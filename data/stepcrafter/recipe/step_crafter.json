@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "ECE",
+    "AMA",
+    "EDE"
+  ],
+  "key": {
+    "E": "minecraft:iron_ingot",
+    "C": "minecraft:redstone",
+    "A": "minecraft:gold_ingot",
+    "M": "minecraft:crafter",
+    "D": "minecraft:hopper"
+  },
+  "result": {
+    "id": "stepcrafter:step_crafter"
+  }
+}

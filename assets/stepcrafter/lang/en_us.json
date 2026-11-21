@@ -1,0 +1,6 @@
+{
+  "mod.stepcrafter": "Step Crafter",
+  "block.stepcrafter.step_crafter": "Step Crafter",
+  "item.stepcrafter.step_crafter.help": "Accepts patterns for recursive autocrafting and allows setting minimum and maximum thresholds. When the output of a configured pattern falls below the minimum, it will automatically craft items up to the maximum.",
+  "itemGroup.stepcrafter": "Step Crafter"
+}

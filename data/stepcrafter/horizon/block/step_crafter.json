@@ -1,0 +1,14 @@
+{
+  "template": "minecraft:stone",
+  "state_properties": {
+    "active": { "type": "boolean" }
+  },
+  "default_state": { "active": "false" },
+  "properties": {
+    "hardness": 1.5,
+    "explosion_resistance": 6.0,
+    "requires_tool": true,
+    "sounds": "minecraft:stone"
+  },
+  "item": true
+}
