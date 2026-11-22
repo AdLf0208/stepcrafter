@@ -1,14 +1,21 @@
 id = "stepcrafter"
 name = "Step Crafter"
-version = "0.2.0"
-description = """A port of Step Crafter for Horizon: the Step Crafter machine, a block entity that keeps a
-configured resource in stock. It is told a target item, resolves that item's own crafting recipe into
-its step pattern, and then crafts one step at a time out of the ingredients stocked in its 27-slot
-inventory: it starts when the stock of the target falls below the configured minimum and keeps going
-until the maximum is reached (upstream's `StepCrafterNetworkNode.doWork` rule). The stock is the
-machine's own inventory, because a Horizon mod cannot join a Refined Storage network: the Step
-Requester, the Step Crafter Manager, the Step Requester Manager, the Step Crafting Monitor, the
-sixteen colour variants, the slot upgrade, the energy buffer and the GUIs are not ported yet."""
+version = "0.2.1"
+description = """A port of Step Crafter for Horizon: the Step Crafter machine and its Step Requester.
+
+The Step Crafter is a block entity that keeps a configured resource in stock. It is told a target
+item, resolves that item's own crafting recipe into its step pattern, and then crafts one step at a
+time out of the ingredients stocked in its 27-slot inventory: it starts when the stock of the target
+falls below the configured minimum and keeps going until the maximum is reached (upstream's
+`StepCrafterNetworkNode.doWork` rule). The stock is the machine's own inventory, because a Horizon mod
+cannot join a Refined Storage network.
+
+The Step Requester keeps a filtered item stocked *through* the Step Crafter beside it: when that
+crafter's stock of the filter falls below the requester's minimum, it asks the crafter for batches of
+the item until the maximum is reached (upstream's `StepRequesterNetworkNode.doWork` rule), and
+reports a refusal it cannot serve. The Step Crafter Manager, the Step Requester Manager, the Step
+Crafting Monitor, the sixteen colour variants, the slot upgrade, the energy buffer and the GUIs are
+not ported yet."""
 authors = ["Ultramega", "AdLf0208"]
 # The original's licence: MIT (the 1.21.1 jar's META-INF/neoforge.mods.toml declares
 # `license = "MIT"`); upstream's LICENSE.txt travels inside the package as LICENSE.

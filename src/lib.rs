@@ -23,7 +23,9 @@
 
 pub mod commands;
 pub mod machine;
+pub mod nbt;
 pub mod pattern;
+pub mod requester;
 pub mod runtime;
 
 use mod_api::{
@@ -38,9 +40,10 @@ struct Mod;
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
-    /// Declare the block entity type the machine's block uses, and the Part that ticks it.
+    /// Declare the block entity types the two blocks use, and the Parts that tick them.
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         machine::declare(r);
+        requester::declare(r);
     }
 
     /// `/stepcrafter info|target|configure|step|take`.
@@ -79,5 +82,25 @@ impl BlockEntityPart for StepCrafter {
     /// One server tick: the band rule, one step, and the `active` state.
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         machine::tick(host, event);
+    }
+}
+
+/// The Part the game asks about the requester's block entity: it ticks on the server, each tick
+/// asking the crafter it maintains its filter with.
+pub struct Requester;
+
+#[mod_api::horizon_part]
+impl BlockPart for Requester {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for Requester {
+    /// The requester ticks on the server, the same way the crafter does.
+    fn block_entity_ticks(&self, _host: &dyn mod_api::Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    /// One server tick: find the crafter, read its stock, ask or hold.
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        requester::tick(host, event);
     }
 }

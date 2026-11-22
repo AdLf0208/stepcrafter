@@ -20,7 +20,9 @@ data shapes), never translated, and no decompilation was used.
 | `common/stepcrafter/task/StepTaskImpl.java`, `task/StepTaskContainer.java` | the task per pattern request (`amount`, `craftedAmount`, states `READY/RUNNING/COMPLETED/...`) |
 | `common/support/ResourceMinMaxAmount.java`, `support/PatternMinMax.java` | the band's validation (non-negative; a resource, min, max, batch, status) |
 | `common/DefaultConfig.java`, `common/Config.java` | the defaults this port needed: `DEFAULT_MIN_AMOUNT = 0`, `DEFAULT_MAX_AMOUNT = 0`, `DEFAULT_BATCH_SIZE = 1`, the energy usages (not ported) |
-| `common/steprequester/StepRequesterNetworkNode.java` | the requester's rule (`needed = max - stored`, `batch = min(needed, batchSize)`, 20-tick failure timeout) — **not** in this slice; it is what the requester row is `blocked` on |
+| `common/steprequester/StepRequesterNetworkNode.java` | **the requester's rule (0.2.1)**: `StepRequesterNetworkNode.doWork` — the same hysteretic guards as the crafter (`status != CRAFTING && stored >= min → break`; `CRAFTING && stored >= max → FINISHED`), then a failed-task timeout, then `isAlreadyRunningTask`, then `needed = max - stored`, `batch = min(needed, batchSize)`, `startTask`; empty → `NOT_ENOUGH_INGREDIENTS` + 20 ticks |
+| `common/steprequester/StepRequesterBlockEntity.java`, `StepRequesterData.java` | the requester's saved shape: `rf` (45 filter slots of resource+min+max+batch+status), `upgr` (8 upgrade slots), `vsrm`; it has no item storage of its own — the filter is configuration, the goods are the network's |
+| `common/support/ResourceMinMaxAmount.java` (re-read) | the filter entry: resource, min, max, batch, status; `batchSize == 0` is skipped by `doWork`, which is why this port's batch 0 disables the entry |
 | `common/stepmanager/AbstractStepManagerBlockEntity.java` | the managers walk the network's `StepBlock` containers — network-bound, not in this slice |
 | `common/registry/*`, `common/ContentIds.java`, `common/ContentNames.java` | the ids and names the content carries |
 | `neoforge/datagen/**` | the data's real shape (recipes, loot, tags) that the jar's `data/` confirms |
@@ -48,7 +50,8 @@ data shapes), never translated, and no decompilation was used.
 |---|---|---|
 | stock = Refined Storage network storage | stock = the machine's own 27-slot inventory | the network surface is absent from the parent port *and* the pin (`ports/_shared/evidence/stepcrafter/parent-surface.md`) |
 | pattern = an encoded RS pattern item in a pattern slot | pattern = the target item's own `minecraft:crafting` recipe, resolved at configuration | an RS pattern item is not representable; the recipe is the same object a pattern is encoded from |
-| min/max/batch per pattern slot, edited in a GUI | min/max per machine via `/stepcrafter configure`; no batch | batch is the *requester's* request size upstream (`StepRequesterNetworkNode`); the requester is not this slice |
+| min/max/batch per pattern slot, edited in a GUI | min/max per machine via `/stepcrafter configure`; no batch | batch is the *requester's* request size upstream (`StepRequesterNetworkNode`), and 0.2.1 ships it as `/stepcrafter requester … <batch>` |
+| the requester asks the network's autocrafting component; the goods land in network storage | the requester asks the nearest Step Crafter within 4 blocks that maintains the same item, and the goods land in that crafter's own inventory | there is no network (parent-surface.md). The ask is one `Int` (`Request`) written into the crafter's saved compound with `merge_data` — the pin's `/data merge block` path — and spent by the crafter's own tick, one step per tick. World-state interop only; proven in game (`notes.md` §2b, `stepcrafter-e2e/e2e-launcher.log`) |
 | a screen with 45 pattern slots + 8 upgrade slots | a 27-slot container with the vanilla chest menu | screens are a later slice; the machine's stock is its inventory |
 | FE per machine | none | energy is the RS network's abstraction |
 | remainders inserted into the network (buckets) | not produced | recorded as `not ported`; no recipe this slice proves needs one |

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.0).
+# In-game check for Step Crafter (the SDK package, 0.2.1).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -36,9 +36,17 @@
 #    and the `active` state is true while it runs and false once idle;
 #  - a broken machine's item carries its pattern and band and placing it back restores them, while
 #    its stock spills as item entities (the engine's container spill);
+#  - the Step Requester: a requester beside a Step Crafter whose own band never fires, filtering
+#    torches 4..8 in batches of 4, makes that crafter step to 8 torches (`stored=8 crafted=8`),
+#    and the *same world with the requester removed* leaves a second crafter at 0 — the ask is the
+#    only difference, so the assertion can fail;
+#  - the refusal and the retry: with the sticks drained the requester reports
+#    `not-enough-ingredients`, and the restock resumes it;
+#  - the requester's own `active` state follows its run;
 #  - `/stepcrafter` needs an operator: a non-operator's `info` is refused.
 #
-# SELFTEST=1 flips the first "filled to the maximum" assertion, so the run must end `EXIT:1`.
+# SELFTEST=1 flips the requester's headline assertion (`stored=8`), so the run must end `EXIT:1`;
+# SELFTEST=crafter flips the machine's first "filled to the maximum" assertion instead.
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -50,12 +58,16 @@ CTL=${CTL:-}
 GAME=${GAME:-}
 CONTROL_GAME=${CONTROL_GAME:-}
 RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}}
-SOCK=${SOCK:-/tmp/opencode/stepcrafter-e2e.sock}
+# `/tmp` is a 7.5 GB tmpfs on this box: honour the harness's own scratch root.
+E2E_TMP=${E2E_TMP:-/tmp/opencode}
+mkdir -p "$E2E_TMP"
+SOCK=${SOCK:-$E2E_TMP/stepcrafter-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 KEEP=${KEEP:-0}
 WORLD=StepCrafterE2E
 CONTROL_WORLD=StepCrafterControl
 BLOCK=stepcrafter:step_crafter
+REQUESTER=stepcrafter:step_requester
 
 [ -n "$CTL" ] || { echo "set CTL to the horizon-ctl built for the same build as GAME" >&2; exit 2; }
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
@@ -67,7 +79,7 @@ if [ -n "$CONTROL_GAME" ] && [ ! -x "$CONTROL_GAME" ]; then
 fi
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/stepcrafter-home.XXXXXX)
+SCRATCH=$(mktemp -d "$E2E_TMP/stepcrafter-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
@@ -118,8 +130,8 @@ arena() {
         fi
     done
     [ "$loaded" = true ] || fail "the End arena chunk never loaded"
-    ctl command "execute in minecraft:the_end run fill 192 63 -8 216 63 8 minecraft:stone"
-    ctl command "execute in minecraft:the_end run fill 192 64 -8 216 74 8 minecraft:air"
+    ctl command "execute in minecraft:the_end run fill 192 63 -8 220 63 8 minecraft:stone"
+    ctl command "execute in minecraft:the_end run fill 192 64 -8 220 74 8 minecraft:air"
     ctl command "execute in minecraft:the_end run kill @e[type=!player]"
     ctl command "gamemode creative"
     ctl wait 20
@@ -162,10 +174,10 @@ box() { # X Y Z
     ctl container "$1" "$2" "$3" | jq -c '[.slots[] | select(. != null) | {item, count}]'
 }
 
-# Whether the block's `active` state is `true`/`false` right now: the game's own predicate, so the
+# Whether a block's `active` state is `true`/`false` right now: the game's own predicate, so the
 # answer is parsed from chat (`Test passed` / `Test failed`), not guessed from the id.
-active_is() { # X Y Z true|false
-    ctl command "execute if block $1 $2 $3 $BLOCK[active=$4]" >/dev/null
+active_is() { # X Y Z true|false [BLOCK]
+    ctl command "execute if block $1 $2 $3 ${5:-$BLOCK}[active=$4]" >/dev/null
     ctl wait 6 >/dev/null
     ctl messages 6 | jq -r '.chat[]' | grep -m1 -E 'Test (passed|failed)' || true
 }
@@ -311,11 +323,11 @@ reply '^stepcrafter configure 202 64 0 ' >/dev/null
 ctl wait 60
 FILLED=$(info 202 64 0)
 echo "  $FILLED"
-if [ "$SELFTEST" = 1 ]; then
-    # The scenario's first headline assertion, deliberately inverted: the machine did fill to the
+if [ "$SELFTEST" = crafter ] || [ "$SELFTEST" = 2 ]; then
+    # The machine's headline assertion, deliberately inverted: the machine did fill to the
     # maximum, so a run that must be able to fail has to end here, non-zero.
     case "$FILLED" in
-        *"stored=16"*) fail "SELFTEST=1: the machine filled to 16 and the run must end non-zero: $FILLED" ;;
+        *"stored=16"*) fail "SELFTEST=crafter: the machine filled to 16 and the run must end non-zero: $FILLED" ;;
         *) ;;
     esac
 else
@@ -447,6 +459,239 @@ esac
 # 32 steps of 4 is 128: it ran past `min` (64) and stopped at `max` (128), the hysteresis.
 expect 210 64 0 "stored=128 phase=idle cells=2 result=minecraft:torch:4 crafted=128"
 
+echo "== the Step Requester asks a nearby Step Crafter (the interop) =="
+# A machine whose own band never fires (0..0) and a requester beside it: every torch the machine
+# makes from here on was asked for by the requester, not maintained by itself. The stock is loaded
+# before the filter is set, so the first ask can be served.
+ctl command "execute in minecraft:the_end run setblock 211 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 211 64 0 minecraft:torch"
+reply '^stepcrafter target 211 64 0 ' >/dev/null
+say "stepcrafter configure 211 64 0 0 0"
+reply '^stepcrafter configure 211 64 0 ' >/dev/null
+load 211 64 0 minecraft:coal 4
+load 211 64 0 minecraft:stick 4
+expect 211 64 0 "min=0 max=0 stored=0 phase=idle"
+QUIET=$(info 211 64 0)
+case "$QUIET" in
+    *"crafted=0"*) ;;
+    *) fail "the quiet machine crafted before the requester existed: $QUIET" ;;
+esac
+ctl command "execute in minecraft:the_end run setblock 212 64 0 $REQUESTER"
+ctl wait 6
+PLACED_REQ=$(ctl block 212 64 0 | jq -r '.block')
+echo "  block(212,64,0): $PLACED_REQ"
+[ "$PLACED_REQ" = "$REQUESTER" ] || fail "expected $REQUESTER at 212 64 0, got $PLACED_REQ"
+ctl give "$REQUESTER" 1
+ctl wait 4
+ctl inventory | jq -e --arg item "$REQUESTER" '[.hotbar[] | select(.item == $item)] | length >= 1' >/dev/null \
+    || fail "the Step Requester item did not register"
+say "stepcrafter requester 212 64 0 minecraft:torch 4 8 4"
+FILTER=$(reply '^stepcrafter requester 212 64 0 ')
+echo "  $FILTER"
+case "$FILTER" in
+    *"item=minecraft:torch min=4 max=8 batch=4"*) ;;
+    *) fail "the requester filter was not configured: $FILTER" ;;
+esac
+# A read right after the filter is set: the requester has found the crafter beside it and has
+# already asked it (the two steps of this 4..8 run complete inside the harness's read latency, so
+# `phase=running` is read on the 32-step run below, where the window is 32 ticks wide).
+ctl wait 1
+ASKING=$(info 212 64 0)
+echo "  just after the filter: $ASKING"
+case "$ASKING" in
+    *"kind=requester"*"item=minecraft:torch"*"min=4 max=8 batch=4"*) ;;
+    *) fail "the requester's readout is not the requester's: $ASKING" ;;
+esac
+case "$ASKING" in
+    *"crafter=211,64,0"*) ;;
+    *) fail "the requester did not link the crafter beside it: $ASKING" ;;
+esac
+case "$ASKING" in
+    *"requests=0"*) fail "the requester linked the crafter but asked nothing: $ASKING" ;;
+    *) ;;
+esac
+ctl wait 40
+ASKED=$(info 212 64 0)
+ASKCRAFT=$(info 211 64 0)
+echo "  after 40 ticks: $ASKED"
+echo "  the crafter:    $ASKCRAFT"
+if [ "$SELFTEST" = 1 ] || [ "$SELFTEST" = requester ]; then
+    # The new family's headline assertion, deliberately inverted: the requester did reach stored=8,
+    # so a run that must be able to fail has to end here, non-zero.
+    case "$ASKED" in
+        *"stored=8"*) fail "SELFTEST=1: the requester reached stored=8 and the run must end non-zero: $ASKED" ;;
+        *) ;;
+    esac
+else
+    case "$ASKED" in
+        *"stored=8"*) ;;
+        *) fail "the requester did not bring the filtered item to max 8: $ASKED" ;;
+    esac
+    case "$ASKED" in
+        *"phase=idle"*) ;;
+        *) fail "the requester did not stop at its maximum: $ASKED" ;;
+    esac
+    case "$ASKCRAFT" in
+        *"stored=8"*"crafted=8"*) ;;
+        *) fail "the crafter did not make 8 torches on the requester's ask: $ASKCRAFT" ;;
+    esac
+    case "$ASKCRAFT" in
+        *"minecraft:coal:2"*"minecraft:stick:2"*) ;;
+        *) fail "the two asked-for steps did not consume exactly 2 coal and 2 sticks: $ASKCRAFT" ;;
+    esac
+fi
+
+echo "== the same world with the requester removed leaves a crafter at zero =="
+ctl command "execute in minecraft:the_end run setblock 212 64 0 minecraft:air"
+ctl wait 6
+ctl command "execute in minecraft:the_end run setblock 213 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 213 64 0 minecraft:torch"
+reply '^stepcrafter target 213 64 0 ' >/dev/null
+say "stepcrafter configure 213 64 0 0 0"
+reply '^stepcrafter configure 213 64 0 ' >/dev/null
+load 213 64 0 minecraft:coal 4
+load 213 64 0 minecraft:stick 4
+ctl wait 40
+ALONE=$(info 213 64 0)
+echo "  a crafter with no requester, same world: $ALONE"
+case "$ALONE" in
+    *"stored=0"*"crafted=0"*) ;;
+    *) fail "a crafter with no requester crafted on its own: $ALONE" ;;
+esac
+
+echo "== a crafter that cannot step: the requester reports it, and the restock resumes it =="
+say "stepcrafter take 213 64 0 minecraft:stick 4"
+reply '^stepcrafter take 213 64 0 ' >/dev/null
+ctl command "execute in minecraft:the_end run setblock 215 64 0 $REQUESTER"
+ctl wait 6
+say "stepcrafter requester 215 64 0 minecraft:torch 4 8 4"
+reply '^stepcrafter requester 215 64 0 ' >/dev/null
+ctl wait 40
+REFUSED=$(info 215 64 0)
+REFUSED_CRAFT=$(info 213 64 0)
+echo "  requester: $REFUSED"
+echo "  crafter:   $REFUSED_CRAFT"
+case "$REFUSED" in
+    *"phase=not-enough-ingredients"*) ;;
+    *) fail "the requester did not report the crafter's refusal: $REFUSED" ;;
+esac
+case "$REFUSED_CRAFT" in
+    *"crafted=0"*) ;;
+    *) fail "the crafter crafted without its sticks: $REFUSED_CRAFT" ;;
+esac
+load 213 64 0 minecraft:stick 4
+ctl wait 140
+RESUMED=$(info 215 64 0)
+RESUMED_CRAFT=$(info 213 64 0)
+echo "  restocked: requester $RESUMED"
+echo "  restocked: crafter   $RESUMED_CRAFT"
+case "$RESUMED" in
+    *"stored=8"*"phase=idle"*) ;;
+    *) fail "the requester did not resume after the restock: $RESUMED" ;;
+esac
+case "$RESUMED_CRAFT" in
+    *"crafted=8"*) ;;
+    *) fail "the restocked crafter did not resume its steps: $RESUMED_CRAFT" ;;
+esac
+
+echo "== the requester's active state follows its run =="
+# A second pair of its own, out of the first pair's reach, for a run long enough (32 steps of 4
+# torches to 128) that `running` and `active` are readable while it works.
+ctl command "execute in minecraft:the_end run setblock 197 64 4 $BLOCK"
+ctl wait 6
+say "stepcrafter target 197 64 4 minecraft:torch"
+reply '^stepcrafter target 197 64 4 ' >/dev/null
+say "stepcrafter configure 197 64 4 0 0"
+reply '^stepcrafter configure 197 64 4 ' >/dev/null
+load 197 64 4 minecraft:coal 32
+load 197 64 4 minecraft:stick 32
+ctl command "execute in minecraft:the_end run setblock 196 64 4 $REQUESTER"
+ctl wait 6
+say "stepcrafter requester 196 64 4 minecraft:torch 4 128 4"
+reply '^stepcrafter requester 196 64 4 ' >/dev/null
+# 32 steps is a 32-tick window: the read lands inside it, so `phase=running` is the real phase.
+ctl wait 2
+RUNAWAY=$(info 196 64 4)
+echo "  while it runs: $RUNAWAY"
+case "$RUNAWAY" in
+    *"phase=running"*) ;;
+    *) fail "the requester did not report a running ask: $RUNAWAY" ;;
+esac
+RUNNING=$(active_is 196 64 4 true "$REQUESTER")
+echo "  active=true while asking: $RUNNING"
+case "$RUNNING" in
+    *"Test passed"*) ;;
+    *) fail "the requester did not show active=true while asking: $RUNNING" ;;
+esac
+ctl wait 400
+DONE=$(active_is 196 64 4 false "$REQUESTER")
+echo "  active=false once done: $DONE"
+case "$DONE" in
+    *"Test passed"*) ;;
+    *) fail "the requester still shows active=true once idle: $DONE" ;;
+esac
+expect 196 64 4 "stored=128 phase=idle"
+expect 197 64 4 "stored=128"
+FILLED_CRAFT=$(info 197 64 4)
+case "$FILLED_CRAFT" in
+    *"crafted=128"*) ;;
+    *) fail "the long run did not craft exactly 128 torches: $FILLED_CRAFT" ;;
+esac
+
+echo "== /stepcrafter requester refuses what it cannot configure =="
+say "stepcrafter requester 215 64 0 minecraft:torch 9 4 4"
+INVERTED_FILTER=$(reply '^stepcrafter: min 9 is above max 4')
+echo "  $INVERTED_FILTER"
+case "$INVERTED_FILTER" in
+    *"min 9 is above max 4"*) ;;
+    *) fail "an inverted requester band was not refused: $INVERTED_FILTER" ;;
+esac
+say "stepcrafter requester 215 64 0 minecraft:not_a_thing 4 8 4"
+UNKNOWN_FILTER=$(reply '^stepcrafter: minecraft:not_a_thing')
+echo "  $UNKNOWN_FILTER"
+case "$UNKNOWN_FILTER" in
+    *"is not an item this world knows"*) ;;
+    *) fail "an unknown filter item was not refused: $UNKNOWN_FILTER" ;;
+esac
+say "stepcrafter requester 215 64 0 minecraft:torch 4 8 -1"
+NEGATIVE_FILTER=$(reply '^stepcrafter: min, max and batch')
+echo "  $NEGATIVE_FILTER"
+case "$NEGATIVE_FILTER" in
+    *"not negative numbers"*) ;;
+    *) fail "a negative batch was not refused: $NEGATIVE_FILTER" ;;
+esac
+say "stepcrafter target 215 64 0 minecraft:torch"
+WRONG_BLOCK=$(reply '^stepcrafter: that is a Step Requester')
+echo "  $WRONG_BLOCK"
+case "$WRONG_BLOCK" in
+    *"that is a Step Requester"*) ;;
+    *) fail "a crafter command on a requester was not refused: $WRONG_BLOCK" ;;
+esac
+
+echo "== the requester's own loot =="
+ctl command "gamemode survival @s"
+ctl wait 6
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl wait 3
+ctl command "execute in minecraft:the_end run tp @s 215.5 64 3.5"
+ctl wait 6
+BROKE_REQ=$(ctl break 215 64 0) || fail "cannot break the requester"
+ctl wait 10
+REQ_GONE=$(ctl block 215 64 0 | jq -r '.block')
+REQ_DROPS=$(jq -r '.drops | to_entries | map("\(.key):\(.value)") | join(",")' <<<"$BROKE_REQ" 2>/dev/null || true)
+echo "  requester after the break: $REQ_GONE; drops: $REQ_DROPS"
+[ "$REQ_GONE" = "minecraft:air" ] || fail "the requester did not break: $REQ_GONE"
+case "$REQ_DROPS" in
+    *"$REQUESTER"*) ;;
+    *) fail "the broken requester dropped no item of its own: $REQ_DROPS" ;;
+esac
+ctl command "gamemode creative"
+ctl wait 4
+
 echo "== a broken machine carries its configuration and spills its stock =="
 ctl command "execute in minecraft:the_end run setblock 214 64 0 $BLOCK"
 ctl wait 6
@@ -538,4 +783,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, the carried recipe crafts and consumes its five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

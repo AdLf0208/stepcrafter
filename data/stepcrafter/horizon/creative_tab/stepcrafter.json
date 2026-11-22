@@ -2,6 +2,7 @@
   "icon": "stepcrafter:step_crafter",
   "title": "Step Crafter",
   "items": [
-    "stepcrafter:step_crafter"
+    "stepcrafter:step_crafter",
+    "stepcrafter:step_requester"
   ]
 }

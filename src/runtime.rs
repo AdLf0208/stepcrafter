@@ -356,6 +356,92 @@ pub fn step_now(stock: &Stock, pattern: Option<&Pattern>, capacity: u64) -> Outc
     craft(stock, pattern, stored, capacity)
 }
 
+/// One filter entry of a Step Requester: upstream's `ResourceMinMaxAmount` — the resource to keep,
+/// its band and the largest amount one request may ask for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filter {
+    item: String,
+    band: Band,
+    batch: u64,
+}
+
+impl Filter {
+    /// The filter for `batch` of `item` kept between the band's amounts, or `None` for an empty
+    /// item id (a filter with nothing to maintain).
+    #[must_use]
+    pub fn new(item: String, band: Band, batch: u64) -> Option<Self> {
+        (!item.is_empty()).then_some(Self { item, band, batch })
+    }
+
+    /// The item the filter maintains.
+    #[must_use]
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    /// The band the filtered item is kept between.
+    #[must_use]
+    pub fn band(&self) -> Band {
+        self.band
+    }
+
+    /// The most a single request asks for; `0` disables the filter, as upstream's `batchSize == 0`
+    /// skips its slot.
+    #[must_use]
+    pub fn batch(&self) -> u64 {
+        self.batch
+    }
+}
+
+/// Ticks a failed request is not retried, upstream's `FAILED_TASK_TIMEOUT_TICKS`.
+pub const FAILED_TASK_TIMEOUT_TICKS: u32 = 20;
+
+/// What a Step Requester's filter says to do this tick, upstream's `StepRequesterNetworkNode.doWork`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// The stock is inside the band and nothing is running.
+    Hold,
+    /// A running fill reached `max`: the phase returns to idle.
+    Finish,
+    /// A failed request is timing out; ask nothing this tick.
+    Backoff,
+    /// A request is already outstanding with the crafter; do not ask again.
+    Waiting,
+    /// Ask a crafter for this many items.
+    Request { amount: u64 },
+}
+
+/// The requester's rule: start asking below `min`, keep asking to `max`, one batch at a time.
+///
+/// `stored` is how much of the filter's item the linked crafter holds; `outstanding` is how many
+/// items it has already been asked for and not yet made; `backoff` is how many of the 20 failed-task
+/// ticks are left.
+#[must_use]
+pub fn ask(stored: u64, filter: &Filter, phase: Phase, outstanding: u64, backoff: u32) -> Ask {
+    // Upstream's guards, in its order: an idle filter only starts below `min`, a running fill is
+    // only stopped by `max`, and a finished or disabled entry asks nothing.
+    if phase != Phase::Crafting && stored >= filter.band.min {
+        return Ask::Hold;
+    }
+    if phase == Phase::Crafting && stored >= filter.band.max {
+        return Ask::Finish;
+    }
+    if backoff > 0 {
+        return Ask::Backoff;
+    }
+    if outstanding > 0 {
+        return Ask::Waiting;
+    }
+    let needed = filter.band.max.saturating_sub(stored);
+    if filter.batch == 0 {
+        // Upstream skips a filter slot whose batch size is 0: the entry is configured but off.
+        return Ask::Hold;
+    }
+    Ask::Request {
+        amount: needed.min(filter.batch),
+    }
+}
+
 /// Apply [`Outcome::Craft`] to a stock; answers whether the stock changed. Every other outcome
 /// leaves it as it was.
 pub fn apply(stock: &mut Stock, outcome: &Outcome) -> bool {
@@ -372,6 +458,21 @@ pub fn apply(stock: &mut Stock, outcome: &Outcome) -> bool {
     }
     stock.add(result, u64::from(*result_count));
     true
+}
+
+/// Whether a crafter's own phase is a refusal the requester must report, and which one.
+///
+/// Upstream learns this from the failed task (`startTask` answering empty, or its timeout); here the
+/// crafter states it in its saved `Phase`, and the stock still being short of `max` is what says the
+/// run is unfinished. `None` means "nothing was refused".
+#[must_use]
+pub fn refused(crafter: Phase, stored: u64, filter: &Filter) -> Option<Phase> {
+    match crafter {
+        Phase::NotEnoughIngredients | Phase::NetworkFull if stored < filter.band.max => {
+            Some(crafter)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -594,6 +695,117 @@ mod tests {
         assert_eq!(Pattern::decode(&saved, "minecraft:torch", 4), Some(pattern));
         assert!(Pattern::decode(&["".to_owned()], "minecraft:torch", 4).is_none());
         assert!(Pattern::decode(&saved, "minecraft:torch", 0).is_none());
+    }
+
+    /// The requester's filter: 4 torches kept between 4 and 8, asking 4 at a time.
+    fn torches(batch: u64) -> Filter {
+        Filter::new("minecraft:torch".to_owned(), band(4, 8), batch).expect("a valid filter")
+    }
+
+    #[test]
+    fn a_requester_holds_at_its_minimum_while_idle() {
+        assert_eq!(ask(4, &torches(4), Phase::Idle, 0, 0), Ask::Hold);
+        assert_eq!(
+            ask(6, &torches(4), Phase::Idle, 0, 0),
+            Ask::Hold,
+            "a stock inside the band and nothing running asks nothing"
+        );
+    }
+
+    #[test]
+    fn a_requester_asks_below_its_minimum() {
+        assert_eq!(
+            ask(0, &torches(4), Phase::Idle, 0, 0),
+            Ask::Request { amount: 4 },
+            "a stock below min must be asked for"
+        );
+    }
+
+    #[test]
+    fn a_requester_keeps_asking_above_the_minimum_until_the_maximum() {
+        // The hysteresis: once asking started, `min` no longer stops it (upstream CRAFTING).
+        assert_eq!(
+            ask(4, &torches(4), Phase::Crafting, 0, 0),
+            Ask::Request { amount: 4 },
+            "a running fill continues between min and max"
+        );
+    }
+
+    #[test]
+    fn a_requester_finishes_at_the_maximum() {
+        assert_eq!(ask(8, &torches(4), Phase::Crafting, 0, 0), Ask::Finish);
+        assert_eq!(
+            ask(8, &torches(4), Phase::Idle, 0, 0),
+            Ask::Hold,
+            "a finished run that is inside the band holds"
+        );
+    }
+
+    #[test]
+    fn a_batch_caps_each_request() {
+        assert_eq!(
+            ask(0, &torches(4), Phase::Idle, 0, 0),
+            Ask::Request { amount: 4 },
+            "8 needed but the batch is 4"
+        );
+        assert_eq!(
+            ask(0, &torches(64), Phase::Idle, 0, 0),
+            Ask::Request { amount: 8 },
+            "the band's remaining room is smaller than the batch"
+        );
+    }
+
+    #[test]
+    fn a_request_is_not_repeated_while_one_is_outstanding() {
+        assert_eq!(
+            ask(0, &torches(4), Phase::Crafting, 4, 0),
+            Ask::Waiting,
+            "the crafter is still working off the last request"
+        );
+    }
+
+    #[test]
+    fn a_failed_task_backs_off_before_asking_again() {
+        assert_eq!(
+            ask(0, &torches(4), Phase::Crafting, 0, 5),
+            Ask::Backoff,
+            "a task that failed is not retried until its timeout runs out"
+        );
+        assert_eq!(
+            ask(8, &torches(4), Phase::Crafting, 0, 5),
+            Ask::Finish,
+            "reaching the maximum ends the run even while a timeout is pending"
+        );
+    }
+
+    #[test]
+    fn a_zero_batch_filter_is_disabled() {
+        assert_eq!(
+            ask(0, &torches(0), Phase::Idle, 0, 0),
+            Ask::Hold,
+            "upstream skips a filter entry whose batch size is 0"
+        );
+        assert!(Filter::new(String::new(), band(4, 8), 4).is_none());
+    }
+
+    #[test]
+    fn a_crafter_that_refused_is_the_requesters_failed_task() {
+        assert_eq!(
+            refused(Phase::NotEnoughIngredients, 4, &torches(4)),
+            Some(Phase::NotEnoughIngredients),
+            "the crafter has too few ingredients and the stock is still short"
+        );
+        assert_eq!(
+            refused(Phase::NetworkFull, 0, &torches(4)),
+            Some(Phase::NetworkFull)
+        );
+        assert_eq!(
+            refused(Phase::NotEnoughIngredients, 8, &torches(4)),
+            None,
+            "a refusal that no longer matters is not reported"
+        );
+        assert_eq!(refused(Phase::Crafting, 0, &torches(4)), None);
+        assert_eq!(refused(Phase::Idle, 0, &torches(4)), None);
     }
 
     #[test]

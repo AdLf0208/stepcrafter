@@ -9,8 +9,8 @@ evidence under `ports/_shared/licence-cache/`). The port targets Horizon **26.3*
 `api = "0.2"`, package format `native-1`, launcher 0.2.92.
 
 **Class + tier:** `content` / **machines** (`ports/ledger.csv`; provenance
-`ports/_shared/source-map/atm10-sources.csv`). The slice is a block entity with a container and a
-tick — the machines shape, no entities, renderers or dimensions.
+`ports/_shared/source-map/atm10-sources.csv`). Both slices are block entities with a container, a
+saved band and a tick — the machines shape, no entities, renderers or dimensions.
 
 **Licence rank 0** (MIT, read from the jar's `META-INF/neoforge.mods.toml`; upstream's
 `LICENSE.txt` travels inside the package as `LICENSE`). Publishable under MIT with this source.
@@ -30,9 +30,11 @@ is `ports/_shared/evidence/stepcrafter/parent-surface.md`. In one line:
 - the **network half** (`AutocraftingNetworkComponent`, `PatternProvider`, `RootStorage`,
   `UpgradeContainer`, the network-node base, the grid screens, and the `refinedstorage:autocrafter`
   / `:detector` / `:upgrade` / `:pattern` items three of its recipes name) is **absent** from the
-  parent port *and* from the pin, and no Horizon mod can call another port's Rust — so the
-  requester, the two managers, the monitor, the colour variants, the slot upgrade, the FE buffer
-  and the GUIs are `blocked(no-parent-addon-surface)`, exactly as `mifa` was;
+  parent port *and* from the pin, and no Horizon mod can call another port's Rust — so the two
+  managers, the monitor, the colour variants, the slot upgrade, the FE buffer and the GUIs are
+  `blocked(no-parent-addon-surface)`, exactly as `mifa` was; the **requester** is the exception
+  (0.2.1): its rule needs no network, only a machine to ask, so it is re-rooted on a nearby Step
+  Crafter (§2b);
 - the **core mechanic** — *keep a resource between a minimum and a maximum by stepping its own
   crafting pattern* — is the add-on's own rule (`StepCrafterNetworkNode.doWork`,
   `StepCraftingAlgorithm`), and it needs only the pin's recipe surface
@@ -50,7 +52,7 @@ with 5 base recipes, 51 colouring recipes, 51 loot tables, 3 item tags, 1 block 
 |---|---|
 | `step_crafter` block + block entity (the machine, `active` state, red/`side_active` art) | **ported** — the block, its 27-slot inventory, the `active` state, the band rule, `recipes`/`loot`/`lang`/`tab` |
 | its pattern system (a Refined Storage *pattern item* per slot, min/max/batch per slot) | **ported differently**: the pattern is the target item's own `minecraft:crafting` recipe (`/stepcrafter target <pos> <item>`), because an RS pattern item is not representable here; the band is `/stepcrafter configure <pos> <min> <max>` |
-| `step_requester` block + entity (asks *other* autocrafters for a resource) | `blocked(no-parent-addon-surface)` — there is no autocrafting network to request from |
+| `step_requester` block + entity (asks *other* autocrafters for a resource) | **ported differently (0.2.1)** — the ask goes to a **nearby Step Crafter** instead of the parent's autocrafting network: the filter (item, min, max, batch) is `/stepcrafter requester`, the store it watches is that crafter's inventory, and the ask is a `Request` count in the crafter's saved compound |
 | `step_crafter_manager`, `step_requester_manager` (+16 colours each), `step_crafting_monitor` (+16 colours) | `blocked(no-parent-addon-surface)` — each is a mixin into Refined Storage's grid screen, which the parent port does not ship (0 hits for `wireless_grid`) |
 | `slot_upgrade` item (a slot upgrade, `Items.INSTANCE.getSlotUpgrade`) | `not ported` — upgrades are the RS `UpgradeContainer`; the machine has 27 slots and no upgrade slots |
 | the 51 colouring recipes + the three colour tags | `not ported` — they recolour the managers/monitor, which are blocked |
@@ -79,6 +81,61 @@ The machine is told **what to keep in stock** and **between which amounts**:
   band's timing bypassed — the manual step); `/stepcrafter take` hands the target back.
 - The `active` block state is true while the machine is crafting.
 
+## 2b. The slice: the Step Requester (version 0.2.1)
+
+Upstream's requester (`StepRequesterNetworkNode.doWork`) watches the network's storage for a filtered
+resource and asks the network's autocrafting component for batches of it:
+
+```text
+for each filter entry with batch != 0:
+  stored = network.get(resource)
+  if status != CRAFTING && stored >= min:   break          // nothing to do
+  if status == CRAFTING && stored >= max:   FINISHED;      break
+  if a failed task is timing out (20 ticks): break
+  if a task is already running:              break
+  needed = max - stored;  batch = min(needed, batchSize)
+  startTask(resource, batch)                                 // empty => NOT_ENOUGH_INGREDIENTS + 20-tick timeout
+```
+
+This slice keeps that rule and replaces only what it reads and what it calls: `network.get(resource)`
+is the stock of a **nearby Step Crafter**, and `startTask(resource, batch)` is a `Request` count
+written into that crafter's saved compound, which the crafter's own tick spends one step at a time.
+The decision to ask (when, how much) stays the requester's; the crafting stays the crafter's.
+
+The two blocks therefore exchange **world state only** — the pin's sanctioned interop, not a Rust
+call across ports:
+
+| the requester does | the API |
+|---|---|
+| read a crafter's `Target`, `Phase`, `Request` and item slots | `Host::block_entity(level, pos)` → `BlockEntityRef::data` / `item_slot` |
+| write one `Int` (`Request`) into that crafter's compound | `BlockEntityRef::merge_data` — the `/data merge block` path the API documents |
+
+Each block still writes **only its own compound** while it ticks, except that one write, which the
+`block_entity_tick` docs allow ("independent Host writes keep their own effects"). That is the
+interop answer the brief asked for: **world-state interop is available and works**, and the
+requester needed no fallback.
+
+What the requester is:
+
+- `/stepcrafter requester <pos> <item> <min> <max> <batch>` sets its one filter entry (upstream's
+  `ResourceMinMaxAmount`: resource, min, max, batch size; batch 0 disables the entry, as upstream
+  skips it).
+- It finds the **nearest** Step Crafter within **4 blocks** (a 9×9×9 cube, nearest first) whose
+  `Target` is its filter item — upstream's reach is the network's, this is the documented re-root. The
+  link is saved and re-validated every tick (block id and `Target`), so a moved or re-targeted
+  machine is dropped and rescanned.
+- The band is **hysteretic** and the batch caps one ask: it asks when the crafter's stock falls below
+  `min`, keeps asking to `max`, `min(needed, batch)` at a time, and never adds a second ask while one
+  is outstanding (`Request != 0`) — upstream's `isAlreadyRunningTask` guard.
+- A crafter that refuses (its own phase is `not-enough-ingredients` or `network-full` while the stock
+  is still short) is reported as the requester's own phase and stops it asking for **20 ticks**
+  (upstream's `FAILED_TASK_TIMEOUT_TICKS`), then it retries.
+- The `active` block state is true while it is asking.
+- `/stepcrafter info <pos>` answers for either block; the requester's line is
+  `stepcrafter <x> <y> <z> kind=requester item=… min=… max=… batch=… stored=… phase=… crafter=… backoff=… requests=…`,
+  its `stored` being the filtered item's count in the linked crafter and its `running` being
+  upstream's `CRAFTING` status (the crafter's own readout keeps `phase=crafting`).
+
 ## 3. TDD: red, then green
 
 The red transcript is `ports/_shared/evidence/stepcrafter/red-unit.log` — the rule and the step
@@ -92,14 +149,38 @@ assertion `left == right` failed: a stock below min must be crafted
 test result: FAILED. 4 passed; 8 failed
 ```
 
-Green today: **17 tests**, `sdk-test.log`. They cover the rule (`decide_holds_at_the_minimum_while_idle`,
+Green at 0.2.1: **30 tests**, `sdk-test.log` (17 of them the 0.2.0 machine, 13 the requester).
+The requester's red transcript is `red-unit-requester.log`: its eight rule tests ran against an
+`ask()` stub answering `Hold` for every filter, so
+
+```
+assertion `left == right` failed: a stock below min must be asked for
+  left: Hold
+ right: Request { amount: 4 }
+...
+test result: FAILED. 19 passed; 6 failed
+```
+
+— and the two hold cases (`a_requester_holds_at_its_minimum_while_idle`,
+`a_zero_batch_filter_is_disabled`) passed against the stub by construction, which is why they are the
+control in the green run.
+
+The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
 `decide_finishes_at_the_maximum`), the step (`a_step_consumes_every_cell_and_makes_the_result`,
 `a_step_prefers_the_first_candidate_the_stock_holds`,
 `a_missing_ingredient_refuses_the_step_and_names_the_cell`, `a_full_inventory_refuses_the_step`,
 `apply_moves_the_stock_by_exactly_the_outcome`, `a_pattern_round_trips_through_its_saved_form`),
 the manual step (`a_manual_step_crafts_even_inside_the_band`,
-`a_manual_step_still_needs_the_ingredients`), and the saved compound.
+`a_manual_step_still_needs_the_ingredients`), and the saved compound. The requester's cover its rule
+(`a_requester_holds_at_its_minimum_while_idle`, `a_requester_asks_below_its_minimum`,
+`a_requester_keeps_asking_above_the_minimum_until_the_maximum`, `a_requester_finishes_at_the_maximum`,
+`a_batch_caps_each_request`, `a_request_is_not_repeated_while_one_is_outstanding`,
+`a_failed_task_backs_off_before_asking_again`, `a_zero_batch_filter_is_disabled`), the refusal it
+reads from the crafter (`a_crafter_that_refused_is_the_requesters_failed_task`), its saved compound
+(`the_requester_state_round_trips_through_the_saved_compound`,
+`an_empty_compound_reads_as_an_unconfigured_requester`), its readout name
+(`the_readout_calls_a_running_ask_running`) and its saved link (`a_saved_position_round_trips_and_foreign_text_is_refused`).
 
 The in-game leg then found two things a unit test cannot. (1) A stock kept as a **ledger in the
 block entity's saved compound** lost entries between ticks: a stepped machine reported `crafted=4`
@@ -114,21 +195,25 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — three logs, all `--strict` green:
+`ports/_shared/evidence/stepcrafter-e2e/` — three run logs plus the build log, all `--strict`
+green (`logs=3 ok=3 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
 | `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package, plus an in-run control leg on the same Nightly built without it |
 | `e2e-control.log` | `FAIL` + `EXIT:1` | the same script with `GAME` = the Nightly **without** the package: `setblock stepcrafter:step_crafter` leaves air |
-| `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the first headline assertion (`stored=16`) and the run ends non-zero |
+| `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the **requester's** headline assertion (`stored=8`) and the run ends non-zero; `SELFTEST=crafter` inverts the machine's (`stored=16`) instead |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.1: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
 1. the block places and reads back `stepcrafter:step_crafter`; the item registers; the unported
    `stepcrafter:step_crafter_manager` is refused by `setblock` and by `give`;
-2. the carried recipe crafts **one** Step Crafter from 4 iron, 1 redstone, 2 gold, 1 crafter and
-   1 hopper in a real table and the grid is consumed; the same items in another pattern craft
-   nothing (`tools/craft_check.py`);
+2. **both** carried recipes craft in a real table and their grids are consumed: one Step Crafter
+   from 4 iron, 1 redstone, 2 gold, 1 crafter, 1 hopper, and one Step Requester from 4 iron,
+   1 comparator, 2 gold, 1 crafter, 1 hopper — the same shape with another centre-top key must be a
+   different recipe, not a shadowed one; the same items in another pattern craft nothing
+   (`tools/craft_check.py`);
 3. a fresh machine reads `target=none min=- max=- stored=0 phase=idle cells=0 crafted=0`, and its
    container is empty;
 4. `target … minecraft:torch` → `cells=2 result=minecraft:torch:4`; `minecraft:bedrock` →
@@ -145,20 +230,35 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
    with no ingredients answers `not-enough-ingredients`;
 10. band 64..128 with 32+32 loaded: `active=true` while it runs, `active=false` once idle, and it
     stops at **128** — past `min` (64), which is the hysteresis;
-11. a survival break with a pickaxe drops the machine's own item **and spills the 8 torches**
-    (`drops: minecraft:torch:8, stepcrafter:step_crafter:1`); placing the item again gives an
-    unconfigured machine (the recorded limit, §6);
-12. a non-operator's `/stepcrafter info` is refused.
+11. **the requester asks a nearby crafter**: a machine with `target minecraft:torch` and its own
+    band `0..0` (so it never fires by itself) with 4 coal + 4 sticks in its container, a requester
+    beside it filtered `minecraft:torch 4 8 4` → the requester links it (`crafter=211,64,0`), asks
+    (`requests=2`), and 40 ticks later reads `stored=8` while the crafter reads `stored=8
+    crafted=8` with exactly 2 coal and 2 sticks consumed;
+12. **the differential**: the same world with the requester removed leaves a second machine, loaded
+    with the same 4 + 4 and configured the same way, at `stored=0 crafted=0` — the ask is the only
+    difference between the two, so the assertion above can fail;
+13. the crafter's own refusal reaches it: with the sticks drained the requester reads
+    `phase=not-enough-ingredients backoff=13` and the crafter `crafted=0`; the restock resumes both
+    (`stored=8`, `crafted=8`);
+14. a 32-step run (filter `4 128 4`, 32 + 32 loaded) reads `phase=running` while it works,
+    `active=true` on the requester, then `active=false` and `stored=128` / `crafted=128` at rest;
+15. `/stepcrafter requester` refuses an inverted band, an unknown item and a negative batch, and
+    `/stepcrafter target` on a requester answers "that is a Step Requester";
+16. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
+    its item **and spills the 8 torches** (`drops: minecraft:torch:8, stepcrafter:step_crafter:1`);
+    placing the machine's item again gives an unconfigured machine (the recorded limit, §6);
+17. a non-operator's `/stepcrafter info` is refused.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **33,589 B** |
-| sha256 | `32b80ec228f8ac978b4413f6e207b79ca1660aa986ca4f13acb8607de970abad` |
-| entries | 23 (`111,459 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.0` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **49,241 B** |
+| sha256 | `b40307c5ddf08c4ea9f7d6e358248dff1d27c5774b41e46eabcbcca6cdc6de63` |
+| entries | 37 (`151,783 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.1` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 
@@ -181,8 +281,23 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 - **`crafting remainders` are not produced** (a bucket recipe leaves its bucket upstream in the
   network): the cells are consumed and the result inserted. No recipe the port's own e2e uses has
   one; record it as `not ported` rather than pretend.
-- **`direction` state, the GUI, the colours, the requester, the managers, the monitor, the slot
-  upgrade, the FE buffer** — see §1's table, each with its reason.
+- **`direction` state, the GUI, the colours, the managers, the monitor, the slot upgrade, the FE
+  buffer** — see §1's table, each with its reason.
+- **The requester's reach is 4 blocks, not the network's.** Upstream's requester asks the network's
+  autocrafting component from anywhere on the network; this one asks the **nearest** Step Crafter
+  inside a 9×9×9 cube whose `Target` is its filtered item (`LINK_RADIUS = 4`, saved and re-validated
+  every tick). Two crafters that both maintain the same item are interchangeable to it; a crafter
+  that maintains something else is never asked, so a filter cannot spend another pattern's items.
+- **The requester has one filter entry, set by command** (upstream: 45 filter slots plus 8 upgrade
+  slots edited in a screen). A screen is the later slice named in §1; the command is the same
+  precedent as `target`/`configure`, and batch 0 disables the entry exactly as upstream skips it.
+- **The ask is one `Int` in the crafter's compound** (`Request`, the pin's `/data merge block` write
+  path), spent at one step per tick. A second requester asking the same crafter is not queued — the
+  ask is a count, and the stock both requesters watch is the crafter's single inventory; the readout
+  names the crafter each one linked, so a shared crafter is visible rather than silent.
+- **Upstream's `FINISHED` status is not saved as a phase**: reaching `max` returns the requester to
+  `idle`, which is the state a player reads. `running` is upstream's `CRAFTING`; `not-enough-ingredients`
+  and `network-full` are the crafter's refusals, reported with the stock unchanged.
 - **Recipe adapted (deviation, not a defect):** upstream's `step_crafter.json` is
   `ECE/AMA/EDE` with `refinedstorage:` ingredients (`quartz_enriched_iron`, `construction_core`,
   `advanced_processor`, `autocrafter`, `destruction_core`). This package's own game cannot name
@@ -204,6 +319,13 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | `active` block state | the RS network node's `active` property | true while the machine is crafting |
 | one step per tick without speed upgrades | `for j < speed + 1` with `speed = 0` | `runtime::STEPS_PER_TICK = 1` |
 | the click | `ExtendedMenuProvider` opens a screen | the vanilla chest menu over the 27-slot container |
+| the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick` |
+| "a task is already running" | `isAlreadyRunningTask` on the task id map | the outstanding `Request` count in the crafter's compound |
+| a failed task (20-tick timeout) | `failedTaskTimeouts`, `FAILED_TASK_TIMEOUT_TICKS` | `runtime::refused` + `State::backoff` (`FAILED_TASK_TIMEOUT_TICKS = 20`) |
+| the store the requester watches | `StorageNetworkComponent.get(resource)` | the linked crafter's own 27 slots (`requester::stock_count`) |
+| `startTask(resource, batch)` | the autocrafting component | one `Request` `Int` written into the crafter's compound (`merge_data`) |
+| the requester's status per filter slot | `ResourceStatus` again | `Phase`, printed as `idle` / `running` / `not-enough-ingredients` / `network-full` |
+| the requester's `active` | the network node's property | true while it is asking |
 
 ## 8. Upstream defects fixed / adaptations
 
@@ -215,19 +337,22 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rule: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Pattern`, `plan`, `step_now`, `apply` — no `mod_api` types |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Pattern`, `plan`, `step_now`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration) |
-| `src/machine.rs` | the block entity: saved compound, the 27-slot inventory as a stock, the tick, the manual step |
-| `src/commands.rs` | `/stepcrafter info|target|configure|step|take` |
-| `src/lib.rs` | the one `impl Hooks` and the `Part` the game ticks |
+| `src/machine.rs` | the crafter's block entity: saved compound (including a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step |
+| `src/requester.rs` | the requester's block entity: its filter, the link to a nearby crafter, the ask, its tick and readout |
+| `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
+| `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
+| `src/lib.rs` | the one `impl Hooks` and the two `Part`s the game ticks |
 | `tools/e2e.sh`, `tools/craft_check.py` | the in-game leg of §4 |
 | `LICENSE` | upstream's MIT text (`starforcraft/Step-Crafter`) |
-| `assets/`, `data/` | the carried content: one block (states `active`), its model/textures, loot, recipe, tag, lang, creative tab |
+| `assets/`, `data/` | the carried content: two blocks (states `active`), their models/textures, loot, recipes, tag, lang, creative tab |
 
-Textures are upstream's own (MIT) — `step_crafter/{top,side_active,side_inactive}.png`, byte-copied
-from the jar; the two models are re-authored for this package (a cube with those three textures
-and a vanilla bottom, since upstream's model names `refinedstorage:block/bottom`, which this
-install does not have).
+Textures are upstream's own (MIT) — `step_crafter/{top,side_active,side_inactive}.png` and
+`step_requester/{active,inactive}.png`, byte-copied from the jar; the crafter's two models are
+re-authored for this package (a cube with those three textures and a vanilla bottom, since
+upstream's model names `refinedstorage:block/bottom`, which this install does not have), and the
+requester's two are upstream's own `cube_all` shape unchanged.
 
 ## 10. Coverage (family → evidence, per the parity rule)
 
@@ -240,12 +365,15 @@ install does not have).
 | the manual step | **tested** — `a_manual_step_crafts_even_inside_the_band`, `a_manual_step_still_needs_the_ingredients`; in game `result=crafted` then `result=not-enough-ingredients` |
 | the pattern from the item's recipe | **tested** in game — `target=minecraft:torch cells=2 result=minecraft:torch:4`; refusals for a recipe-less item and an unknown id |
 | the container (the stock) | **tested** in game — `ctl container` loads 8+8 and the readout agrees; empty for a fresh machine |
-| the recipe | **tested** in game — `tools/craft_check.py` (one output, five ingredients consumed, wrong pattern crafts nothing) |
-| the block and the item | **tested** in game — placed, given, read back; `stepcrafter:step_crafter_manager` refused by `setblock` and `give` |
-| the commands | **tested** in game — every reply parsed, incl. `min 9 is above max 4` and the operator refusal |
-| the `active` state | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle |
-| loot, stock spill, `mineable/pickaxe` | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_crafter:1` + `minecraft:torch:8`; a bare hand drops no block |
-| the step requester | **not ported** — `blocked(no-parent-addon-surface)`: needs the RS autocrafting component |
+| the recipes (both) | **tested** in game — `tools/craft_check.py`: one Step Crafter and one Step Requester, five ingredients consumed each, another pattern crafts nothing |
+| the blocks and the items (both) | **tested** in game — placed, given, read back; `stepcrafter:step_crafter_manager` refused by `setblock` and `give` |
+| the commands | **tested** in game — every reply parsed, incl. `min 9 is above max 4`, the requester's three refusals, the wrong-block refusal and the operator refusal |
+| the `active` states (both) | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle, on the machine and on the requester |
+| loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
+| the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |
+| **the interop: the requester asks a nearby Step Crafter** | **tested** in game — the pair reaches `stored=8` / `crafted=8` with 2 coal and 2 sticks consumed, and the *same world with the requester removed* leaves an identically configured machine at `stored=0 crafted=0` |
+| the refusal path across the two blocks | **tested** in game — the crafter with no sticks answers `not-enough-ingredients`, the requester shows `phase=not-enough-ingredients backoff=13`, the restock resumes both to `stored=8 crafted=8` |
+| the requester's own loot | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_requester:1` |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
 | the slot upgrade, the FE buffer, the GUI, `direction`, advancements, JEI/EMI | **not ported** — upgrades/energy/GUI are the RS harness; `direction` is cosmetic here |
 | crafting remainders | **not ported** — no recipe this slice proves has one |

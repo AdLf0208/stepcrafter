@@ -6,10 +6,10 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "stepcrafter"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
-description = "Step Crafter for Horizon: the threshold-maintained step crafting machine"
+description = "Step Crafter for Horizon: the threshold-maintained step crafting machine and its requester"
 publish = false
 
 [dependencies]

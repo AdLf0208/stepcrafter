@@ -10,17 +10,20 @@
 //! |---|---|
 //! | `target <pos> <item>` | the pattern slot, with the pattern being the item's crafting recipe |
 //! | `configure <pos> <min> <max>` | the slot's min/max fields |
-//! | `info <pos>` | the tooltip: maintaining min–max, the status |
+//! | `requester <pos> <item> <min> <max> <batch>` | the requester's filter slot: resource, min, max, batch |
+//! | `info <pos>` | the tooltip: maintaining min–max, the status (either block) |
 //! | `step <pos>` | a manual step (upstream: click a step-crafting request) |
 //! | `take <pos> <item> <count>` | taking the maintained item out of the network |
 
 use mod_api::{
-    Command, CommandArgumentValue, CommandInvocation, Host, LevelRef, PlayerRef, ServerHost, Text,
+    Command, CommandArgumentValue, CommandInvocation, Host, Identifier, LevelRef, PlayerRef,
+    ServerHost, Text,
 };
 
 use crate::machine;
 use crate::pattern;
-use crate::runtime::{Band, Phase};
+use crate::requester;
+use crate::runtime::{Band, Filter, Phase};
 
 /// `/stepcrafter` needs the game-master level `/data get block` needs: it reads and writes another
 /// position's block entity.
@@ -43,6 +46,10 @@ pub fn declare(commands: &mut Vec<Command>) {
         OPERATOR_LEVEL,
     ));
     commands.push(Command::op(
+        "stepcrafter requester <pos:block_pos> <item:id> <min:integer> <max:integer> <batch:integer>",
+        OPERATOR_LEVEL,
+    ));
+    commands.push(Command::op(
         "stepcrafter step <pos:block_pos>",
         OPERATOR_LEVEL,
     ));
@@ -61,7 +68,7 @@ pub fn run(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> bool {
     let Some(pos) = block_pos(invocation) else {
         say(
             host,
-            "Usage: /stepcrafter <info|target|configure|step|take> <x> <y> <z> …",
+            "Usage: /stepcrafter <info|target|configure|requester|step|take> <x> <y> <z> …",
         );
         return true;
     };
@@ -90,6 +97,22 @@ pub fn run(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> bool {
             let line = configure(host, pos, min, max);
             say(host, &line);
         }
+        "requester" => {
+            let (Some(item), Some(min), Some(max), Some(batch)) = (
+                id(invocation, "item"),
+                integer(invocation, "min"),
+                integer(invocation, "max"),
+                integer(invocation, "batch"),
+            ) else {
+                say(
+                    host,
+                    "Usage: /stepcrafter requester <x> <y> <z> <item> <min> <max> <batch>",
+                );
+                return true;
+            };
+            let line = set_filter(host, pos, &item, min, max, batch);
+            say(host, &line);
+        }
         "step" => {
             let line = step(host, pos);
             say(host, &line);
@@ -105,7 +128,7 @@ pub fn run(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> bool {
         }
         _ => say(
             host,
-            "Usage: /stepcrafter <info|target|configure|step|take> <x> <y> <z> …",
+            "Usage: /stepcrafter <info|target|configure|requester|step|take> <x> <y> <z> …",
         ),
     }
     true
@@ -117,7 +140,7 @@ fn set_target(host: &mut dyn ServerHost, pos: [i32; 3], item: &str) -> String {
         return NO_MACHINE.to_owned();
     };
     if !is_machine(&*host, level, pos) {
-        return NO_MACHINE.to_owned();
+        return not_a_crafter(&*host, level, pos);
     }
     let pattern = match pattern::resolve(&*host, item) {
         Ok(pattern) => pattern,
@@ -156,7 +179,7 @@ fn configure(host: &mut dyn ServerHost, pos: [i32; 3], min: i32, max: i32) -> St
         return NO_MACHINE.to_owned();
     };
     if !is_machine(&*host, level, pos) {
-        return NO_MACHINE.to_owned();
+        return not_a_crafter(&*host, level, pos);
     }
     let (Ok(min), Ok(max)) = (u64::try_from(min), u64::try_from(max)) else {
         return "stepcrafter: min and max are amounts, not negative numbers".to_owned();
@@ -193,7 +216,7 @@ fn step(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         return NO_MACHINE.to_owned();
     };
     if !is_machine(&*host, level, pos) {
-        return NO_MACHINE.to_owned();
+        return not_a_crafter(&*host, level, pos);
     }
     let result = machine::step_once(host, level, pos);
     format!(
@@ -208,7 +231,7 @@ fn take(host: &mut dyn ServerHost, pos: [i32; 3], item: &str, count: i32) -> Str
         return NO_MACHINE.to_owned();
     };
     if !is_machine(&*host, level, pos) {
-        return NO_MACHINE.to_owned();
+        return not_a_crafter(&*host, level, pos);
     }
     let Ok(count) = u64::try_from(count) else {
         return "stepcrafter: count is an amount, not a negative number".to_owned();
@@ -269,6 +292,9 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
     let Some(level) = host.level(host.dimension()) else {
         return NO_MACHINE.to_owned();
     };
+    if is_requester(&*host, level, pos) {
+        return requester_readout(host, level, pos);
+    }
     if !is_machine(&*host, level, pos) {
         return NO_MACHINE.to_owned();
     }
@@ -291,7 +317,7 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         format!("{}:{}", pattern.result(), pattern.result_count())
     });
     format!(
-        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} items={} stock={}",
+        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} request={} items={} stock={}",
         pos[0],
         pos[1],
         pos[2],
@@ -303,8 +329,116 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         cells,
         result,
         state.crafted,
+        state.request,
         stock.total(),
         stock_line(&stock),
+    )
+}
+
+/// `/stepcrafter info <pos>` for a Step Requester: its filter, the crafter it asks and that
+/// crafter's stock of the filtered item (upstream's `storageComponent.get(resource)`).
+fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MACHINE.to_owned();
+    };
+    let nbt = entity.data(&*host).unwrap_or_default();
+    let state = requester::read(&nbt);
+    let (crafter, stored) = requester::crafter_and_stock(&*host, level, pos, &nbt);
+    let item = state
+        .filter
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |filter| filter.item().to_owned());
+    let (min, max, batch) = state.filter.as_ref().map_or_else(
+        || ("-".to_owned(), "-".to_owned(), "-".to_owned()),
+        |filter| {
+            (
+                filter.band().min().to_string(),
+                filter.band().max().to_string(),
+                filter.batch().to_string(),
+            )
+        },
+    );
+    let crafter = crafter.map_or_else(|| "none".to_owned(), |[x, y, z]| format!("{x},{y},{z}"));
+    format!(
+        "stepcrafter {} {} {} kind=requester item={} min={} max={} batch={} stored={} phase={} crafter={} backoff={} requests={}",
+        pos[0],
+        pos[1],
+        pos[2],
+        item,
+        min,
+        max,
+        batch,
+        stored,
+        state.phase_id(),
+        crafter,
+        state.backoff,
+        state.requests,
+    )
+}
+
+/// `/stepcrafter requester <pos> <item> <min> <max> <batch>`: the requester's filter entry —
+/// upstream's filter slot with its resource, minimum, maximum and batch size.
+fn set_filter(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    item: &str,
+    min: i32,
+    max: i32,
+    batch: i32,
+) -> String {
+    let Some(level) = host.level(host.dimension()) else {
+        return NO_MACHINE.to_owned();
+    };
+    if !is_requester(&*host, level, pos) {
+        return if is_machine(&*host, level, pos) {
+            "stepcrafter: that is a Step Crafter; a filter is set on the requester beside it"
+                .to_owned()
+        } else {
+            NO_MACHINE.to_owned()
+        };
+    }
+    let Ok(id) = Identifier::parse(item) else {
+        return format!("stepcrafter: {item} is not an item id");
+    };
+    if host.item_key(&id).is_none() {
+        return format!("stepcrafter: {item} is not an item this world knows");
+    }
+    let (Ok(min), Ok(max), Ok(batch)) =
+        (u64::try_from(min), u64::try_from(max), u64::try_from(batch))
+    else {
+        return "stepcrafter: min, max and batch are amounts, not negative numbers".to_owned();
+    };
+    let Some(band) = Band::new(min, max) else {
+        return format!("stepcrafter: min {min} is above max {max}");
+    };
+    let Some(filter) = Filter::new(item.to_owned(), band, batch) else {
+        return format!("stepcrafter: {item} is not an item id");
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MACHINE.to_owned();
+    };
+    let Some(mut nbt) = entity.data(&*host) else {
+        return NO_MACHINE.to_owned();
+    };
+    let mut state = requester::read(&nbt);
+    state.filter = Some(filter.clone());
+    state.phase = Phase::Idle;
+    state.backoff = 0;
+    // The previous filter's crafter may make something else: let the next tick resolve it again.
+    state.link = None;
+    requester::write(&mut nbt, &state);
+    if !matches!(entity.replace_data(host, nbt), Ok(true)) {
+        return "The Step Requester could not be written.".to_owned();
+    }
+    format!(
+        "stepcrafter requester {} {} {} item={} min={} max={} batch={}",
+        pos[0],
+        pos[1],
+        pos[2],
+        filter.item(),
+        filter.band().min(),
+        filter.band().max(),
+        filter.batch()
     )
 }
 
@@ -336,6 +470,26 @@ fn is_machine(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
         .block(host, pos)
         .map(|block| block.id(host) == machine::BLOCK)
         .unwrap_or(false)
+}
+
+fn is_requester(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
+    if !level.is_loaded(host, pos) {
+        return false;
+    }
+    level
+        .block(host, pos)
+        .map(|block| block.id(host) == requester::BLOCK)
+        .unwrap_or(false)
+}
+
+/// The refusal for a command only a Step Crafter answers, at a position that holds a requester.
+fn not_a_crafter(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+    if is_requester(host, level, pos) {
+        "stepcrafter: that is a Step Requester; it is configured with /stepcrafter requester"
+            .to_owned()
+    } else {
+        NO_MACHINE.to_owned()
+    }
 }
 
 fn say(host: &mut dyn ServerHost, line: &str) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Craft the one recipe the Step Crafter package carries, in a real crafting table.
+"""Craft the two recipes the Step Crafter package carries, in a real crafting table.
 
 Called by `tools/e2e.sh` with the open game's control socket. Uses the harness's crafting grid
 (`ctl screen`: slots 100-108 row-major, result 200), gives the ingredients and asserts:
@@ -7,8 +7,12 @@ Called by `tools/e2e.sh` with the open game's control socket. Uses the harness's
 1. `data/stepcrafter/recipe/step_crafter.json` (upstream's shape `ECE/AMA/EDE`, re-rooted on
    vanilla ingredients — see notes.md) crafts exactly one `stepcrafter:step_crafter`, and the five
    ingredients are consumed;
-2. the same ingredients in a pattern the recipe does not declare craft nothing — the control that
-   makes case 1 an assertion rather than a coincidence.
+2. `data/stepcrafter/recipe/step_requester.json` (the same shape, upstream's key for its detector
+   re-rooted on `minecraft:comparator`) crafts exactly one `stepcrafter:step_requester` and
+   consumes its five ingredients — the same shape with another key must be a different recipe, not
+   a shadowed one;
+3. the same ingredients in a pattern a recipe does not declare craft nothing — the control that
+   makes cases 1 and 2 assertions rather than coincidences.
 
 The table is replaced before each case, so an untaken result cannot leak into the next grid.
 Exits 1 with the observed result on the first mismatch.
@@ -20,9 +24,10 @@ import sys
 # Row-major slots of the table screen.
 GRID = ["100", "101", "102", "103", "104", "105", "106", "107", "108"]
 # The recipe's own shape: E at the four corners, C top middle, A at the middle sides, M in the
-# middle, D bottom middle.
+# middle, D bottom middle. Both carried recipes use it; they differ in the `C` key.
 IRON = ["100", "102", "106", "108"]
 REDSTONE = ["101"]
+COMPARATOR = ["101"]
 GOLD = ["103", "105"]
 CRAFTER = ["104"]
 HOPPER = ["107"]
@@ -169,6 +174,33 @@ def main():
             "minecraft:hopper",
         ],
     )
+    requester_ingredients = [
+        ("minecraft:iron_ingot", 4),
+        ("minecraft:comparator", 1),
+        ("minecraft:gold_ingot", 2),
+        ("minecraft:crafter", 1),
+        ("minecraft:hopper", 1),
+    ]
+    expect(
+        "the carried step_requester recipe (ECE/AMA/EDE, comparator for the detector)",
+        requester_ingredients,
+        [
+            ("minecraft:iron_ingot", IRON),
+            ("minecraft:comparator", COMPARATOR),
+            ("minecraft:gold_ingot", GOLD),
+            ("minecraft:crafter", CRAFTER),
+            ("minecraft:hopper", HOPPER),
+        ],
+        "stepcrafter:step_requester",
+        1,
+        consume=[
+            "minecraft:iron_ingot",
+            "minecraft:comparator",
+            "minecraft:gold_ingot",
+            "minecraft:crafter",
+            "minecraft:hopper",
+        ],
+    )
     expect_empty(
         "the same ingredients in a pattern the recipe does not declare",
         ingredients,
@@ -189,8 +221,9 @@ def main():
         raise SystemExit(1)
     print(
         "recipe PASS: ECE/AMA/EDE crafts exactly one stepcrafter:step_crafter from 4 iron, "
-        "1 redstone, 2 gold, 1 crafter and 1 hopper and consumes them, and the same items in "
-        "another pattern craft nothing"
+        "1 redstone, 2 gold, 1 crafter and 1 hopper and consumes them; the same shape with a "
+        "comparator for the centre-top key crafts exactly one stepcrafter:step_requester and "
+        "consumes its five ingredients; and the same items in another pattern craft nothing"
     )
 
 

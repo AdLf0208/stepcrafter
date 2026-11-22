@@ -17,6 +17,7 @@ use mod_api::{
     LevelRef, ModContainer, Registrar, ServerHost, Tag,
 };
 
+use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
 use crate::runtime::{self, Band, Outcome, Pattern, Phase, Stock};
 
 /// The block entity type this mod declares, and the `id` its carried data is tagged with.
@@ -36,6 +37,10 @@ const KEY_CELLS: &str = "Cells";
 const KEY_RESULT_COUNT: &str = "ResultCount";
 const KEY_PHASE: &str = "Phase";
 const KEY_CRAFTED: &str = "Crafted";
+/// How many items a Step Requester has asked this machine for and not yet been given: the ask a
+/// requester writes into this compound (`merge_data`, the `/data merge block` path) and this
+/// machine's tick spends one step at a time.
+pub const KEY_REQUEST: &str = "Request";
 /// Declare the block entity type holding the machine's one block, its 27-slot container and the
 /// Part that ticks it.
 pub fn declare(r: &mut dyn Registrar) {
@@ -82,6 +87,8 @@ pub struct State {
     pub pattern: Option<Pattern>,
     /// Where the last step left the machine.
     pub phase: Phase,
+    /// How many items a requester has asked for and not yet been given.
+    pub request: u64,
     /// How many items this machine has crafted in all (the harness readout).
     pub crafted: u64,
 }
@@ -121,9 +128,8 @@ pub fn read(nbt: &Compound) -> State {
         phase: string(nbt, KEY_PHASE)
             .as_deref()
             .map_or(Phase::Idle, Phase::of),
-        crafted: int(nbt, KEY_CRAFTED)
-            .and_then(|crafted| u64::try_from(crafted).ok())
-            .unwrap_or(0),
+        request: amount(nbt, KEY_REQUEST),
+        crafted: amount(nbt, KEY_CRAFTED),
     }
 }
 
@@ -135,16 +141,8 @@ pub fn write(nbt: &mut Compound, state: &State) {
     }
     match state.band {
         Some(band) => {
-            put(
-                nbt,
-                KEY_MIN,
-                Tag::Int(i32::try_from(band.min()).unwrap_or(i32::MAX)),
-            );
-            put(
-                nbt,
-                KEY_MAX,
-                Tag::Int(i32::try_from(band.max()).unwrap_or(i32::MAX)),
-            );
+            put(nbt, KEY_MIN, int_of(band.min()));
+            put(nbt, KEY_MAX, int_of(band.max()));
         }
         None => {
             drop_key(nbt, KEY_MIN);
@@ -176,11 +174,8 @@ pub fn write(nbt: &mut Compound, state: &State) {
         }
     }
     put(nbt, KEY_PHASE, Tag::String(state.phase.id().into()));
-    put(
-        nbt,
-        KEY_CRAFTED,
-        Tag::Int(i32::try_from(state.crafted).unwrap_or(i32::MAX)),
-    );
+    put(nbt, KEY_REQUEST, int_of(state.request));
+    put(nbt, KEY_CRAFTED, int_of(state.crafted));
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +283,18 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         event.entity.items.resize(SLOTS, None);
     }
     let mut state = read(&event.entity.nbt);
+
+    // A Step Requester's ask outranks this machine's own band for the tick it is served: the band
+    // is this machine's timing rule, an ask is somebody else's, and either way one tick is one step
+    // (`STEPS_PER_TICK`). The step itself is the same one `/stepcrafter step` takes — the ask
+    // bypasses the band, not the pattern.
+    if state.request > 0 {
+        serve_request(host, event, &mut state);
+        write(&mut event.entity.nbt, &state);
+        sync_active(host, pos, state.phase.is_crafting());
+        return;
+    }
+
     let Some(band) = state.band else {
         sync_active(host, pos, false);
         return;
@@ -310,11 +317,7 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 result_count,
             } => {
                 take_from_slots(&*host, &mut event.entity.items, &consume);
-                if let Ok(id) = Identifier::parse(&result)
-                    && let Some(item) = host.item_key(&id)
-                {
-                    put_into_slots(&*host, &mut event.entity.items, item, result_count);
-                }
+                put_result(host, &mut event.entity.items, &result, result_count);
                 state.crafted = state.crafted.saturating_add(u64::from(result_count));
                 state.phase = Phase::Crafting;
                 changed = true;
@@ -338,6 +341,44 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     sync_active(host, pos, state.phase.is_crafting());
 }
 
+/// Serve one item of a requester's ask: one step of the pattern, band bypassed.
+///
+/// The ask is spent by what the step produced (`Request` counts items, not steps); a step the
+/// machine cannot take drops the rest of the ask, so the requester reads the refusal from this
+/// machine's `phase` instead of waiting for items that will never come.
+fn serve_request(
+    host: &mut dyn ServerHost,
+    event: &mut BlockEntityTickEvent<'_>,
+    state: &mut State,
+) {
+    let stock = stock_of(&*host, &event.entity.items);
+    match runtime::step_now(&stock, state.pattern.as_ref(), CAPACITY) {
+        Outcome::Craft {
+            consume,
+            result,
+            result_count,
+        } => {
+            take_from_slots(&*host, &mut event.entity.items, &consume);
+            put_result(host, &mut event.entity.items, &result, result_count);
+            state.crafted = state.crafted.saturating_add(u64::from(result_count));
+            state.request = state.request.saturating_sub(u64::from(result_count));
+            state.phase = Phase::Crafting;
+        }
+        Outcome::NotEnoughIngredients { .. } => {
+            state.request = 0;
+            state.phase = Phase::NotEnoughIngredients;
+        }
+        Outcome::NetworkFull { .. } => {
+            state.request = 0;
+            state.phase = Phase::NetworkFull;
+        }
+        Outcome::Hold | Outcome::Finished => {
+            // No pattern configured, nothing to step: the ask cannot be answered.
+            state.request = 0;
+        }
+    }
+}
+
 /// Take one step now, whatever the band says: the harness driver that proves a single step without
 /// waiting for the stock to fall, and the player's manual step. Answers the outcome's name.
 pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
@@ -351,11 +392,10 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
         .map(|slot| entity.item_slot(&*host, slot as u32).ok().flatten())
         .collect();
     let mut state = read(&nbt);
-    let Some(band) = state.band else {
+    let Some(_band) = state.band else {
         return "unconfigured".to_owned();
     };
     let stock = stock_of(&*host, &items);
-    let _ = band;
     let outcome = runtime::step_now(&stock, state.pattern.as_ref(), CAPACITY);
     match outcome {
         Outcome::Craft {
@@ -364,11 +404,7 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
             result_count,
         } => {
             take_from_slots(&*host, &mut items, &consume);
-            if let Ok(id) = Identifier::parse(&result)
-                && let Some(item) = host.item_key(&id)
-            {
-                put_into_slots(&*host, &mut items, item, result_count);
-            }
+            put_result(host, &mut items, &result, result_count);
             state.crafted = state.crafted.saturating_add(u64::from(result_count));
             state.phase = Phase::Crafting;
             write(&mut nbt, &state);
@@ -401,55 +437,26 @@ pub fn replace_items(
     let _ = entity.set_changed(host);
 }
 
+/// Put one step's result into slots: existing stacks first, then the first empty slot. The item id
+/// comes from the pattern, so an id this world does not know puts nothing in (the step's own
+/// capacity check already held the room).
+fn put_result(
+    host: &mut dyn ServerHost,
+    items: &mut [Option<ItemStack>],
+    result: &str,
+    count: u32,
+) {
+    if let Ok(id) = Identifier::parse(result)
+        && let Some(item) = host.item_key(&id)
+    {
+        put_into_slots(&*host, items, item, count);
+    }
+}
+
 /// The `active` state shows the machine is crafting (upstream's `active` is the network node's;
 /// this machine has no network, so its own run is what it reports).
-fn sync_active(host: &mut dyn ServerHost, pos: [i32; 3], active: bool) {
+pub(crate) fn sync_active(host: &mut dyn ServerHost, pos: [i32; 3], active: bool) {
     let _ = host.set_block_property(pos, "active", if active { "true" } else { "false" });
-}
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-fn put(nbt: &mut Compound, name: &str, value: Tag) {
-    nbt.insert(name.into(), value);
-}
-
-fn tag<'a>(nbt: &'a Compound, name: &str) -> Option<&'a Tag> {
-    nbt.get(&name.into())
-}
-
-fn drop_key(nbt: &mut Compound, name: &str) {
-    nbt.remove(&name.into());
-}
-
-fn string(nbt: &Compound, name: &str) -> Option<String> {
-    match tag(nbt, name) {
-        Some(Tag::String(text)) => Some(text.to_string_lossy()),
-        _ => None,
-    }
-}
-
-fn int(nbt: &Compound, name: &str) -> Option<i32> {
-    match tag(nbt, name) {
-        Some(Tag::Int(value)) => Some(*value),
-        _ => None,
-    }
-}
-
-fn list(nbt: &Compound, name: &str) -> Option<Vec<String>> {
-    let Some(Tag::List(items)) = tag(nbt, name) else {
-        return None;
-    };
-    Some(
-        items
-            .iter()
-            .filter_map(|item| match item {
-                Tag::String(text) => Some(text.to_string_lossy()),
-                _ => None,
-            })
-            .collect(),
-    )
 }
 
 #[cfg(test)]
@@ -473,10 +480,16 @@ mod tests {
                 4,
             ),
             phase: Phase::Crafting,
+            request: 4,
             crafted: 12,
         };
         write(&mut nbt, &state);
         assert_eq!(read(&nbt), state);
+        assert_eq!(
+            read(&nbt).request,
+            4,
+            "an outstanding ask must survive the compound between ticks"
+        );
     }
 
     #[test]
