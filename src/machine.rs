@@ -31,6 +31,8 @@ const KEY_TARGET: &str = "Target";
 const KEY_MIN: &str = "Min";
 const KEY_MAX: &str = "Max";
 const KEY_CELLS: &str = "Cells";
+/// What the pattern's consumed items leave behind, `consumed=left:count` per entry.
+const KEY_REMAINDERS: &str = "Remainders";
 const KEY_RESULT_COUNT: &str = "ResultCount";
 const KEY_PHASE: &str = "Phase";
 const KEY_CRAFTED: &str = "Crafted";
@@ -112,9 +114,10 @@ pub fn read(nbt: &Compound) -> State {
     };
     let result_count = int(nbt, KEY_RESULT_COUNT).and_then(|count| u32::try_from(count).ok());
     let cells = list(nbt, KEY_CELLS);
+    let remainders = list(nbt, KEY_REMAINDERS).unwrap_or_default();
     let pattern = match (target.as_deref(), result_count) {
         (Some(target), Some(count)) => {
-            cells.and_then(|cells| Pattern::decode(&cells, target, count))
+            cells.and_then(|cells| Pattern::decode(&cells, &remainders, target, count))
         }
         _ => None,
     };
@@ -159,6 +162,21 @@ pub fn write(nbt: &mut Compound, state: &State) {
                         .collect(),
                 ),
             );
+            let remainders = pattern.encode_remainders();
+            if remainders.is_empty() {
+                drop_key(nbt, KEY_REMAINDERS);
+            } else {
+                put(
+                    nbt,
+                    KEY_REMAINDERS,
+                    Tag::List(
+                        remainders
+                            .iter()
+                            .map(|entry| Tag::String(entry.as_str().into()))
+                            .collect(),
+                    ),
+                );
+            }
             put(
                 nbt,
                 KEY_RESULT_COUNT,
@@ -167,6 +185,7 @@ pub fn write(nbt: &mut Compound, state: &State) {
         }
         None => {
             drop_key(nbt, KEY_CELLS);
+            drop_key(nbt, KEY_REMAINDERS);
             drop_key(nbt, KEY_RESULT_COUNT);
         }
     }
@@ -197,11 +216,39 @@ pub fn slots_of(host: &dyn Host, items: &[Option<ItemStack>], empty_room: u32) -
 #[must_use]
 pub fn result_room(host: &dyn Host, pattern: Option<&Pattern>) -> u32 {
     pattern
-        .and_then(|pattern| Identifier::parse(pattern.result()).ok())
-        .and_then(|id| host.item_key(&id))
-        .and_then(|item| host.max_stack_size(item))
+        .and_then(|pattern| item_limit(host, pattern.result()))
         .unwrap_or(64)
         .max(1)
+}
+
+/// The machine's 27 slots as the rules see them, with each item a step inserts — the result and
+/// what the recipe leaves behind — carrying its own stack limit as the room an empty slot offers it.
+#[must_use]
+pub fn slots_with_rooms(
+    host: &dyn Host,
+    items: &[Option<ItemStack>],
+    pattern: Option<&Pattern>,
+) -> Slots {
+    let mut slots = slots_of(host, items, result_room(host, pattern));
+    if let Some(pattern) = pattern {
+        let inserted = std::iter::once(pattern.result())
+            .chain(pattern.remainders().values().map(|(left, _)| left.as_str()));
+        for item in inserted {
+            if let Some(max) = item_limit(host, item) {
+                slots.set_empty_room(item, max);
+            }
+        }
+    }
+    slots
+}
+
+/// An item's stack limit, or `None` for an id this world does not know.
+fn item_limit(host: &dyn Host, item: &str) -> Option<u32> {
+    Identifier::parse(item)
+        .ok()
+        .and_then(|id| host.item_key(&id))
+        .and_then(|key| host.max_stack_size(key))
+        .map(|max| max.max(1))
 }
 
 /// The machine's 27 slots as one stock: how much of each item it holds, in all.
@@ -328,27 +375,18 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 
     let mut changed = false;
     for _ in 0..runtime::STEPS_PER_TICK {
-        let slots = slots_of(
-            &*host,
-            &event.entity.items,
-            result_room(&*host, state.pattern.as_ref()),
-        );
+        let slots = slots_with_rooms(&*host, &event.entity.items, state.pattern.as_ref());
         let outcome = runtime::plan(&slots, band, state.phase, state.pattern.as_ref());
-        match outcome {
+        match &outcome {
             Outcome::Hold => break,
             Outcome::Finished => {
                 state.phase = Phase::Idle;
                 changed = true;
                 break;
             }
-            Outcome::Craft {
-                consume,
-                result,
-                result_count,
-            } => {
-                take_from_slots(&*host, &mut event.entity.items, &consume);
-                put_result(host, &mut event.entity.items, &result, result_count);
-                state.crafted = state.crafted.saturating_add(u64::from(result_count));
+            Outcome::Craft { result_count, .. } => {
+                apply_craft(host, &mut event.entity.items, &outcome);
+                state.crafted = state.crafted.saturating_add(u64::from(*result_count));
                 state.phase = Phase::Crafting;
                 changed = true;
             }
@@ -382,21 +420,13 @@ fn serve_request(
     event: &mut BlockEntityTickEvent<'_>,
     state: &mut State,
 ) {
-    let slots = slots_of(
-        &*host,
-        &event.entity.items,
-        result_room(&*host, state.pattern.as_ref()),
-    );
-    match runtime::step_now(&slots, state.pattern.as_ref()) {
-        Outcome::Craft {
-            consume,
-            result,
-            result_count,
-        } => {
-            take_from_slots(&*host, &mut event.entity.items, &consume);
-            put_result(host, &mut event.entity.items, &result, result_count);
-            state.crafted = state.crafted.saturating_add(u64::from(result_count));
-            state.request = state.request.saturating_sub(u64::from(result_count));
+    let slots = slots_with_rooms(&*host, &event.entity.items, state.pattern.as_ref());
+    let outcome = runtime::step_now(&slots, state.pattern.as_ref());
+    match &outcome {
+        Outcome::Craft { result_count, .. } => {
+            apply_craft(host, &mut event.entity.items, &outcome);
+            state.crafted = state.crafted.saturating_add(u64::from(*result_count));
+            state.request = state.request.saturating_sub(u64::from(*result_count));
             state.phase = Phase::Crafting;
         }
         Outcome::NotEnoughIngredients { .. } => {
@@ -430,17 +460,12 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
     let Some(_band) = state.band else {
         return "unconfigured".to_owned();
     };
-    let slots = slots_of(&*host, &items, result_room(&*host, state.pattern.as_ref()));
+    let slots = slots_with_rooms(&*host, &items, state.pattern.as_ref());
     let outcome = runtime::step_now(&slots, state.pattern.as_ref());
-    match outcome {
-        Outcome::Craft {
-            consume,
-            result,
-            result_count,
-        } => {
-            take_from_slots(&*host, &mut items, &consume);
-            put_result(host, &mut items, &result, result_count);
-            state.crafted = state.crafted.saturating_add(u64::from(result_count));
+    match &outcome {
+        Outcome::Craft { result_count, .. } => {
+            apply_craft(host, &mut items, &outcome);
+            state.crafted = state.crafted.saturating_add(u64::from(*result_count));
             state.phase = Phase::Crafting;
             write(&mut nbt, &state);
             let _ = entity.replace_data(&mut *host, nbt);
@@ -451,6 +476,24 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
         Outcome::Finished => "finished".to_owned(),
         Outcome::NotEnoughIngredients { .. } => "not-enough-ingredients".to_owned(),
         Outcome::NetworkFull { .. } => "network-full".to_owned(),
+    }
+}
+
+/// Commit one step: the ingredients out, then the result and what the recipe leaves in.
+fn apply_craft(host: &mut dyn ServerHost, items: &mut [Option<ItemStack>], outcome: &Outcome) {
+    let Outcome::Craft {
+        consume,
+        result,
+        result_count,
+        remainders,
+    } = outcome
+    else {
+        return;
+    };
+    take_from_slots(&*host, items, consume);
+    put_item(host, items, result, *result_count);
+    for (item, count) in remainders {
+        put_item(host, items, item, u32::try_from(*count).unwrap_or(u32::MAX));
     }
 }
 
@@ -472,19 +515,20 @@ pub fn replace_items(
     let _ = entity.set_changed(host);
 }
 
-/// Put one step's result into slots: existing stacks that hold the same components first, then the
-/// first empty slot. The item id comes from the pattern, so an id this world does not know puts
-/// nothing in (the step's own room check already held the space).
-fn put_result(
+/// Put one item into slots: existing stacks that hold the same components first, then the first
+/// empty slot. The id comes from the pattern, so an id this world does not know puts nothing in
+/// (the step's own room check already held the space). Used for the result and for what the recipe
+/// leaves.
+fn put_item(
     host: &mut dyn ServerHost,
     items: &mut [Option<ItemStack>],
-    result: &str,
+    item: &str,
     count: u32,
 ) {
-    if let Ok(id) = Identifier::parse(result)
-        && let Some(item) = host.item_key(&id)
+    if let Ok(id) = Identifier::parse(item)
+        && let Some(key) = host.item_key(&id)
     {
-        put_into_slots(&*host, items, item, count);
+        put_into_slots(&*host, items, key, count);
     }
 }
 
@@ -513,7 +557,13 @@ mod tests {
                 ],
                 "minecraft:torch".to_owned(),
                 4,
-            ),
+            )
+            .map(|pattern| {
+                pattern.with_remainders(std::collections::BTreeMap::from([(
+                    "minecraft:coal".to_owned(),
+                    ("minecraft:coal".to_owned(), 1),
+                )]))
+            }),
             phase: Phase::Crafting,
             request: 4,
             crafted: 12,
@@ -524,6 +574,16 @@ mod tests {
             read(&nbt).request,
             4,
             "an outstanding ask must survive the compound between ticks"
+        );
+        let saved = read(&nbt);
+        let left = saved
+            .pattern
+            .as_ref()
+            .and_then(|pattern| pattern.remainder_of("minecraft:coal"));
+        assert_eq!(
+            left,
+            Some(("minecraft:coal", 1)),
+            "what the recipe leaves must survive the compound too"
         );
     }
 

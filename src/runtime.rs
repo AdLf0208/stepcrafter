@@ -231,23 +231,44 @@ impl Slot {
 
 /// The machine's inventory as the rules see it: one entry per slot, in slot order.
 ///
-/// `empty_room` is the room an **empty** slot offers for the step's result — the result item's
-/// stack limit, which only the game knows. A slot that already holds something carries its own
-/// limit in its [`Slot`].
+/// `default_room` is the room an **empty** slot offers for an item a step inserts — that item's
+/// stack limit, which only the game knows. A step inserts more than one item (the result and what
+/// the recipe leaves behind), and each has its own limit, so [`Slots::set_empty_room`] names one
+/// per item; the default covers the rest. A slot that already holds something carries its own limit
+/// in its [`Slot`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slots {
     slots: Vec<Option<Slot>>,
-    empty_room: u32,
+    default_room: u32,
+    empty_rooms: BTreeMap<String, u32>,
 }
 
 impl Slots {
-    /// No slots yet; an empty slot will hold up to `empty_room` of the result item.
+    /// No slots yet; an empty slot will hold up to `empty_room` of an item not named by
+    /// [`Slots::set_empty_room`].
     #[must_use]
     pub fn new(empty_room: u32) -> Self {
         Self {
             slots: Vec::new(),
-            empty_room,
+            default_room: empty_room,
+            empty_rooms: BTreeMap::new(),
         }
+    }
+
+    /// The room an empty slot offers `item`: its own stack limit, in place of the default.
+    pub fn set_empty_room(&mut self, item: &str, room: u32) {
+        if room > 0 {
+            self.empty_rooms.insert(item.to_owned(), room);
+        }
+    }
+
+    /// The room an empty slot offers `item`.
+    fn room_of_empty_slot(&self, item: &str) -> u32 {
+        self.empty_rooms
+            .get(item)
+            .copied()
+            .unwrap_or(self.default_room)
+            .max(1)
     }
 
     /// Add one slot, empty (`None`) or holding `slot`.
@@ -321,6 +342,7 @@ impl Slots {
             slot.count += added;
             left -= added;
         }
+        let room = self.room_of_empty_slot(item);
         for cell in &mut self.slots {
             if left == 0 {
                 break;
@@ -328,9 +350,9 @@ impl Slots {
             if cell.is_some() {
                 continue;
             }
-            let added = left.min(self.empty_room);
+            let added = left.min(room);
             if added > 0 {
-                *cell = Slot::new(item, added, self.empty_room);
+                *cell = Slot::new(item, added, room);
                 left -= added;
             }
         }
@@ -342,10 +364,11 @@ impl Slots {
     /// this one.
     #[must_use]
     pub fn room_for(&self, item: &str) -> u64 {
+        let room = u64::from(self.room_of_empty_slot(item));
         self.slots
             .iter()
             .map(|slot| match slot {
-                None => u64::from(self.empty_room),
+                None => room,
                 Some(slot) if slot.item == item => u64::from(slot.max.saturating_sub(slot.count)),
                 Some(_) => 0,
             })
@@ -358,9 +381,15 @@ impl Slots {
 /// Upstream's pattern is a Refined Storage pattern item; here it is the target item's own crafting
 /// recipe, resolved from the game's recipe table ([`crate::pattern`]). A cell keeps every item
 /// that satisfies it (a tag expands to its members), and one item of the cell is consumed per step.
+///
+/// `remainders` is what those consumed items leave in the grid — vanilla's `getRemainingItems`: a
+/// milk bucket leaves a bucket, so a cake step that used three of them leaves three buckets. It is
+/// keyed by the consumed item, because the pattern keeps every candidate of a cell and the step
+/// picks one of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
     cells: Vec<Vec<String>>,
+    remainders: BTreeMap<String, (String, u32)>,
     result: String,
     result_count: u32,
 }
@@ -370,6 +399,17 @@ impl Pattern {
     /// names no item, or when the result count is zero (such a pattern could never complete).
     #[must_use]
     pub fn new(cells: Vec<Vec<String>>, result: String, result_count: u32) -> Option<Self> {
+        Self::new_with_remainders(cells, BTreeMap::new(), result, result_count)
+    }
+
+    /// [`Pattern::new`] with what the consumed items leave behind: each `(consumed, left, count)`.
+    #[must_use]
+    pub fn new_with_remainders(
+        cells: Vec<Vec<String>>,
+        remainders: BTreeMap<String, (String, u32)>,
+        result: String,
+        result_count: u32,
+    ) -> Option<Self> {
         if cells.is_empty()
             || cells.iter().any(|cell| cell.is_empty())
             || result.is_empty()
@@ -377,17 +417,48 @@ impl Pattern {
         {
             return None;
         }
-        Some(Self {
-            cells,
-            result,
-            result_count,
-        })
+        Some(
+            Self {
+                cells,
+                remainders: BTreeMap::new(),
+                result,
+                result_count,
+            }
+            .with_remainders(remainders),
+        )
+    }
+
+    /// The same pattern with what its consumed items leave behind; an entry with an empty consumed
+    /// or leftover id, or a zero count, is dropped.
+    #[must_use]
+    pub fn with_remainders(mut self, remainders: BTreeMap<String, (String, u32)>) -> Self {
+        self.remainders = remainders
+            .into_iter()
+            .filter(|(consumed, (left, count))| {
+                !consumed.is_empty() && !left.is_empty() && *count > 0
+            })
+            .collect();
+        self
     }
 
     /// The cells, each a list of the items that satisfy it.
     #[must_use]
     pub fn cells(&self) -> &[Vec<String>] {
         &self.cells
+    }
+
+    /// What each consumed item leaves behind: its leftover item and how many per consumed item.
+    #[must_use]
+    pub fn remainders(&self) -> &BTreeMap<String, (String, u32)> {
+        &self.remainders
+    }
+
+    /// What consuming `item` leaves behind, when it leaves anything.
+    #[must_use]
+    pub fn remainder_of(&self, item: &str) -> Option<(&str, u32)> {
+        self.remainders
+            .get(item)
+            .map(|(left, count)| (left.as_str(), *count))
     }
 
     /// The item one step makes.
@@ -411,10 +482,25 @@ impl Pattern {
             .collect::<Vec<_>>()
     }
 
-    /// A pattern from [`Pattern::encode`]'s form; `None` when it does not admit one ([`Pattern::new`]'s
-    /// rules).
+    /// The saved form of [`Pattern::remainders`]: `consumed=left:count` per entry.
     #[must_use]
-    pub fn decode(cells: &[String], result: &str, result_count: u32) -> Option<Self> {
+    pub fn encode_remainders(&self) -> Vec<String> {
+        self.remainders
+            .iter()
+            .map(|(consumed, (left, count))| format!("{consumed}={left}:{count}"))
+            .collect()
+    }
+
+    /// A pattern from [`Pattern::encode`] and [`Pattern::encode_remainders`]'s forms; `None` when a
+    /// part of it does not admit one ([`Pattern::new_with_remainders`]'s rules, or a saved entry
+    /// that is not `consumed=left:count`).
+    #[must_use]
+    pub fn decode(
+        cells: &[String],
+        remainders: &[String],
+        result: &str,
+        result_count: u32,
+    ) -> Option<Self> {
         let cells = cells
             .iter()
             .map(|cell| {
@@ -425,7 +511,16 @@ impl Pattern {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        Self::new(cells, result.to_owned(), result_count)
+        let mut left = BTreeMap::new();
+        for entry in remainders {
+            let (consumed, rest) = entry.split_once('=')?;
+            let (leftover, count) = match rest.rsplit_once(':') {
+                Some((leftover, count)) => (leftover, count.parse::<u32>().ok()?),
+                None => (rest, 1),
+            };
+            left.insert(consumed.trim().to_owned(), (leftover.trim().to_owned(), count));
+        }
+        Self::new_with_remainders(cells, left, result.to_owned(), result_count)
     }
 }
 
@@ -436,20 +531,23 @@ pub enum Outcome {
     Hold,
     /// The run reached `max`: the phase returns to idle.
     Finished,
-    /// One step: consume these items, make `result_count` of `result`.
+    /// One step: consume these items, make `result_count` of `result`, and leave `remainders`
+    /// (`item`, `count`) in the slots — what the consumed ingredients leave behind.
     Craft {
         consume: Vec<(String, u64)>,
         result: String,
         result_count: u32,
+        remainders: Vec<(String, u64)>,
     },
     /// A cell of the pattern has no item in stock; the cell's candidates are named.
     NotEnoughIngredients { missing: Vec<String> },
-    /// The result has no room in the slots the ingredients would leave free.
+    /// The step's result, or what the recipe leaves, has no room in the slots the ingredients would
+    /// leave free.
     NetworkFull {
         item: String,
-        /// How many of the result those slots can still hold.
+        /// How many of the item those slots can still hold.
         room: u64,
-        /// How many the step makes.
+        /// How many the step would insert (the result, or what the recipe leaves).
         produced: u32,
     },
 }
@@ -472,7 +570,8 @@ pub fn plan(slots: &Slots, band: Band, phase: Phase, pattern: Option<&Pattern>) 
 
 /// One step's ingredients out and result in, once the band said to craft:
 /// upstream's `prepareCraft` (resolve every cell against the stock, reserving what earlier cells
-/// took) and its `canInsertIntoNetwork` room check.
+/// took), its `canInsertIntoNetwork` room check, and `getRemainingItems` (what the ingredients
+/// leave in the grid).
 fn craft(slots: &Slots, pattern: &Pattern) -> Outcome {
     let mut remaining = slots.stock();
     let mut consume: BTreeMap<String, u64> = BTreeMap::new();
@@ -490,9 +589,18 @@ fn craft(slots: &Slots, pattern: &Pattern) -> Outcome {
     if !missing.is_empty() {
         return Outcome::NotEnoughIngredients { missing };
     }
+    // What the consumed items leave behind, summed per leftover item: three milk buckets leave
+    // three buckets, however many cells they came from.
+    let mut left: BTreeMap<String, u64> = BTreeMap::new();
+    for (item, count) in &consume {
+        if let Some((leftover, per)) = pattern.remainder_of(item) {
+            *left.entry(leftover.to_owned()).or_default() += u64::from(per) * count;
+        }
+    }
     let produced = pattern.result_count();
     // The room is measured **after** the ingredients are taken: consuming the last item of a slot
-    // frees that slot, and only the slots that hold the result (or are empty) have room for it.
+    // frees that slot, and only the slots that hold an inserted item (or are empty) have room for
+    // it. The result goes in first, then the remainders, one at a time, each through the same rule.
     let mut after = slots.clone();
     for (item, count) in &consume {
         after.take(item, *count);
@@ -505,10 +613,26 @@ fn craft(slots: &Slots, pattern: &Pattern) -> Outcome {
             produced,
         };
     }
+    after.put(pattern.result(), produced);
+    let mut remainders = Vec::with_capacity(left.len());
+    for (item, count) in left {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let room = after.room_for(&item);
+        if u64::from(count) > room {
+            return Outcome::NetworkFull {
+                item,
+                room,
+                produced: count,
+            };
+        }
+        after.put(&item, count);
+        remainders.push((item, u64::from(count)));
+    }
     Outcome::Craft {
         consume: consume.into_iter().collect(),
         result: pattern.result().to_owned(),
         result_count: pattern.result_count(),
+        remainders,
     }
 }
 
@@ -615,6 +739,7 @@ pub fn apply(slots: &mut Slots, outcome: &Outcome) -> bool {
         consume,
         result,
         result_count,
+        remainders,
     } = outcome
     else {
         return false;
@@ -623,6 +748,9 @@ pub fn apply(slots: &mut Slots, outcome: &Outcome) -> bool {
         slots.take(item, *count);
     }
     slots.put(result, *result_count);
+    for (item, count) in remainders {
+        slots.put(item, u32::try_from(*count).unwrap_or(u32::MAX));
+    }
     true
 }
 
@@ -660,6 +788,107 @@ mod tests {
             4,
         )
         .expect("a valid pattern")
+    }
+
+    /// Vanilla's `getRemainingItems` for the one item a step in these tests consumes: a milk bucket
+    /// leaves a bucket.
+    fn buckets() -> BTreeMap<String, (String, u32)> {
+        BTreeMap::from([(
+            "minecraft:milk_bucket".to_owned(),
+            ("minecraft:bucket".to_owned(), 1),
+        )])
+    }
+
+    /// `minecraft:cake` (`MMM/SES/WWW`): 3 milk buckets, 2 sugar, 1 egg and 3 wheat, making one
+    /// cake — and leaving the three buckets behind.
+    fn cake() -> Pattern {
+        let cell = |id: &str| vec![id.to_owned()];
+        Pattern::new_with_remainders(
+            vec![
+                cell("minecraft:milk_bucket"),
+                cell("minecraft:milk_bucket"),
+                cell("minecraft:milk_bucket"),
+                cell("minecraft:sugar"),
+                cell("minecraft:egg"),
+                cell("minecraft:sugar"),
+                cell("minecraft:wheat"),
+                cell("minecraft:wheat"),
+                cell("minecraft:wheat"),
+            ],
+            buckets(),
+            "minecraft:cake".to_owned(),
+            1,
+        )
+        .expect("a valid pattern")
+    }
+
+    /// One milk bucket making one cake, leaving a bucket: cake's rule with a single cell, for the
+    /// room test.
+    fn bucket_step() -> Pattern {
+        Pattern::new_with_remainders(
+            vec![vec!["minecraft:milk_bucket".to_owned()]],
+            buckets(),
+            "minecraft:cake".to_owned(),
+            1,
+        )
+        .expect("a valid pattern")
+    }
+
+    #[test]
+    fn a_step_returns_the_bucket_the_recipe_leaves() {
+        let slots = slots(&[
+            ("minecraft:milk_bucket", 3),
+            ("minecraft:sugar", 2),
+            ("minecraft:egg", 1),
+            ("minecraft:wheat", 3),
+        ]);
+        let outcome = step_now(&slots, Some(&cake()));
+        assert_eq!(
+            outcome,
+            Outcome::Craft {
+                consume: vec![
+                    ("minecraft:egg".to_owned(), 1),
+                    ("minecraft:milk_bucket".to_owned(), 3),
+                    ("minecraft:sugar".to_owned(), 2),
+                    ("minecraft:wheat".to_owned(), 3),
+                ],
+                result: "minecraft:cake".to_owned(),
+                result_count: 1,
+                remainders: vec![("minecraft:bucket".to_owned(), 3)],
+            },
+            "the three milk buckets leave three buckets in the machine"
+        );
+        let mut after = slots.clone();
+        assert!(apply(&mut after, &outcome));
+        assert_eq!(after.count("minecraft:milk_bucket"), 0, "the milk is gone");
+        assert_eq!(after.count("minecraft:cake"), 1);
+        assert_eq!(
+            after.count("minecraft:bucket"),
+            3,
+            "a bucket recipe leaves its buckets, not destroys them"
+        );
+    }
+
+    #[test]
+    fn a_remainder_that_fits_no_slot_refuses_the_step() {
+        // One slot holds the milk bucket. Taking it frees the slot and the cake goes in; nothing is
+        // empty then and no slot holds a bucket, so what the recipe leaves has nowhere to go and the
+        // step must not consume the milk.
+        let slots = full_slots(&[("minecraft:milk_bucket", 1)]);
+        let before = slots.clone();
+        let outcome = step_now(&slots, Some(&bucket_step()));
+        assert_eq!(
+            outcome,
+            Outcome::NetworkFull {
+                item: "minecraft:bucket".to_owned(),
+                room: 0,
+                produced: 1,
+            },
+            "no slot has room for the bucket the milk leaves"
+        );
+        let mut after = before.clone();
+        assert!(!apply(&mut after, &outcome), "a refusal consumes nothing");
+        assert_eq!(after, before);
     }
 
     /// A machine's 27 slots from `(item, count)` pairs — one slot each, 64 to a stack, the rest
@@ -740,6 +969,7 @@ mod tests {
                 ],
                 result: "minecraft:torch".to_owned(),
                 result_count: 4,
+                remainders: Vec::new(),
             }
         );
     }
@@ -757,6 +987,7 @@ mod tests {
                 ],
                 result: "minecraft:torch".to_owned(),
                 result_count: 4,
+                remainders: Vec::new(),
             },
             "the alternative ingredient in stock is the one consumed"
         );
@@ -867,6 +1098,7 @@ mod tests {
                 ],
                 result: "minecraft:torch".to_owned(),
                 result_count: 4,
+                remainders: Vec::new(),
             },
             "the free room in the torch's own slot holds the step"
         );
@@ -890,6 +1122,7 @@ mod tests {
                 ],
                 result: "minecraft:torch".to_owned(),
                 result_count: 4,
+                remainders: Vec::new(),
             }
         );
     }
@@ -935,6 +1168,7 @@ mod tests {
                 ],
                 result: "minecraft:torch".to_owned(),
                 result_count: 4,
+                remainders: Vec::new(),
             }
         );
     }
@@ -981,6 +1215,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_slot_offers_each_inserted_item_its_own_room() {
+        // A step inserts the result and what the recipe leaves; their stack limits differ, so an
+        // empty slot's room for a bucket (16) is not its room for a cake (1).
+        let mut slots = Slots::new(1);
+        slots.push(None);
+        slots.set_empty_room("minecraft:bucket", 16);
+        assert_eq!(slots.room_for("minecraft:cake"), 1);
+        assert_eq!(slots.room_for("minecraft:bucket"), 16);
+        assert_eq!(slots.put("minecraft:bucket", 3), 3);
+        assert_eq!(slots.count("minecraft:bucket"), 3);
+    }
+
+    #[test]
     fn a_pattern_round_trips_through_its_saved_form() {
         let pattern = torch();
         let saved = pattern.encode();
@@ -991,9 +1238,29 @@ mod tests {
                 "minecraft:stick".to_owned()
             ]
         );
-        assert_eq!(Pattern::decode(&saved, "minecraft:torch", 4), Some(pattern));
-        assert!(Pattern::decode(&["".to_owned()], "minecraft:torch", 4).is_none());
-        assert!(Pattern::decode(&saved, "minecraft:torch", 0).is_none());
+        assert_eq!(
+            Pattern::decode(&saved, &[], "minecraft:torch", 4),
+            Some(pattern)
+        );
+        assert!(Pattern::decode(&["".to_owned()], &[], "minecraft:torch", 4).is_none());
+        assert!(Pattern::decode(&saved, &[], "minecraft:torch", 0).is_none());
+        // The remainders are part of the configuration: a restart must not forget that the milk
+        // buckets leave buckets.
+        let pattern = cake();
+        let cells = pattern.encode();
+        let saved_remainders = pattern.encode_remainders();
+        assert_eq!(
+            saved_remainders,
+            vec!["minecraft:milk_bucket=minecraft:bucket:1".to_owned()]
+        );
+        assert_eq!(
+            Pattern::decode(&cells, &saved_remainders, "minecraft:cake", 1),
+            Some(pattern)
+        );
+        assert!(
+            Pattern::decode(&cells, &["nonsense".to_owned()], "minecraft:cake", 1).is_none(),
+            "a saved remainder that is not consumed=left:count is refused"
+        );
     }
 
     /// The requester's filter: 4 torches kept between 4 and 8, asking 4 at a time.

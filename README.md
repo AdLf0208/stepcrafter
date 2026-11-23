@@ -7,7 +7,9 @@ The **Step Crafter** keeps a resource in stock: it is told **what** to keep (`/s
 and **between which amounts** (`/stepcrafter configure <min> <max>`), resolves the item's own
 crafting recipe into a step, and crafts one step at a time out of the ingredients in its own 27-slot
 inventory — starting when the stock falls below the minimum and filling up to the maximum, as
-upstream's `StepCrafterNetworkNode.doWork` does. Right-click the block to open its inventory.
+upstream's `StepCrafterNetworkNode.doWork` does. A step also leaves what its ingredients leave, as a
+crafting grid does: a cake recipe returns its three milk buckets. Right-click the block to open its
+inventory.
 
 The **Step Requester** keeps a filtered item in stock *through* the Step Crafter beside it: when that
 crafter's stock of the filter falls below the requester's minimum, it asks the crafter for batches of

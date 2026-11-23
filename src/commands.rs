@@ -162,15 +162,27 @@ fn set_target(host: &mut dyn ServerHost, pos: [i32; 3], item: &str) -> String {
         return "The Step Crafter could not be written.".to_owned();
     }
     format!(
-        "stepcrafter target {} {} {} target={} cells={} result={}:{}",
+        "stepcrafter target {} {} {} target={} cells={} result={}:{} remainders={}",
         pos[0],
         pos[1],
         pos[2],
         pattern.result(),
         pattern.cells().len(),
         pattern.result(),
-        pattern.result_count()
+        pattern.result_count(),
+        remainder_line(&pattern)
     )
+}
+
+/// What the pattern's consumed items leave behind, as the saved form (`consumed=left:count`),
+/// comma-separated; `none` when nothing is left.
+fn remainder_line(pattern: &crate::runtime::Pattern) -> String {
+    let entries = pattern.encode_remainders();
+    if entries.is_empty() {
+        "none".to_owned()
+    } else {
+        entries.join(",")
+    }
 }
 
 /// `/stepcrafter configure <pos> <min> <max>`: the maintenance band.

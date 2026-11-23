@@ -9,7 +9,7 @@ evidence under `ports/_shared/licence-cache/`). The port targets Horizon **26.3*
 `api = "0.2"`, package format `native-1`, launcher 0.2.92.
 
 **Class + tier:** `content` / **machines** (`ports/ledger.csv`; provenance
-`ports/_shared/source-map/atm10-sources.csv`). Both slices are block entities with a container, a
+`ports/_shared/source-map/atm10-sources.csv`). Every slice is a block entity with a container, a
 saved band and a tick — the machines shape, no entities, renderers or dimensions.
 
 **Licence rank 0** (MIT, read from the jar's `META-INF/neoforge.mods.toml`; upstream's
@@ -163,6 +163,32 @@ touched here. The archive carries `LICENSE-NOTICE.md` (Ultramega, Starforcraft a
 `https://github.com/starforcraft/Step-Crafter`, verbatim) beside upstream's `LICENSE` verbatim; §5
 records both, and the packed `README.md` is the tree's current text (`cmp`-identical).
 
+## 2d. The slice (version 0.2.3): crafting remainders
+
+0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
+its bucket upstream)"*. A step consumed every cell and put only the result in, so a cake cost three
+milk buckets and gave none back — where a crafting grid returns one bucket per bucket.
+
+The pin exposes the remainder twice, and the symbol check came before any code:
+
+| symbol | where | verdict |
+|---|---|---|
+| `Host::item_crafting_remainder(&ItemStack) -> Option<ItemStack>` | `host/block_states.rs:44` (`#[access(Metadata)]`, side both) | **used**: one call per distinct candidate when `/stepcrafter target` resolves the pattern, never in the tick |
+| `RecipeMatch.remainders: Vec<Option<ItemStack>>` via `LevelRef::recipe_for` | `item/crafting.rs:230`, `generated/mod_api_generated_host.rs:1678` | exists, but not usable here: `Recipe` (from `recipes_of_type`) carries no grid width/height (`item/crafting.rs:146`), so a `RecipeInput::Crafting` cannot be rebuilt without parsing the file's pattern. The item-level accessor is the same `getRemainingItems` value for a plain stack, and the step picks one candidate per cell, so a per-candidate answer is the precise one |
+
+What changed:
+
+- `Pattern` keeps `remainders` (consumed item → leftover item and count) **in its saved compound**
+  (`Remainders`, one `consumed=left:count` per entry), so a restart keeps them; `/stepcrafter target`
+  names them in its reply (`remainders=minecraft:milk_bucket=minecraft:bucket:1`).
+- `runtime::craft` sums them per leftover item and carries them in `Outcome::Craft { remainders }`;
+  `apply` and `machine::apply_craft` insert them after the result.
+- The **0.2.2 room rule covers them**: the result and every remainder are simulated in the
+  post-consumption slots through `Slots::put`, and a remainder with no room refuses the whole step
+  (`NetworkFull`, nothing consumed). `Slots` learned each inserted item's own empty-slot room
+  (`set_empty_room`), because a bucket's limit (16) is not a cake's (1).
+
+
 ## 3. TDD: red, then green
 
 The red transcript is `ports/_shared/evidence/stepcrafter/red-unit.log` — the rule and the step
@@ -176,7 +202,7 @@ assertion `left == right` failed: a stock below min must be crafted
 test result: FAILED. 4 passed; 8 failed
 ```
 
-Green at 0.2.1: **30 tests**, `sdk-test.log` (17 of them the 0.2.0 machine, 13 the requester).
+Green at 0.2.1: **30 tests** (in the then-current `sdk-test.log`; 17 of them the 0.2.0 machine, 13 the requester).
 The requester's red transcript is `red-unit-requester.log`: its eight rule tests ran against an
 `ask()` stub answering `Hold` for every filter, so
 
@@ -192,7 +218,8 @@ test result: FAILED. 19 passed; 6 failed
 `a_zero_batch_filter_is_disabled`) passed against the stub by construction, which is why they are the
 control in the green run.
 
-Green at 0.2.2 (the review slice): **34 tests** (`sdk-test.log`). Its red transcript is
+Green at 0.2.2 (the review slice): **34 tests** (the then-current `sdk-test.log`, which 0.2.3 has
+since regenerated at 37). Its red transcript is
 `red-unit-capacity.log`: the rule had been ported onto the new slot model but `craft` still made the
 review's aggregate check, so the two tests that demand per-slot room failed for exactly that reason:
 
@@ -217,6 +244,32 @@ test result: FAILED. 32 passed; 2 failed
 The `take` fix has no unit-level red: handing stacks to a player needs the game's host, so its red is
 the in-game counterfactual `SELFTEST=take` (§4), which asserts the defect (a rebuilt stack reads no
 components) and fails on the fixed package.
+
+Green at 0.2.3 (the remainder slice): **37 tests** (`sdk-test.log`). Its red transcript is
+`red-unit-remainder.log`: `Pattern` carried the remainders and `Outcome::Craft` had the field, but
+`craft` still returned none, so the two new tests failed for exactly that reason:
+
+```
+---- runtime::tests::a_step_returns_the_bucket_the_recipe_leaves stdout ----
+
+thread 'runtime::tests::a_step_returns_the_bucket_the_recipe_leaves' (61217) panicked at src/runtime.rs:842:9:
+assertion `left == right` failed: the three milk buckets leave three buckets in the machine
+  left: Craft { consume: [("minecraft:egg", 1), ("minecraft:milk_bucket", 3), ("minecraft:sugar", 2), ("minecraft:wheat", 3)], result: "minecraft:cake", result_count: 1, remainders: [] }
+ right: Craft { consume: [("minecraft:egg", 1), ("minecraft:milk_bucket", 3), ("minecraft:sugar", 2), ("minecraft:wheat", 3)], result: "minecraft:cake", result_count: 1, remainders: [("minecraft:bucket", 3)] }
+
+---- runtime::tests::a_remainder_that_fits_no_slot_refuses_the_step stdout ----
+
+thread 'runtime::tests::a_remainder_that_fits_no_slot_refuses_the_step' (61206) panicked at src/runtime.rs:876:9:
+assertion `left == right` failed: no slot has room for the bucket the milk leaves
+  left: Craft { consume: [("minecraft:milk_bucket", 1)], result: "minecraft:cake", result_count: 1, remainders: [] }
+ right: NetworkFull { item: "minecraft:bucket", room: 0, produced: 1 }
+
+test result: FAILED. 35 passed; 2 failed
+```
+
+The remainder's own red is that same pair; its in-game red is the `SELFTEST=remainder` run (§4),
+which asserts today's defect (the buckets are gone) and ends non-zero on the fixed package.
+
 
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
@@ -248,8 +301,8 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — five run logs plus the build log, all `--strict`
-green (`logs=5 ok=5 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — six run logs plus the build log, all `--strict`
+green (`logs=6 ok=6 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
@@ -258,7 +311,8 @@ green (`logs=5 ok=5 missing-exit=0 bad-exit=0`):
 | `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the **requester's** headline assertion (`stored=8`) and the run ends non-zero; `SELFTEST=crafter` inverts the machine's (`stored=16`) instead |
 | `e2e-selftest-capacity.log` | `FAIL` + `EXIT:1` | `SELFTEST=capacity` inverts the **no-room** assertion: “nothing fit, so nothing was served” (`crafted=0`) ends the run non-zero |
 | `e2e-selftest-take.log` | `FAIL` + `EXIT:1` | `SELFTEST=take` inverts the **component** assertion: the defect “a rebuilt stack reads no components” ends the run non-zero |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.2: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-remainder.log` | `FAIL` + `EXIT:1` | `SELFTEST=remainder` inverts the **remainder** assertion: the defect “the step consumes the buckets and leaves none” ends the run non-zero |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.3: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -309,22 +363,29 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     them over and `ctl inventory` reads two torch stacks with their own names and counts and a sword
     with `components {"custom_name":"Blade","damage":7,"enchantments":{"sharpness":3}}`, `damage 7`
     and `durability_left 1554`;
-17. `/stepcrafter requester` refuses an inverted band, an unknown item and a negative batch, and
+17. **crafting remainders (0.2.3)**: `/stepcrafter target … minecraft:cake` resolves the cake's
+    9-cell recipe and names what it leaves (`remainders=minecraft:milk_bucket=minecraft:bucket:1`);
+    with 3 milk buckets, 2 sugar, an egg and 3 wheat loaded and the band at `0..0`, one
+    `/stepcrafter step` reads `result=crafted` and the machine then holds
+    `stock=minecraft:bucket:3,minecraft:cake:1` (`stored=1 crafted=1 items=4`) — the cake **and** the
+    three buckets, with every ingredient consumed. `SELFTEST=remainder` asserts the old behaviour
+    (no bucket) and ends the run non-zero;
+18. `/stepcrafter requester` refuses an inverted band, an unknown item and a negative batch, and
     `/stepcrafter target` on a requester answers "that is a Step Requester";
-18. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
+19. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
     its item **and spills the 8 torches** (`drops: minecraft:torch:8, stepcrafter:step_crafter:1`);
     placing the machine's item again gives an unconfigured machine (the recorded limit, §6);
-19. a non-operator's `/stepcrafter info` is refused.
+20. a non-operator's `/stepcrafter info` is refused.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **52,361 B** |
-| sha256 | `d7f5eb112ed6bd2e06d4ae83432a4744bc3a0f32cf849ed65a3a59f0d5d7bff5` |
-| entries | 37 (`165,157 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.2` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **55,800 B** |
+| sha256 | `ebbdd9cb13d44f8bd8d0319e86053dd24dd7f3aba832b1ca97f09eed39ef29c5` |
+| entries | 37 (`180,709 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.3` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -346,9 +407,22 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   but this port's pattern is derived, so there is nothing to drop. A `block_entity_data` payload
   was tried and removed: it did not restore the block entity, and HANDOVER §9d.23 forbids it on a
   block whose contents the engine already spills.
-- **`crafting remainders` are not produced** (a bucket recipe leaves its bucket upstream in the
-  network): the cells are consumed and the result inserted. No recipe the port's own e2e uses has
-  one; record it as `not ported` rather than pretend.
+- **The room model counts item ids, not components.** `Slots` knows a slot's item, count and limit;
+  `machine::put_into_slots` merges only into a stack whose components match the plain result, so a
+  machine holding a **named** stack of the target item counts room the game would not use: a step can
+  report room, be taken, and then not merge its result into the named stack. No leg reaches it (the
+  named stacks are planted in an empty machine and taken out before any step; a normal load carries
+  plain stacks). It is the gap the next slice should close — carry each stack's components in `Slot`,
+  or drive the room check from the same dry-run insert the step will use.
+- **Crafting remainders are carried from the *item*, not from a matched grid.** A step's pattern
+  keeps what each candidate leaves (`Host::item_crafting_remainder`, one call per candidate at
+  `/stepcrafter target`) and inserts it beside the result through the same per-slot room rule
+  (0.2.3). `RecipeMatch::remainders` (`LevelRef::recipe_for`) is the same data for a real grid but is
+  not reachable here: `Recipe` from `recipes_of_type` carries no grid width/height, so the input grid
+  cannot be rebuilt from it. A recipe that overrides `getRemainingItems` with something other than the
+  item's own remainder (a custom recipe class) is therefore not expressed; vanilla crafting recipes,
+  which is what this pattern resolves, are. A remainder with no room refuses the step rather than
+  dropping the leftover on the floor.
 - **`direction` state, the GUI, the colours, the managers, the monitor, the slot upgrade, the FE
   buffer** — see §1's table, each with its reason.
 - **The requester's reach is 4 blocks, not the network's.** Upstream's requester asks the network's
@@ -380,7 +454,8 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | behaviour | upstream | this port |
 |---|---|---|
 | the band rule (start below min, fill to max, hold at max) | `StepCrafterNetworkNode.doWork`, three guards | `runtime::decide`, `runtime::plan` |
-| one step = resolve every cell, take, insert | `StepCraftingAlgorithm.prepareCraft/extractResolvedInputs/insertIntoNetwork` | `runtime::craft` (candidate resolution, reservation by counting), `machine::take_from_slots` / `put_into_slots` |
+| one step = resolve every cell, take, insert | `StepCraftingAlgorithm.prepareCraft/extractResolvedInputs/insertIntoNetwork` | `runtime::craft` (candidate resolution, reservation by counting), `machine::apply_craft` |
+| what the ingredients leave | `getRemainingItems` on the pattern's recipe | `Pattern.remainders` (per candidate, from `Host::item_crafting_remainder` at configuration), carried in `Outcome::Craft`, inserted beside the result under the same room rule |
 | `NETWORK_FULL` | `canInsertIntoNetwork` before extracting | `runtime::craft`'s room check **after** the ingredients are taken: the free room in the slots that hold the result plus one empty slot's worth per empty slot (the result's stack limit) — the stock's item count is not the room |
 | `NOT_ENOUGH_INGREDIENTS` | `prepareCraft` returns null | `Outcome::NotEnoughIngredients` naming the short cell |
 | status per pattern slot | `ResourceStatus` (`CRAFTING`, `FINISHED`, `NOT_ENOUGH_INGREDIENTS`, `NETWORK_FULL`) | `runtime::Phase`, saved as `Phase` |
@@ -406,9 +481,9 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room), `Pattern`, `plan`, `step_now`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
-| `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration) |
-| `src/machine.rs` | the crafter's block entity: saved compound (including a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
+| `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
+| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step, `apply_craft` |
 | `src/requester.rs` | the requester's block entity: its filter, the link to a nearby crafter, the ask, its tick and readout |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
 | `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
@@ -438,7 +513,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the blocks and the items (both) | **tested** in game — placed, given, read back; `stepcrafter:step_crafter_manager` refused by `setblock` and `give` |
 | the commands | **tested** in game — every reply parsed, incl. `min 9 is above max 4`, the requester's three refusals, the wrong-block refusal and the operator refusal |
 | `/stepcrafter take` (the stored stacks themselves) | **tested** in game — two named torch stacks (Alpha ×2, Beta ×3) and a damaged, enchanted sword come out with both names, both counts, `damage 7` and `sharpness 3` (`durability_left 1554`); `SELFTEST=take` asserts the defect (no components) and the run ends non-zero |
-| the slots' room for the result (per-slot limits, post-consumption) | **tested** — `a_result_that_fits_no_slot_…`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`; in game the 1,724-item machine (`items=1724` of 1,728) refuses |
+| the slots' room for the result (per-slot limits, post-consumption) | **tested** — `a_result_that_fits_no_slot_…`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`, `an_empty_slot_offers_each_inserted_item_its_own_room`; in game the 1,724-item machine (`items=1724` of 1,728) refuses |
 | the `active` states (both) | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle, on the machine and on the requester |
 | loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |
@@ -447,4 +522,4 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the requester's own loot | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_requester:1` |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
 | the slot upgrade, the FE buffer, the GUI, `direction`, advancements, JEI/EMI | **not ported** — upgrades/energy/GUI are the RS harness; `direction` is cosmetic here |
-| crafting remainders | **not ported** — no recipe this slice proves has one |
+| crafting remainders (a bucket recipe leaves its bucket) | **tested** — `a_step_returns_the_bucket_the_recipe_leaves` (3 milk buckets → cake + 3 buckets), `a_remainder_that_fits_no_slot_refuses_the_step`, `a_pattern_round_trips_through_its_saved_form` (the saved `Remainders`); in game a cake step reads `stock=minecraft:bucket:3,minecraft:cake:1` with every ingredient consumed, and `SELFTEST=remainder` asserts the old defect (no bucket) and ends non-zero |

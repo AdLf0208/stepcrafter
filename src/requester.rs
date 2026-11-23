@@ -238,11 +238,11 @@ fn ask_crafter(host: &mut dyn ServerHost, entity: BlockEntityRef, amount: u64) {
 
 /// Where a requester's crafter is this tick.
 enum Found {
-    /// The crafter, its handle and the configuration it saved.
+    /// The crafter, its handle, and what the requester needs to know about it.
     Crafter {
         pos: [i32; 3],
         entity: BlockEntityRef,
-        state: machine::State,
+        state: Crafter,
     },
     /// No Step Crafter maintains the filter inside [`LINK_RADIUS`].
     NoCrafter,
@@ -251,9 +251,26 @@ enum Found {
     Unreadable,
 }
 
+/// The part of a crafter's saved state a requester reads: how many items it has been asked for and
+/// how its last step went. The pattern, the band and the stock are the crafter's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Crafter {
+    request: u64,
+    phase: Phase,
+}
+
+impl From<machine::State> for Crafter {
+    fn from(state: machine::State) -> Self {
+        Self {
+            request: state.request,
+            phase: state.phase,
+        }
+    }
+}
+
 /// One position's answer to "is this the crafter my filter needs".
 enum Candidate {
-    Hit(BlockEntityRef, machine::State),
+    Hit(BlockEntityRef, Crafter),
     Unreadable,
     Miss,
 }
@@ -275,7 +292,7 @@ fn resolve(
             Candidate::Miss => {}
         }
     }
-    let mut best: Option<([i32; 3], BlockEntityRef, machine::State, i32)> = None;
+    let mut best: Option<([i32; 3], BlockEntityRef, Crafter, i32)> = None;
     let mut unreadable = false;
     for dx in -LINK_RADIUS..=LINK_RADIUS {
         for dy in -LINK_RADIUS..=LINK_RADIUS {
@@ -318,7 +335,7 @@ fn inspect(host: &dyn Host, level: LevelRef, pos: [i32; 3], item: &str) -> Candi
     };
     let state = machine::read(&data);
     if state.target.as_deref() == Some(item) {
-        Candidate::Hit(entity, state)
+        Candidate::Hit(entity, Crafter::from(state))
     } else {
         // A crafter that maintains something else cannot be asked for this item: the ask would
         // spend this requester's items on another pattern.

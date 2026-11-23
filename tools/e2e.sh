@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.2).
+# In-game check for Step Crafter (the SDK package, 0.2.3).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -49,12 +49,16 @@
 #    are taken is per slot, not the inventory's item count);
 #  - take hands over the stored stacks themselves: two differently named, damaged swords are taken
 #    and their custom names and damage are read back from the player's inventory;
+#  - a step leaves what its ingredients leave: a cake step from 3 milk buckets, 2 sugar, an egg and
+#    3 wheat makes the cake **and** three buckets, consuming every ingredient (the recipe's
+#    remainders, which this port used to destroy);
 #  - `/stepcrafter` needs an operator: a non-operator's `info` is refused.
 #
 # SELFTEST=1 flips the requester's headline assertion (`stored=8`), so the run must end `EXIT:1`;
 # SELFTEST=crafter flips the machine's first "filled to the maximum" assertion instead;
 # SELFTEST=capacity flips the no-room assertion (nothing fit, so nothing was served);
-# SELFTEST=take flips the component assertion (a stack rebuilt from its id reads no components).
+# SELFTEST=take flips the component assertion (a stack rebuilt from its id reads no components);
+# SELFTEST=remainder flips the remainder assertion (today's defect: the buckets are destroyed).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -766,6 +770,69 @@ if [ "$SELFTEST" = take ]; then
     esac
 fi
 
+echo "== crafting remainders: a step leaves the bucket the recipe leaves =="
+# The gap this version closes (notes.md §6/§10): a bucket ingredient used to be destroyed, where a
+# real crafting grid hands its bucket back. A cake takes three milk buckets; one step must leave the
+# cake *and* three buckets, and consume the sugar, egg and wheat.
+ctl command "execute in minecraft:the_end run setblock 220 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 220 64 0 minecraft:cake"
+CAKE_TARGET=$(reply '^stepcrafter target 220 64 0 ')
+echo "  $CAKE_TARGET"
+case "$CAKE_TARGET" in
+    *"target=minecraft:cake cells=9 result=minecraft:cake:1"*) ;;
+    *) fail "the cake target did not resolve to a 9-cell step: $CAKE_TARGET" ;;
+esac
+# The step pattern carries what its ingredients leave: the milk bucket's own remainder.
+case "$CAKE_TARGET" in
+    *"remainders=minecraft:milk_bucket=minecraft:bucket:1"*) ;;
+    *) fail "the cake pattern does not carry the bucket its milk leaves: $CAKE_TARGET" ;;
+esac
+say "stepcrafter configure 220 64 0 0 0"
+reply '^stepcrafter configure 220 64 0 ' >/dev/null
+# A milk bucket stacks to one, so three of them go in three slots.
+load 220 64 0 minecraft:milk_bucket 1
+load 220 64 0 minecraft:milk_bucket 1
+load 220 64 0 minecraft:milk_bucket 1
+load 220 64 0 minecraft:sugar 2
+load 220 64 0 minecraft:egg 1
+load 220 64 0 minecraft:wheat 3
+CAKE_BEFORE=$(info 220 64 0)
+echo "  before the step: $CAKE_BEFORE"
+case "$CAKE_BEFORE" in
+    *"stock=minecraft:egg:1,minecraft:milk_bucket:3,minecraft:sugar:2,minecraft:wheat:3"*) ;;
+    *) fail "the machine was not stocked with cake's ingredients: $CAKE_BEFORE" ;;
+esac
+say "stepcrafter step 220 64 0"
+CAKE_STEP=$(reply '^stepcrafter step 220 64 0 ')
+echo "  $CAKE_STEP"
+case "$CAKE_STEP" in
+    *"result=crafted"*) ;;
+    *) fail "the cake step was refused: $CAKE_STEP" ;;
+esac
+ctl wait 6
+CAKE_AFTER=$(info 220 64 0)
+echo "  after the step: $CAKE_AFTER"
+case "$CAKE_AFTER" in
+    *"stored=1"*"crafted=1"*) ;;
+    *) fail "the cake step did not make the cake: $CAKE_AFTER" ;;
+esac
+# The output *and* the three buckets, with every ingredient consumed: the exact stock, not a grep
+# that would also match the ingredients.
+case "$CAKE_AFTER" in
+    *"stock=minecraft:bucket:3,minecraft:cake:1"*) ;;
+    *) fail "the step did not leave the three buckets its milk leaves: $CAKE_AFTER" ;;
+esac
+if [ "$SELFTEST" = remainder ]; then
+    # Today's defect, deliberately asserted: the step consumes every cell and puts only the result
+    # in, so the buckets are destroyed. The package leaves them, so this inverted run has to end
+    # here, non-zero.
+    case "$CAKE_AFTER" in
+        *"minecraft:bucket"*) fail "SELFTEST=remainder: the step left the buckets its milk leaves and the run must end non-zero: $CAKE_AFTER" ;;
+        *) ;;
+    esac
+fi
+
 echo "== /stepcrafter requester refuses what it cannot configure =="
 say "stepcrafter requester 215 64 0 minecraft:torch 9 4 4"
 INVERTED_FILTER=$(reply '^stepcrafter: min 9 is above max 4')
@@ -909,4 +976,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

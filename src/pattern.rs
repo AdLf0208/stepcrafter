@@ -10,7 +10,9 @@
 //! One host crossing per resolution: `recipes_of_type` and one `item_keys` per cell, at the moment
 //! the player configures the machine. The tick never crosses to the recipe table.
 
-use mod_api::{Host, Identifier, Ingredient};
+use std::collections::BTreeMap;
+
+use mod_api::{Host, Identifier, Ingredient, ItemStack};
 
 use crate::runtime::Pattern;
 
@@ -86,10 +88,41 @@ pub fn resolve(host: &dyn Host, target: &str) -> Result<Pattern, ResolveError> {
         }
     }
     match best {
-        Some(pattern) => Ok(pattern),
+        Some(pattern) => {
+            let left = remainders(host, pattern.cells());
+            Ok(pattern.with_remainders(left))
+        }
         None if saw_recipe => Err(ResolveError::UnsupportedRecipe(target.to_owned())),
         None => Err(ResolveError::NoRecipe(target.to_owned())),
     }
+}
+
+/// What each candidate item leaves in the grid when consumed, keyed by the consumed item
+/// (`Item.getCraftingRemainder`, vanilla's `getRemainingItems` for a plain stack).
+///
+/// One host call per distinct candidate, at the moment the player configures the machine: the tick
+/// never asks again. A candidate that leaves nothing has no entry.
+fn remainders(host: &dyn Host, cells: &[Vec<String>]) -> BTreeMap<String, (String, u32)> {
+    let mut left = BTreeMap::new();
+    for id in cells.iter().flatten() {
+        if left.contains_key(id) {
+            continue;
+        }
+        let Ok(key) = Identifier::parse(id) else {
+            continue;
+        };
+        let Some(item) = host.item_key(&key) else {
+            continue;
+        };
+        let Some(rest) = host.item_crafting_remainder(&ItemStack::of(item)) else {
+            continue;
+        };
+        let count = rest.count();
+        if count > 0 {
+            left.insert(id.clone(), (rest.item().id(host), count));
+        }
+    }
+    left
 }
 
 /// The item ids of each ingredient's candidate set, or `None` when the recipe does not fit a step.
