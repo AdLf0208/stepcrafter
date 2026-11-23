@@ -70,17 +70,19 @@ impl Hooks for Mod {
 
     /// The requester's filter cells on the client: the entries' resources, one id per line, which
     /// its screen draws as icons. The numbers travel in the menu's data slots; this payload is what
-    /// the pin has no data slot for (an item id). Answer only for our block and our menu.
+    /// the pin has no data slot for (an item id). The machine's one cell uses the same hook for its
+    /// target. Answer only for our blocks.
     fn menu_extra_data(
         &self,
         host: &mut dyn ServerHost,
         event: &mut MenuExtraDataEvent<'_>,
     ) -> Option<Vec<u8>> {
-        if event.block != requester::BLOCK {
-            return None;
-        }
         let level = host.level(host.dimension())?;
-        requester::extra_data(&*host, level, event.pos, event.menu)
+        match event.block {
+            requester::BLOCK => requester::extra_data(&*host, level, event.pos, event.menu),
+            machine::BLOCK => machine::extra_data(&*host, level, event.pos, event.menu),
+            _ => None,
+        }
     }
 
     /// A right click on either block opens its menu: the engine never opens a mod container's menu
@@ -107,6 +109,42 @@ impl BlockEntityPart for StepCrafter {
     /// One server tick: the band rule, one step, and the `active` state.
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         machine::tick(host, event);
+    }
+
+    /// The machine's own panel: its 27 stock slots, the target cell and the band's buttons.
+    fn screen(
+        &self,
+        _host: &dyn mod_api::Host,
+        event: &mut ScreenEvent<'_>,
+    ) -> Option<mod_api::Screen> {
+        if event.block != machine::BLOCK {
+            return None;
+        }
+        Some(screen::machine_layout())
+    }
+
+    /// Draw the machine's target cell and band over the engine's panel and slot frames.
+    fn screen_draw(&self, host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+        if event.block == machine::BLOCK {
+            screen::machine_draw(host, event);
+        }
+    }
+
+    /// A press on the machine's panel over no stock slot: the target cell or a band button.
+    fn screen_click(
+        &self,
+        _host: &dyn ClientHost,
+        event: &mut ScreenClickEvent<'_>,
+    ) -> Option<i32> {
+        if event.block != machine::BLOCK {
+            return None;
+        }
+        screen::machine_button_at(event.at)
+    }
+
+    /// The server's half of a machine press: the target cell or a band button.
+    fn menu_button(&self, host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+        machine::press(host, event);
     }
 }
 

@@ -15,8 +15,8 @@
 
 use mod_api::{
     BlockClick, BlockEntityTickEvent, Compound, Flow, Hand, Host, HostSide, HostTransaction,
-    Identifier, InteractionResult, ItemKey, ItemStack, LevelRef, ModContainer, Registrar,
-    RightClickBlockEvent, ServerHost, Tag,
+    Identifier, InteractionResult, ItemKey, ItemStack, LevelRef, MenuButtonEvent, ModContainer,
+    Registrar, RightClickBlockEvent, ServerHost, Tag,
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
@@ -26,6 +26,9 @@ use crate::runtime::{self, Band, Outcome, Pattern, Phase, Queue, Slot, Slots, St
 pub const TYPE: &str = "step_crafter";
 /// The block whose item carries the machine (the package's one block).
 pub const BLOCK: &str = "stepcrafter:step_crafter";
+/// The menu type the content declares (`data/stepcrafter/horizon/menu/step_crafter_config.json`):
+/// the 27 stock slots and the two data slots the screen reads.
+pub const MENU: &str = "stepcrafter:step_crafter_config";
 /// The machine's inventory: upstream's stock is the network, this port's is its own slots.
 pub const SLOTS: usize = 27;
 const KEY_TARGET: &str = "Target";
@@ -60,8 +63,9 @@ pub fn declare(r: &mut dyn Registrar) {
     let _ = r.block_entity_part(&kind, crate::StepCrafter);
 }
 
-/// Every face reaches every slot and the vanilla chest menu shows them: the machine's stock is
-/// its inventory, and the player loads and empties it through that menu (or a hopper).
+/// Every face reaches every slot and the machine's own menu shows them: the machine's stock is its
+/// inventory, and the player loads and empties it through that menu (or a hopper). The menu is this
+/// package's type, so the screen can draw the target cell and the band's buttons beside the slots.
 fn container() -> ModContainer {
     let all: Vec<usize> = (0..SLOTS).collect();
     ModContainer {
@@ -76,8 +80,9 @@ fn container() -> ModContainer {
         ],
         inputs: (0..SLOTS).collect(),
         outputs: (0..SLOTS).collect(),
-        // The *menu type*, not the block: a chest's menu is `minecraft:generic_9x3` (27 slots).
-        menu: Some("minecraft:generic_9x3".to_owned()),
+        // The *menu type*, not the block: a chest's menu is `minecraft:generic_9x3`; this one has
+        // the same 27 slots and the screen that draws the configuration over them.
+        menu: Some(MENU.to_owned()),
     }
 }
 
@@ -444,6 +449,9 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         event.entity.items.resize(SLOTS, None);
     }
     let mut state = read(&event.entity.nbt);
+    // The screen's numbers are the menu's data slots, a view and not saved: publish the band every
+    // tick, so a reopened menu and its buttons agree with the compound the command writes.
+    event.entity.data = runtime::machine_data_slots(state.band).to_vec();
     let before = state.clone();
 
     // An ask that can never be served is dropped before anything is spent on it: one for another
@@ -688,6 +696,57 @@ fn item_key(host: &dyn Host, item: &str) -> Option<ItemKey> {
         .and_then(|id| host.item_key(&id))
 }
 
+/// One press on the machine's own screen, on the server (`menu_button`): the target cell takes the
+/// item the player carries — resolved into that item's step pattern exactly as `/stepcrafter
+/// target` does — and the four buttons step the band. Both write the compound `machine::write`
+/// writes for the command, so the screen and `/stepcrafter` cannot disagree.
+pub fn press(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+    let Some(press) = runtime::MachinePress::of(event.context.id) else {
+        return;
+    };
+    let carried = {
+        let host: &dyn Host = &*host;
+        event.carried.as_ref().map(|stack| stack.item().id(host))
+    };
+    let mut state = read(&event.entity.nbt);
+    let mut editor = runtime::MachineEditor::new(state.target.clone(), state.band);
+    if !editor.apply(press, carried.as_deref()) {
+        return;
+    }
+    let (target, band) = editor.into_parts();
+    if target != state.target {
+        let Some(item) = target.as_deref() else {
+            return;
+        };
+        // The carried item must have a step to take: a pattern the machine could never craft is no
+        // configuration, exactly as the command refuses an item with no `minecraft:crafting` recipe.
+        let Ok(pattern) = crate::pattern::resolve(&*host, item) else {
+            return;
+        };
+        state.target = Some(pattern.result().to_owned());
+        state.pattern = Some(pattern);
+    }
+    state.band = band;
+    state.phase = Phase::Idle;
+    write(&mut event.entity.nbt, &state);
+    // Publish at once rather than waiting for the next tick: the client redraws the number the
+    // player just stepped.
+    event.entity.data = runtime::machine_data_slots(state.band).to_vec();
+}
+
+/// The machine's screen open payload (`menu_extra_data`): the target's item id, so the client draws
+/// the target cell's icon. The band travels in the menu's data slots; the saved compound is the
+/// truth for both.
+#[must_use]
+pub fn extra_data(host: &dyn Host, level: LevelRef, pos: [i32; 3], menu: &str) -> Option<Vec<u8>> {
+    if menu != MENU {
+        return None;
+    }
+    let entity = host.block_entity(level, pos)?;
+    let data = entity.data(host)?;
+    Some(runtime::machine_extra_data(read(&data).target.as_deref()).into_bytes())
+}
+
 /// A player's right click on one of this package's two blocks opens its menu.
 ///
 /// **The engine never opens a mod container's menu on its own**, and its empty-hand hook does not
@@ -863,5 +922,27 @@ mod tests {
         let state = read(&Compound::new());
         assert!(!state.is_configured());
         assert_eq!(state.phase, Phase::Idle);
+    }
+
+    /// The machine's menu declares the 27 stock slots and the two data slots the screen publishes,
+    /// so the engine sizes the menu from the same numbers the panel draws — the two cannot drift.
+    #[test]
+    fn the_machines_menu_declares_the_slots_the_screen_publishes() {
+        let declared = include_str!("../data/stepcrafter/horizon/menu/step_crafter_config.json");
+        let published = crate::screen::machine_layout().slots.len();
+        assert_eq!(
+            published, SLOTS,
+            "the screen places the menu's 27 stock slots"
+        );
+        assert!(
+            declared.contains(&format!("\"slots\": {published}")),
+            "the menu's slots must be the {published} the screen places: {declared}"
+        );
+        let data = runtime::machine_data_slots(None).len();
+        assert_eq!(data, 2, "min and max");
+        assert!(
+            declared.contains(&format!("\"data_slots\": {data}")),
+            "the menu's data_slots must be the {data} the screen draws: {declared}"
+        );
     }
 }

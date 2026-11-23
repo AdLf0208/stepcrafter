@@ -1,6 +1,6 @@
 id = "stepcrafter"
 name = "Step Crafter"
-version = "0.2.7"
+version = "0.2.8"
 description = """A port of Step Crafter for Horizon: the Step Crafter machine and its Step Requester.
 
 The Step Crafter is a block entity that keeps a configured resource in stock. It is told a target
@@ -15,8 +15,9 @@ The Step Requester keeps filtered items stocked *through* the Step Crafters besi
 entry has its own minimum, maximum and batch, and when the stock of that entry's item falls below its
 minimum the requester asks the crafter that maintains it for batches of the item until the maximum is
 reached (upstream's `StepRequesterNetworkNode.doWork` rule), and reports a refusal it cannot serve.
-Both are configured in game: the Step Crafter by command, the Step Requester on its own screen, its
-45 filter cells each holding a resource, a minimum, a maximum and a batch. The Step Crafter Manager,
+Both are configured in game on their own panels and by command: the Step Crafter's panel holds its
+27 stock slots, a target cell and the minimum/maximum buttons, and the Step Requester's 45 filter
+cells each hold a resource, a minimum, a maximum and a batch. The Step Crafter Manager,
 the Step Requester Manager, the Step Crafting Monitor, the sixteen colour variants, the slot upgrade,
 the energy buffer and the requester's eight upgrade slots are not ported yet."""
 authors = ["Ultramega", "AdLf0208"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.5).
+# In-game check for Step Crafter (the SDK package, 0.2.8).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -59,12 +59,17 @@
 #  - a step leaves what its ingredients leave: a cake step from 3 milk buckets, 2 sugar, an egg and
 #    3 wheat makes the cake **and** three buckets, consuming every ingredient (the recipe's
 #    remainders, which this port used to destroy);
-#  - the requester's screen (0.2.6): a right click opens a 176 x 258 mod menu whose panel the
+#  - the requester's screen (0.2.6): a right click opens a 176 x 238 mod menu whose panel the
 #    game reports at the centred origin, a carried torch clicked onto its first cell makes filter
 #    entry 0, the drawn value buttons set that entry to `min=4 max=8 batch=4` (and the band's own
 #    guard refuses `min +` at 0..0), a carried stick repoints the cell while keeping its band, a
 #    command-added entry appears as a cell the remove button drops, and a requester nobody opened
 #    carries no entry — the screen and `/stepcrafter requester` are one saved container;
+#  - the machine's own panel (0.2.8): a right click opens the package's own 176 x 208 menu type with
+#    the 27 stock slots still there at 300..326, a carried torch clicked onto the drawn target cell
+#    makes `/stepcrafter info` read `target=minecraft:torch cells=2 result=minecraft:torch:4`, the
+#    drawn `max +` x16 and `min +` x8 set the band to `min=8 max=16`, a `min +` that would invert
+#    the band at `8..8` is refused, and a machine nobody opened reads `target=none min=- max=-`;
 #  - two requesters share one crafter: the ask is now a list in the crafter's compound, so the
 #    second is queued behind the first instead of being lost, each reads its own share of the stock
 #    (the first `stored=4 served=4`, the second `stored=0 queued=1`), and a restock serves the second
@@ -82,7 +87,9 @@
 # SELFTEST=screen flips the screen assertion (today's defect: the right click opens no screen, so
 # `ctl screen` reads `playing` and no entry can be made from a menu);
 # SELFTEST=queue flips the queued-ask assertion (today's defect: the ask is one `Int`, so a second
-# requester asking the same crafter is never queued and reads the first's torches as its own).
+# requester asking the same crafter is never queued and reads the first's torches as its own);
+# SELFTEST=crafterscreen flips the machine-panel assertion (today's defect: the panel has no target
+# cell, so the carried torch clicked on it changes nothing and the target stays `none`).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -1210,9 +1217,10 @@ ctl wait 3
 ctl command "execute in minecraft:the_end run tp @s 214.5 64 3.5" >/dev/null
 ctl wait 10
 # The break leaves the spilled stack as item entities; any that are still around the spot block
-# the placement ("blocked by an entity"), so clear the ones beside it (the drops were picked up
-# above, and `held`/`SPILLED` already asserted that).
-ctl command "execute in minecraft:the_end run kill @e[type=item,x=213,y=63,z=-1,dx=3,dy=4,dz=3]" >/dev/null 2>&1 || true
+# the placement ("blocked by an entity"), as does an Enderman that wandered onto the spot (the End
+# spawns them, and a run is minutes long). The drops were picked up above and `held`/`SPILLED`
+# already asserted that, so clear whatever is left on the spot — items and mobs alike.
+ctl command "execute in minecraft:the_end run kill @e[type=!player,x=213,y=63,z=-1,dx=3,dy=4,dz=3]" >/dev/null 2>&1 || true
 ctl wait 4
 # `--item` selects the hotbar slot holding the machine by id, not by a remembered slot number; the
 # second attempt covers a teleport that lands after the first click's aim.
@@ -1295,9 +1303,9 @@ press_batch_down() { press 44 134; }
 press_batch_up() { press 84 134; }
 press_remove() { press 130 134; }
 
-# The machine's own stock menu opens on the same click path (the engine never opens a mod
-# container's menu): 27 slots of the declared chest menu, which is what `notes.md` §2 claimed and
-# the engine alone does not do.
+# The machine's own panel opens on the same click path (the engine never opens a mod container's
+# menu): since 0.2.8 the machine opens the package's own menu type, whose 27 stock slots are still
+# real menu slots, and whose drawn cell and buttons sit under them.
 ctl close >/dev/null 2>&1 || true
 ctl tp 222.5 64 2.5 >/dev/null
 ctl wait 6
@@ -1308,10 +1316,10 @@ ctl interact 222 64 0 south >/dev/null || fail "the machine refused the right cl
 ctl wait 6
 MACHINE_SCREEN=$(ctl screen)
 [ "$(jq -r '.screen' <<<"$MACHINE_SCREEN")" = container ] \
-    || fail "the machine's stock menu did not open: $(jq -r '.screen' <<<"$MACHINE_SCREEN")"
+    || fail "the machine's menu did not open: $(jq -r '.screen' <<<"$MACHINE_SCREEN")"
 MACHINE_SLOTS=$(jq '[.slots[] | select(.slot >= 300)] | length' <<<"$MACHINE_SCREEN")
-PANEL_H=166
-panel_origin 84
+PANEL_H=208
+panel_origin 126
 MACHINE_OY=$OY
 echo "  the machine's stock menu: $(jq -r '.screen' <<<"$MACHINE_SCREEN"), $MACHINE_SLOTS container slots, top $MACHINE_OY"
 [ "$MACHINE_SLOTS" = 27 ] || fail "the machine's menu shows $MACHINE_SLOTS slots, not its 27"
@@ -1327,8 +1335,8 @@ SCREEN_FIRST=$(info 223 64 0)
 if [ "$OPENED" = container ]; then
     echo "  the screen opened: $(ctl screen | jq -r '.screen'), slots $(ctl screen | jq -r '(.slots | length)')"
     # Both panels are centred in the same GUI, so their tops differ by half their heights:
-    # (238 - 166) / 2 = 36. That is the requester's declared height, read back from the game.
-    [ "$(( MACHINE_OY - OY ))" = 36 ] || fail "the requester's panel top is $OY against the machine's $MACHINE_OY: not the 238-high panel (36 above a 166-high one)"
+    # (238 - 208) / 2 = 15. That is the requester's declared height against the machine's 208.
+    [ "$(( MACHINE_OY - OY ))" = 15 ] || fail "the requester's panel top is $OY against the machine's $MACHINE_OY: not the 238-high panel (15 above a 208-high one)"
     # A cell's entry is made from the carried item, as upstream's ghost filter slot is: pick the
     # torch up onto the cursor, click the first cell, put it back.
     TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
@@ -1440,6 +1448,139 @@ echo "  the unopened requester beside it: $SCREEN_OTHER"
 case "$SCREEN_OTHER" in
     *"filters=0 item=none"*) ;;
     *) fail "a requester nobody opened carries an entry: $SCREEN_OTHER" ;;
+esac
+
+echo "== the Step Crafter's own panel: the target cell and the band's buttons =="
+# 0.2.7's gap (notes.md §1/§6): the machine was configured only by command while the requester had
+# its own panel. The machine now opens the package's own menu type: the 27 stock slots are still
+# real menu slots, and the target cell and the band's buttons are drawn over them (a press is a menu
+# button id: the client hit-tests it, the server applies it to the same compound the command writes).
+for z in 0 2 4 6; do
+    ctl command "execute in minecraft:the_end run setblock 225 64 $z minecraft:air" >/dev/null
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run setblock 225 64 0 $BLOCK" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 225 64 4 $BLOCK" >/dev/null
+ctl wait 8
+
+FRESH_MACHINE=$(info 225 64 0)
+echo "  the fresh machine: $FRESH_MACHINE"
+case "$FRESH_MACHINE" in
+    *"target=none min=- max=-"*) ;;
+    *) fail "a fresh machine is not unconfigured: $FRESH_MACHINE" ;;
+esac
+
+open_machine() { # X Y Z -> sets OPENED and, when it opened, OX/OY
+    ctl close >/dev/null 2>&1 || true
+    ctl tp "$1.5" "$2" "$(( $3 + 2 )).5" >/dev/null
+    ctl wait 6
+    ctl look 180 0 >/dev/null
+    ctl wait 2
+    ctl look-at block "$1" "$2" "$3" south >/dev/null 2>&1 || true
+    ctl interact "$1" "$2" "$3" south >/dev/null || fail "the machine refused the right click"
+    ctl wait 6
+    OPENED=$(ctl screen | jq -r '.screen')
+    if [ "$OPENED" = container ]; then PANEL_H=208; panel_origin 126; fi
+}
+
+# The cell and the four buttons, at the pixels `src/screen.rs` lays them out at.
+press_target_cell() { press 17 85; }
+press_min_down() { press 36 104; }
+press_min_up() { press 72 104; }
+press_max_down() { press 116 104; }
+press_max_up() { press 152 104; }
+
+ctl command "clear" >/dev/null
+ctl wait 4
+ctl give minecraft:torch 1 >/dev/null
+ctl wait 4
+open_machine 225 64 0
+MACHINE_PANEL=$(ctl screen)
+MACHINE_PANEL_SLOTS=$(jq '[.slots[] | select(.slot >= 300)] | length' <<<"$MACHINE_PANEL")
+MACHINE_PANEL_SCREEN=$OPENED
+MACHINE_PANEL_OY=$OY
+echo "  the machine's panel: $MACHINE_PANEL_SCREEN, $MACHINE_PANEL_SLOTS stock slots, top $MACHINE_PANEL_OY"
+if [ "$OPENED" = container ]; then
+    [ "$MACHINE_PANEL_SLOTS" = 27 ] \
+        || fail "the machine's panel shows $MACHINE_PANEL_SLOTS stock slots, not its 27"
+    # The target cell takes the carried item, as upstream's pattern slot takes the pattern: pick the
+    # torch up onto the cursor, click the cell, put it back.
+    TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
+    [ -n "$TORCH_SLOT" ] || fail "the torch is not in the open panel's inventory: $(ctl screen | jq -c '.slots')"
+    ctl click-slot "$TORCH_SLOT" >/dev/null
+    ctl wait 3
+    press_target_cell
+    ctl click-slot "$TORCH_SLOT" >/dev/null
+    ctl wait 3
+    ctl close >/dev/null
+    ctl wait 6
+fi
+SCREEN_TARGET=$(info 225 64 0)
+echo "  after the torch onto the target cell: $SCREEN_TARGET"
+
+if [ "$SELFTEST" = crafterscreen ]; then
+    # Today's behaviour, deliberately asserted: the panel has no target cell, so the carried torch
+    # clicked where the cell now is changes nothing and the machine still has no target. This
+    # package's cell takes it, so this inverted run has to end here, non-zero.
+    case "$MACHINE_PANEL_SCREEN" in
+        container) ;;
+        *) fail "SELFTEST=crafterscreen: the machine's panel did not open ($MACHINE_PANEL_SCREEN), so today's defect cannot be asserted" ;;
+    esac
+    case "$SCREEN_TARGET" in
+        *"target=none"*) ;;
+        *) fail "SELFTEST=crafterscreen: the target cell took the carried torch where today's panel has no cell and sets no target, so the run must end non-zero: $SCREEN_TARGET" ;;
+    esac
+    fail "SELFTEST=crafterscreen: today's defect is not on this package"
+fi
+[ "$MACHINE_PANEL_SCREEN" = container ] || fail "the machine's own panel did not open: $MACHINE_PANEL_SCREEN"
+case "$SCREEN_TARGET" in
+    *"target=minecraft:torch"*) ;;
+    *) fail "the target cell did not take the torch: $SCREEN_TARGET" ;;
+esac
+case "$SCREEN_TARGET" in
+    *"cells=2 result=minecraft:torch:4"*) ;;
+    *) fail "the target cell's item did not resolve into its step: $SCREEN_TARGET" ;;
+esac
+
+# The band's buttons, at the pixels the panel draws them: `max` up 16 times and `min` up 8 read
+# 8..16, the brief's band, made entirely through the panel.
+open_machine 225 64 0
+for _ in $(seq 1 16); do press_max_up; done
+for _ in $(seq 1 8); do press_min_up; done
+ctl close >/dev/null
+ctl wait 6
+SCREEN_BAND=$(info 225 64 0)
+echo "  the band the panel's buttons set: $SCREEN_BAND"
+case "$SCREEN_BAND" in
+    *"min=8 max=16"*) ;;
+    *) fail "the panel's buttons did not set the band the brief names (8..16): $SCREEN_BAND" ;;
+esac
+
+# Down to 8..8 and a `min +` that would invert the band is refused: the number stays 8.
+open_machine 225 64 0
+for _ in $(seq 1 8); do press_max_down; done
+press_min_up
+ctl close >/dev/null
+ctl wait 6
+SCREEN_GUARD=$(info 225 64 0)
+echo "  the band's guard (max - to 8..8, then min +): $SCREEN_GUARD"
+case "$SCREEN_GUARD" in
+    *"min=8 max=8"*) ;;
+    *) fail "a step of the panel's buttons left an invalid band: $SCREEN_GUARD" ;;
+esac
+
+open_machine 225 64 0
+ctl screenshot "$PORT/../_shared/evidence/stepcrafter-e2e/screen-crafter.png" >/dev/null 2>&1 || true
+ctl close >/dev/null
+ctl wait 4
+
+# The differential: the same machine one row over, never opened, is still unconfigured — the panel's
+# presses are the only difference between the two.
+SCREEN_OTHER_MACHINE=$(info 225 64 4)
+echo "  the machine nobody opened: $SCREEN_OTHER_MACHINE"
+case "$SCREEN_OTHER_MACHINE" in
+    *"target=none min=- max=-"*) ;;
+    *) fail "a machine nobody opened is configured: $SCREEN_OTHER_MACHINE" ;;
 esac
 
 echo "== queued asks: one crafter, two requesters, each served its own share =="
@@ -1560,4 +1701,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x208 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

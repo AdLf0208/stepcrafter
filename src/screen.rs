@@ -16,7 +16,7 @@
 
 use mod_api::{ClientHost, DrawContext, Identifier, ItemKey, Screen, ScreenDrawEvent};
 
-use crate::runtime::{self, Press, SCREEN_COLUMNS, SCREEN_ROWS};
+use crate::runtime::{self, MachinePress, Press, SCREEN_COLUMNS, SCREEN_ROWS};
 
 /// The panel is vanilla's 176 wide, tall enough for five filter rows, three value rows and the
 /// player's inventory.
@@ -202,6 +202,137 @@ fn item_key(host: &dyn ClientHost, item: &str) -> Option<ItemKey> {
         .and_then(|id| host.item_key(&id))
 }
 
+/// The machine's panel: vanilla's 176 wide, tall enough for its three stock rows, its
+/// configuration row and the player's inventory.
+pub const MACHINE_WIDTH: f32 = 176.0;
+/// The player's inventory rows, under the configuration row.
+pub const MACHINE_INVENTORY_Y: f32 = 126.0;
+/// The machine's panel height: the inventory's first row plus vanilla's 82. It fits the game's
+/// 240-pixel GUI the same way the requester's 238 does (measured in game, §2g trap 3).
+pub const MACHINE_HEIGHT: f32 = MACHINE_INVENTORY_Y + 82.0;
+
+/// The stock grid's top left: the machine's own 27 slots, the same three chest rows, and they are
+/// real menu slots (unlike the requester's drawn filter cells).
+const STOCK_X: f32 = 8.0;
+const STOCK_Y: f32 = 18.0;
+const STOCK_COLUMNS: usize = 9;
+/// The target cell under the stock grid: the drawn cell a carried item configures the machine
+/// from, beside the stock's rows.
+const TARGET_CELL: [f32; 4] = [8.0, 76.0, 18.0, 18.0];
+/// The band's row under the target cell: `min`'s group then `max`'s, each a label, `-`, its number
+/// and `+`.
+const MACHINE_VALUE_Y: f32 = 98.0;
+const MACHINE_MIN_GROUP: [f32; 4] = [8.0, 30.0, 44.0, 66.0];
+const MACHINE_MAX_GROUP: [f32; 4] = [88.0, 110.0, 124.0, 146.0];
+
+/// The machine's rows fit inside its panel, checked when the crate compiles: the stock grid above
+/// the target cell, the cell above the band's row, that row above the engine's "Inventory" label,
+/// and the inventory inside the height the panel declares.
+const _: () = {
+    assert!(STOCK_Y + CELL * (crate::machine::SLOTS / STOCK_COLUMNS) as f32 <= TARGET_CELL[1]);
+    assert!(TARGET_CELL[1] + TARGET_CELL[3] <= MACHINE_VALUE_Y);
+    assert!(MACHINE_VALUE_Y + BUTTON <= MACHINE_INVENTORY_Y - 16.0);
+    assert!(MACHINE_INVENTORY_Y + 82.0 <= MACHINE_HEIGHT + 0.01);
+    assert!(MACHINE_HEIGHT <= 240.0);
+};
+
+/// The machine's panel: its 27 stock slots as menu slots, the target cell and the band's buttons,
+/// then the player's inventory.
+#[must_use]
+pub fn machine_layout() -> Screen {
+    let slots = (0..crate::machine::SLOTS)
+        .map(|slot| {
+            let column = (slot % STOCK_COLUMNS) as f32;
+            let row = (slot / STOCK_COLUMNS) as f32;
+            Some([STOCK_X + column * CELL, STOCK_Y + row * CELL])
+        })
+        .collect();
+    Screen {
+        width: MACHINE_WIDTH,
+        height: MACHINE_HEIGHT,
+        slots,
+        inventory_y: MACHINE_INVENTORY_Y,
+        inventory_x: INVENTORY_X,
+        own_labels: false,
+        own_background: false,
+        ..Screen::default()
+    }
+}
+
+/// The menu button a press on the machine's panel sends, or `None` when it is on a stock slot or
+/// nothing of the screen's.
+#[must_use]
+pub fn machine_button_at(at: [f32; 2]) -> Option<i32> {
+    if inside(TARGET_CELL, at) {
+        return Some(MachinePress::Target.button());
+    }
+    let minus = |group: [f32; 4]| [group[1], MACHINE_VALUE_Y, BUTTON, BUTTON];
+    let plus = |group: [f32; 4]| [group[3], MACHINE_VALUE_Y, BUTTON, BUTTON];
+    let press = if inside(minus(MACHINE_MIN_GROUP), at) {
+        MachinePress::MinDown
+    } else if inside(plus(MACHINE_MIN_GROUP), at) {
+        MachinePress::MinUp
+    } else if inside(minus(MACHINE_MAX_GROUP), at) {
+        MachinePress::MaxDown
+    } else if inside(plus(MACHINE_MAX_GROUP), at) {
+        MachinePress::MaxUp
+    } else {
+        return None;
+    };
+    Some(press.button())
+}
+
+/// The "target" label beside the cell.
+const TARGET_LABEL: [f32; 2] = [30.0, 81.0];
+
+/// Draw the machine's panel over the engine's: the target cell (its item from the open payload),
+/// its label, and the band's two rows as the data slots carry them.
+///
+/// The engine draws the plain panel, the stock slots' frames and the player's inventory; the drawn
+/// cell and buttons are this function's, over the panel and under the items and labels, so every
+/// coordinate must add `event.origin`.
+pub fn machine_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+    let [ox, oy] = event.origin;
+    let target = host
+        .screen_extra_data()
+        .and_then(|data| runtime::machine_extra_item(&data));
+    let draw = &mut *event.draw;
+
+    let [x, y, w, h] = TARGET_CELL;
+    let rect = [ox + x, oy + y, w, h];
+    draw.fill(rect, SLOT);
+    draw.fill([rect[0], rect[1], rect[2], 1.0], SLOT_EDGE);
+    draw.fill([rect[0], rect[1], 1.0, rect[3]], SLOT_EDGE);
+    draw.fill([rect[0] + rect[2] - 1.0, rect[1], 1.0, rect[3]], SLOT_EDGE);
+    draw.fill([rect[0], rect[1] + rect[3] - 1.0, rect[2], 1.0], SLOT_EDGE);
+    if let Some(key) = target.as_deref().and_then(|item| item_key(host, item)) {
+        draw.item(key, [rect[0] + 1.0, rect[1] + 1.0], 16.0);
+    }
+    draw.text(
+        "target",
+        [ox + TARGET_LABEL[0], oy + TARGET_LABEL[1]],
+        TEXT,
+        false,
+    );
+
+    let value = |index: usize| event.data.get(index).copied().unwrap_or(0);
+    for (label, group, index) in [
+        ("min", MACHINE_MIN_GROUP, 0usize),
+        ("max", MACHINE_MAX_GROUP, 1usize),
+    ] {
+        let row = oy + MACHINE_VALUE_Y;
+        draw.text(label, [ox + group[0], row + 2.0], TEXT, false);
+        draw.text(
+            &value(index).to_string(),
+            [ox + group[2], row + 2.0],
+            TEXT,
+            false,
+        );
+        draw_button(draw, [ox + group[1], row, BUTTON, BUTTON], "-");
+        draw_button(draw, [ox + group[3], row, BUTTON, BUTTON], "+");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +422,58 @@ mod tests {
             screen.slots,
             vec![None],
             "the container's one slot is hidden: the cells are drawn"
+        );
+    }
+
+    /// The machine's 27 stock slots are menu slots, placed in the chest's three rows, and its
+    /// panel is the 176 × 208 declaration the engine reads — the 238 of the requester's minus its
+    /// own extra row.
+    #[test]
+    fn the_machines_stock_slots_are_its_containers_twenty_seven() {
+        let screen = machine_layout();
+        assert_eq!((screen.width, screen.height), (176.0, 208.0));
+        assert_eq!(screen.inventory_y, 126.0);
+        assert_eq!(screen.slots.len(), 27, "every stock slot is a menu slot");
+        assert_eq!(screen.slots[0], Some([STOCK_X, STOCK_Y]));
+        assert_eq!(
+            screen.slots[26],
+            Some([STOCK_X + 8.0 * CELL, STOCK_Y + 2.0 * CELL])
+        );
+        assert!(
+            screen.slots.iter().all(Option::is_some),
+            "no stock slot is hidden"
+        );
+    }
+
+    /// The machine's cell and buttons are the presses the server applies, and a press on a stock
+    /// slot is the menu's (it must not be swallowed as a button).
+    #[test]
+    fn the_machines_cell_and_buttons_are_the_presses_the_server_applies() {
+        let minus = |group: [f32; 4]| [group[1], MACHINE_VALUE_Y, BUTTON, BUTTON];
+        let plus = |group: [f32; 4]| [group[3], MACHINE_VALUE_Y, BUTTON, BUTTON];
+        for (rect, press) in [
+            (TARGET_CELL, MachinePress::Target),
+            (minus(MACHINE_MIN_GROUP), MachinePress::MinDown),
+            (plus(MACHINE_MIN_GROUP), MachinePress::MinUp),
+            (minus(MACHINE_MAX_GROUP), MachinePress::MaxDown),
+            (plus(MACHINE_MAX_GROUP), MachinePress::MaxUp),
+        ] {
+            let centre = [rect[0] + 2.0, rect[1] + 2.0];
+            assert_eq!(
+                machine_button_at(centre),
+                Some(press.button()),
+                "the rect {rect:?} is {press:?}"
+            );
+            assert_eq!(MachinePress::of(press.button()), Some(press));
+        }
+        assert_eq!(
+            machine_button_at([STOCK_X + 1.0, STOCK_Y + 1.0]),
+            None,
+            "a press on a stock slot belongs to the menu, not the screen"
+        );
+        assert_eq!(
+            machine_button_at([MACHINE_WIDTH - 2.0, MACHINE_HEIGHT - 2.0]),
+            None
         );
     }
 }

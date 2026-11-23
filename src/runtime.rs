@@ -1777,6 +1777,167 @@ pub fn extra_items(data: &[u8]) -> Vec<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The Step Crafter's own screen: its target cell and the band's buttons
+// ---------------------------------------------------------------------------
+
+/// One press on the machine's configuration screen, as [`MachineEditor::apply`] takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachinePress {
+    /// The target cell: take the carried item as the machine's maintained item.
+    Target,
+    /// The band's minimum, down one.
+    MinDown,
+    /// The band's minimum, up one.
+    MinUp,
+    /// The band's maximum, down one.
+    MaxDown,
+    /// The band's maximum, up one.
+    MaxUp,
+}
+
+/// The target cell's menu button id; the value buttons follow it.
+pub const TARGET_BUTTON: i32 = 300;
+
+impl MachinePress {
+    /// The press a menu button id stands for; `None` for a button the screen does not draw.
+    #[must_use]
+    pub fn of(button: i32) -> Option<Self> {
+        match button {
+            TARGET_BUTTON => Some(Self::Target),
+            310 => Some(Self::MinDown),
+            311 => Some(Self::MinUp),
+            312 => Some(Self::MaxDown),
+            313 => Some(Self::MaxUp),
+            _ => None,
+        }
+    }
+
+    /// The button id this press is sent as.
+    #[must_use]
+    pub fn button(self) -> i32 {
+        match self {
+            Self::Target => TARGET_BUTTON,
+            Self::MinDown => 310,
+            Self::MinUp => 311,
+            Self::MaxDown => 312,
+            Self::MaxUp => 313,
+        }
+    }
+}
+
+/// The machine's screen over its saved target and band: the one cell the pattern is set from and
+/// the four buttons that step the band. The screen and `/stepcrafter target|configure` edit the
+/// same saved compound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineEditor {
+    target: Option<String>,
+    band: Option<Band>,
+}
+
+impl MachineEditor {
+    /// The screen over a machine's saved target and band.
+    #[must_use]
+    pub fn new(target: Option<String>, band: Option<Band>) -> Self {
+        Self { target, band }
+    }
+
+    /// The item the machine maintains.
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// The maintenance band the buttons edit.
+    #[must_use]
+    pub fn band(&self) -> Option<Band> {
+        self.band
+    }
+
+    /// Apply one press, with the item the player carries (`None` for an empty hand). Answers
+    /// whether the configuration changed.
+    pub fn apply(&mut self, press: MachinePress, carried: Option<&str>) -> bool {
+        match press {
+            MachinePress::Target => self.take_target(carried),
+            MachinePress::MinDown => self.step(MachineField::Min, false),
+            MachinePress::MinUp => self.step(MachineField::Min, true),
+            MachinePress::MaxDown => self.step(MachineField::Max, false),
+            MachinePress::MaxUp => self.step(MachineField::Max, true),
+        }
+    }
+
+    /// The target cell: the carried item becomes the machine's target (the command resolves the
+    /// same item's recipe into the pattern). An empty hand leaves the target as it was — a click
+    /// must not silently unconfigure the machine — and clicking the item it already maintains is no
+    /// change, so the run is not restarted for nothing.
+    fn take_target(&mut self, carried: Option<&str>) -> bool {
+        let Some(item) = carried.filter(|item| is_item_id(item)) else {
+            return false;
+        };
+        if self.target.as_deref() == Some(item) {
+            return false;
+        }
+        self.target = Some(item.to_owned());
+        true
+    }
+
+    /// One value button: the band stays valid (`min <= max`), no amount is negative and a screen
+    /// edit caps at [`SCREEN_MAX`] — the requester's screen's own rules.
+    fn step(&mut self, field: MachineField, up: bool) -> bool {
+        let (min, max) = self.band.map_or((0, 0), |band| (band.min(), band.max()));
+        let (min, max) = match field {
+            MachineField::Min if up && min < max => (min + 1, max),
+            MachineField::Min if !up && min > 0 => (min - 1, max),
+            MachineField::Max if up && max < SCREEN_MAX => (min, max + 1),
+            MachineField::Max if !up && max > min => (min, max - 1),
+            MachineField::Min | MachineField::Max => return false,
+        };
+        let Some(band) = Band::new(min, max) else {
+            return false;
+        };
+        self.band = Some(band);
+        true
+    }
+
+    /// The configuration as the machine saves it.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<String>, Option<Band>) {
+        (self.target, self.band)
+    }
+}
+
+/// The two amounts the machine's screen steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MachineField {
+    Min,
+    Max,
+}
+
+/// The machine's menu data slots: its band's minimum and maximum, which the screen draws. A
+/// machine with no band shows zeroes; the command's readout still prints `min=- max=-`.
+#[must_use]
+pub fn machine_data_slots(band: Option<Band>) -> [i32; 2] {
+    band.map_or([0, 0], |band| {
+        [slot_value(band.min()), slot_value(band.max())]
+    })
+}
+
+/// The target cell's open payload: the maintained item's id, or nothing.
+#[must_use]
+pub fn machine_extra_data(target: Option<&str>) -> String {
+    target
+        .filter(|target| is_item_id(target))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// The item id a target cell's payload names, if it names one.
+#[must_use]
+pub fn machine_extra_item(data: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(data).ok()?.trim();
+    is_item_id(text).then(|| text.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3032,6 +3193,153 @@ mod tests {
         assert!(
             queue.failed().is_none(),
             "the failure named an ask that is gone"
+        );
+    }
+
+    /// Every press the machine's panel draws round-trips through its menu button id, and a button
+    /// it does not draw is no press.
+    #[test]
+    fn a_machine_press_round_trips_through_its_button_id() {
+        for (button, press) in [
+            (300, MachinePress::Target),
+            (310, MachinePress::MinDown),
+            (311, MachinePress::MinUp),
+            (312, MachinePress::MaxDown),
+            (313, MachinePress::MaxUp),
+        ] {
+            assert_eq!(MachinePress::of(button), Some(press));
+            assert_eq!(press.button(), button);
+        }
+        assert_eq!(MachinePress::of(301), None);
+        assert_eq!(MachinePress::of(314), None);
+    }
+
+    /// The target cell takes the carried item; an empty hand leaves the target as it was, so a
+    /// click on the cell cannot silently unconfigure the machine.
+    #[test]
+    fn the_target_cell_takes_the_carried_item() {
+        let mut editor = MachineEditor::new(None, None);
+        assert!(
+            editor.apply(MachinePress::Target, Some("minecraft:torch")),
+            "a carried torch must make the machine's target"
+        );
+        assert_eq!(editor.target(), Some("minecraft:torch"));
+        assert!(
+            !editor.apply(MachinePress::Target, None),
+            "an empty hand changes nothing"
+        );
+        assert_eq!(
+            editor.target(),
+            Some("minecraft:torch"),
+            "the cell keeps its target when nothing is carried"
+        );
+    }
+
+    /// The same item clicked onto the target cell again is no change: the command's reply and the
+    /// screen would otherwise restart the run for nothing.
+    #[test]
+    fn the_target_cell_with_the_same_item_changes_nothing() {
+        let mut editor = MachineEditor::new(Some("minecraft:torch".to_owned()), None);
+        assert!(!editor.apply(MachinePress::Target, Some("minecraft:torch")));
+        assert!(editor.apply(MachinePress::Target, Some("minecraft:stick")));
+        assert_eq!(editor.target(), Some("minecraft:stick"));
+    }
+
+    /// The four buttons step the band: `max` first lifts from nothing, `min` follows it, and a
+    /// step that would invert the band (`min` past `max`) is refused, so `8..8` stays `8..8`.
+    #[test]
+    fn the_value_buttons_step_the_band_and_refuse_an_inversion() {
+        let mut editor = MachineEditor::new(None, None);
+        assert!(
+            !editor.apply(MachinePress::MinUp, None),
+            "min cannot pass a maximum of zero"
+        );
+        for _ in 0..16 {
+            assert!(editor.apply(MachinePress::MaxUp, None));
+        }
+        assert_eq!(editor.band(), Some(band(0, 16)));
+        for _ in 0..8 {
+            assert!(editor.apply(MachinePress::MinUp, None));
+        }
+        assert_eq!(editor.band(), Some(band(8, 16)), "the brief's band");
+        for _ in 0..8 {
+            assert!(editor.apply(MachinePress::MaxDown, None));
+        }
+        assert_eq!(editor.band(), Some(band(8, 8)));
+        assert!(
+            !editor.apply(MachinePress::MinUp, None),
+            "min + at 8..8 would invert the band"
+        );
+        assert_eq!(
+            editor.band(),
+            Some(band(8, 8)),
+            "the refused step changed nothing"
+        );
+        assert!(
+            !editor.apply(MachinePress::MaxDown, None),
+            "max - at 8..8 would invert the band"
+        );
+        assert_eq!(editor.band(), Some(band(8, 8)));
+    }
+
+    /// A value never goes below zero and a screen edit caps at the same maximum the requester's
+    /// screen uses; the band it makes is always a `Band` the rules accept.
+    #[test]
+    fn a_machine_value_never_goes_below_zero_and_caps_at_the_screens_maximum() {
+        let mut editor = MachineEditor::new(None, Some(band(0, 0)));
+        assert!(!editor.apply(MachinePress::MinDown, None));
+        assert!(!editor.apply(MachinePress::MaxDown, None));
+        for _ in 0..(SCREEN_MAX + 2) {
+            editor.apply(MachinePress::MaxUp, None);
+        }
+        assert_eq!(editor.band().map(|band| band.max()), Some(SCREEN_MAX));
+        let mut floor = MachineEditor::new(None, Some(band(0, 2)));
+        assert!(floor.apply(MachinePress::MinUp, None));
+        assert!(floor.apply(MachinePress::MinDown, None));
+        assert!(
+            !floor.apply(MachinePress::MinDown, None),
+            "a minimum stops at zero"
+        );
+        assert_eq!(floor.band(), Some(band(0, 2)));
+    }
+
+    /// The panel's numbers are the band's two amounts, clamped to the wire: a menu data slot is
+    /// 16-bit, so a saved band above it must not wrap negative (and a machine with no band shows
+    /// zeroes).
+    #[test]
+    fn the_machines_data_slots_are_its_band() {
+        assert_eq!(machine_data_slots(None), [0, 0]);
+        assert_eq!(
+            machine_data_slots(Some(band(8, 16))),
+            [8, 16],
+            "the screen's min and max"
+        );
+        let huge = Band::new(u64::MAX, u64::MAX).expect("the largest band");
+        assert_eq!(
+            machine_data_slots(Some(huge)),
+            [i32::from(i16::MAX), i32::from(i16::MAX)],
+            "a value past the wire is clamped, never wrapped"
+        );
+    }
+
+    /// The target cell's payload is its item id, and a malformed payload draws no icon rather than
+    /// guessing one.
+    #[test]
+    fn the_target_cells_payload_is_its_item_id() {
+        assert_eq!(
+            machine_extra_data(Some("minecraft:torch")),
+            "minecraft:torch"
+        );
+        assert_eq!(machine_extra_data(None), "");
+        assert_eq!(
+            machine_extra_item(b"minecraft:torch"),
+            Some("minecraft:torch".to_owned())
+        );
+        assert_eq!(machine_extra_item(b""), None);
+        assert_eq!(machine_extra_item(b"not an id"), None);
+        assert_eq!(
+            machine_extra_item(b"minecraft:torch\nminecraft:stick"),
+            None
         );
     }
 }
