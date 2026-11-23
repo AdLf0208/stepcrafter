@@ -97,14 +97,17 @@ def main():
         for item, count in items:
             run("give", item, str(count))
         wait(3)
-        run("interact", x, y, z)
-        wait(5)
+        # The interaction can miss (the teleport lands a tick late, or a loose item entity sits
+        # between the player and the table), so the use is retried before this is called a defect.
         screen = {}
-        for _ in range(10):
-            screen = run("screen")
-            if "slots" in screen:
-                return
-            wait(2)
+        for _ in range(3):
+            run("interact", x, y, z)
+            wait(5)
+            for _ in range(6):
+                screen = run("screen")
+                if "slots" in screen:
+                    return
+                wait(2)
         raise SystemExit(f"the crafting table did not open a menu: {screen}")
 
     def counts():

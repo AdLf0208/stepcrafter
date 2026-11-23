@@ -10,7 +10,9 @@
 //! |---|---|
 //! | `target <pos> <item>` | the pattern slot, with the pattern being the item's crafting recipe |
 //! | `configure <pos> <min> <max>` | the slot's min/max fields |
-//! | `requester <pos> <item> <min> <max> <batch>` | the requester's filter slot: resource, min, max, batch |
+//! | `requester <pos> <item> <min> <max> <batch>` | the requester's filter slot: resource, min, max, batch (add or replace) |
+//! | `requester add <pos> <item> <min> <max> <batch>` | another filter slot, the same fields |
+//! | `requester remove <pos> <item>` | clearing a filter slot |
 //! | `info <pos>` | the tooltip: maintaining min–max, the status (either block) |
 //! | `step <pos>` | a manual step (upstream: click a step-crafting request) |
 //! | `take <pos> <item> <count>` | taking the maintained item out of the network |
@@ -47,6 +49,14 @@ pub fn declare(commands: &mut Vec<Command>) {
     ));
     commands.push(Command::op(
         "stepcrafter requester <pos:block_pos> <item:id> <min:integer> <max:integer> <batch:integer>",
+        OPERATOR_LEVEL,
+    ));
+    commands.push(Command::op(
+        "stepcrafter requester add <pos:block_pos> <item:id> <min:integer> <max:integer> <batch:integer>",
+        OPERATOR_LEVEL,
+    ));
+    commands.push(Command::op(
+        "stepcrafter requester remove <pos:block_pos> <item:id>",
         OPERATOR_LEVEL,
     ));
     commands.push(Command::op(
@@ -98,19 +108,49 @@ pub fn run(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> bool {
             say(host, &line);
         }
         "requester" => {
-            let (Some(item), Some(min), Some(max), Some(batch)) = (
-                id(invocation, "item"),
-                integer(invocation, "min"),
-                integer(invocation, "max"),
-                integer(invocation, "batch"),
-            ) else {
-                say(
-                    host,
-                    "Usage: /stepcrafter requester <x> <y> <z> <item> <min> <max> <batch>",
-                );
-                return true;
+            let line = match words.get(2).copied() {
+                Some("add") => {
+                    let (Some(item), Some(min), Some(max), Some(batch)) = (
+                        id(invocation, "item"),
+                        integer(invocation, "min"),
+                        integer(invocation, "max"),
+                        integer(invocation, "batch"),
+                    ) else {
+                        say(
+                            host,
+                            "Usage: /stepcrafter requester add <x> <y> <z> <item> <min> <max> <batch>",
+                        );
+                        return true;
+                    };
+                    set_filter(host, pos, &item, min, max, batch)
+                }
+                Some("remove") => {
+                    let Some(item) = id(invocation, "item") else {
+                        say(
+                            host,
+                            "Usage: /stepcrafter requester remove <x> <y> <z> <item>",
+                        );
+                        return true;
+                    };
+                    remove_filter(host, pos, &item)
+                }
+                // The 0.2.1–0.2.4 spelling: set (or replace) the entry for this resource.
+                _ => {
+                    let (Some(item), Some(min), Some(max), Some(batch)) = (
+                        id(invocation, "item"),
+                        integer(invocation, "min"),
+                        integer(invocation, "max"),
+                        integer(invocation, "batch"),
+                    ) else {
+                        say(
+                            host,
+                            "Usage: /stepcrafter requester <x> <y> <z> <item> <min> <max> <batch>",
+                        );
+                        return true;
+                    };
+                    set_filter(host, pos, &item, min, max, batch)
+                }
             };
-            let line = set_filter(host, pos, &item, min, max, batch);
             say(host, &line);
         }
         "step" => {
@@ -358,49 +398,71 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
     )
 }
 
-/// `/stepcrafter info <pos>` for a Step Requester: its filter, the crafter it asks and that
-/// crafter's stock of the filtered item (upstream's `storageComponent.get(resource)`).
+/// `/stepcrafter info <pos>` for a Step Requester: every filter entry, the crafter it asks and that
+/// crafter's stock of the entry's resource (upstream's `storageComponent.get(resource)`).
+///
+/// The single-entry fields (`item/min/max/batch/stored/phase/crafter/backoff`) describe the first
+/// entry, the shape 0.2.1–0.2.4 printed; `filters` and `entries` name the whole container.
 fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
     let Some(entity) = host.block_entity(level, pos) else {
         return NO_MACHINE.to_owned();
     };
     let nbt = entity.data(&*host).unwrap_or_default();
     let state = requester::read(&nbt);
-    let (crafter, stored) = requester::crafter_and_stock(&*host, level, pos, &nbt);
-    let item = state
-        .filter
-        .as_ref()
-        .map_or_else(|| "none".to_owned(), |filter| filter.item().to_owned());
-    let (min, max, batch) = state.filter.as_ref().map_or_else(
-        || ("-".to_owned(), "-".to_owned(), "-".to_owned()),
-        |filter| {
-            (
-                filter.band().min().to_string(),
-                filter.band().max().to_string(),
-                filter.batch().to_string(),
-            )
-        },
-    );
-    let crafter = crafter.map_or_else(|| "none".to_owned(), |[x, y, z]| format!("{x},{y},{z}"));
+    let views = requester::views(&*host, level, pos, &nbt);
+    let first = views.first();
+    let item = first.map_or_else(|| "none".to_owned(), |view| view.item.clone());
+    let min = first.map_or_else(|| "-".to_owned(), |view| view.min.to_string());
+    let max = first.map_or_else(|| "-".to_owned(), |view| view.max.to_string());
+    let batch = first.map_or_else(|| "-".to_owned(), |view| view.batch.to_string());
+    let stored = first.map_or(0, |view| view.stored);
+    let phase = first.map_or("idle", |view| view.phase);
+    let backoff = first.map_or(0, |view| view.backoff);
+    let crafter = first
+        .and_then(|view| view.crafter)
+        .map_or_else(|| "none".to_owned(), |[x, y, z]| format!("{x},{y},{z}"));
+    let entries: Vec<String> = views.iter().map(requester::View::encode).collect();
+    let entries = if entries.is_empty() {
+        "none".to_owned()
+    } else {
+        entries.join(";")
+    };
     format!(
-        "stepcrafter {} {} {} kind=requester item={} min={} max={} batch={} stored={} phase={} crafter={} backoff={} requests={}",
+        "stepcrafter {} {} {} kind=requester filters={} item={} min={} max={} batch={} stored={} phase={} crafter={} backoff={} requests={} entries={}",
         pos[0],
         pos[1],
         pos[2],
+        state.filters.len(),
         item,
         min,
         max,
         batch,
         stored,
-        state.phase_id(),
+        phase,
         crafter,
-        state.backoff,
+        backoff,
         state.requests,
+        entries,
     )
 }
 
-/// `/stepcrafter requester <pos> <item> <min> <max> <batch>`: the requester's filter entry —
-/// upstream's filter slot with its resource, minimum, maximum and batch size.
+/// The refusal for a command only a Step Requester answers, at a position that holds something else.
+fn ensure_requester(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Result<(), String> {
+    if is_requester(host, level, pos) {
+        Ok(())
+    } else if is_machine(host, level, pos) {
+        Err(
+            "stepcrafter: that is a Step Crafter; a filter is set on the requester beside it"
+                .to_owned(),
+        )
+    } else {
+        Err(NO_MACHINE.to_owned())
+    }
+}
+
+/// `/stepcrafter requester [add] <pos> <item> <min> <max> <batch>`: add a filter entry, or replace
+/// the one that already maintains this resource (upstream's filter slot with its resource, minimum,
+/// maximum and batch size).
 fn set_filter(
     host: &mut dyn ServerHost,
     pos: [i32; 3],
@@ -412,13 +474,8 @@ fn set_filter(
     let Some(level) = host.level(host.dimension()) else {
         return NO_MACHINE.to_owned();
     };
-    if !is_requester(&*host, level, pos) {
-        return if is_machine(&*host, level, pos) {
-            "stepcrafter: that is a Step Crafter; a filter is set on the requester beside it"
-                .to_owned()
-        } else {
-            NO_MACHINE.to_owned()
-        };
+    if let Err(refusal) = ensure_requester(&*host, level, pos) {
+        return refusal;
     }
     let Ok(id) = Identifier::parse(item) else {
         return format!("stepcrafter: {item} is not an item id");
@@ -444,24 +501,58 @@ fn set_filter(
         return NO_MACHINE.to_owned();
     };
     let mut state = requester::read(&nbt);
-    state.filter = Some(filter.clone());
-    state.phase = Phase::Idle;
-    state.backoff = 0;
-    // The previous filter's crafter may make something else: let the next tick resolve it again.
-    state.link = None;
+    if state.filters.set(filter.clone()).is_err() {
+        return format!(
+            "stepcrafter: the requester already carries {} filter entries",
+            crate::runtime::MAX_FILTER_ENTRIES
+        );
+    }
     requester::write(&mut nbt, &state);
     if !matches!(entity.replace_data(host, nbt), Ok(true)) {
         return "The Step Requester could not be written.".to_owned();
     }
     format!(
-        "stepcrafter requester {} {} {} item={} min={} max={} batch={}",
+        "stepcrafter requester {} {} {} item={} min={} max={} batch={} filters={}",
         pos[0],
         pos[1],
         pos[2],
         filter.item(),
         filter.band().min(),
         filter.band().max(),
-        filter.batch()
+        filter.batch(),
+        state.filters.len()
+    )
+}
+
+/// `/stepcrafter requester remove <pos> <item>`: clear the entry that maintains this resource;
+/// removing a resource the requester does not carry changes nothing.
+fn remove_filter(host: &mut dyn ServerHost, pos: [i32; 3], item: &str) -> String {
+    let Some(level) = host.level(host.dimension()) else {
+        return NO_MACHINE.to_owned();
+    };
+    if let Err(refusal) = ensure_requester(&*host, level, pos) {
+        return refusal;
+    }
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MACHINE.to_owned();
+    };
+    let Some(mut nbt) = entity.data(&*host) else {
+        return NO_MACHINE.to_owned();
+    };
+    let mut state = requester::read(&nbt);
+    let removed = state.filters.remove(item);
+    requester::write(&mut nbt, &state);
+    if !matches!(entity.replace_data(host, nbt), Ok(true)) {
+        return "The Step Requester could not be written.".to_owned();
+    }
+    format!(
+        "stepcrafter requester {} {} {} item={} removed={} filters={}",
+        pos[0],
+        pos[1],
+        pos[2],
+        item,
+        u8::from(removed),
+        state.filters.len()
     )
 }
 

@@ -11,18 +11,23 @@ upstream's `StepCrafterNetworkNode.doWork` does. A step also leaves what its ing
 crafting grid does: a cake recipe returns its three milk buckets. Right-click the block to open its
 inventory.
 
-The **Step Requester** keeps a filtered item in stock *through* the Step Crafter beside it: when that
-crafter's stock of the filter falls below the requester's minimum, it asks the crafter for batches of
-the item until the maximum is reached (upstream's `StepRequesterNetworkNode.doWork`), and reports a
-refusal the crafter cannot serve. Upstream's version asks a Refined Storage autocrafting network;
-this one asks the nearest Step Crafter within 4 blocks that maintains the same item.
+The **Step Requester** keeps filtered items in stock *through* the Step Crafters beside it: each
+filter entry has its own resource, minimum, maximum and batch (up to 45 entries, upstream's filter
+slots), and when that entry's stock falls below its minimum the requester asks the crafter that
+maintains the item for batches until the maximum is reached (upstream's
+`StepRequesterNetworkNode.doWork`), reporting a refusal the crafter cannot serve. Upstream's version
+asks a Refined Storage autocrafting network; this one asks the nearest Step Crafter within 4 blocks
+that maintains the entry's item.
 
 ```
 /stepcrafter target <pos> <item>        the item a Step Crafter maintains (its crafting recipe becomes the step)
 /stepcrafter configure <pos> <min> <max>  the machine's band: start below min, fill to max
-/stepcrafter requester <pos> <item> <min> <max> <batch>
-                                        the requester's filter: what to keep, its band, and the most
-                                        one request asks for (0 disables the entry)
+/stepcrafter requester add <pos> <item> <min> <max> <batch>
+                                        add a filter entry (or replace the one for that item): what
+                                        to keep, its band, and the most one request asks for (0
+                                        disables the entry); up to 45 entries
+/stepcrafter requester remove <pos> <item>
+                                        clear the entry for that item
 /stepcrafter info <pos>                  either block's whole state, one line
 /stepcrafter step <pos>                  take one step now
 /stepcrafter take <pos> <item> <count>   take the target back

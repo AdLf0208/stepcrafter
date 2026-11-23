@@ -1,6 +1,6 @@
 id = "stepcrafter"
 name = "Step Crafter"
-version = "0.2.4"
+version = "0.2.5"
 description = """A port of Step Crafter for Horizon: the Step Crafter machine and its Step Requester.
 
 The Step Crafter is a block entity that keeps a configured resource in stock. It is told a target
@@ -11,9 +11,10 @@ falls below the configured minimum and keeps going until the maximum is reached 
 does: a cake recipe's three milk buckets come back as three buckets. The stock is the machine's own
 inventory, because a Horizon mod cannot join a Refined Storage network.
 
-The Step Requester keeps a filtered item stocked *through* the Step Crafter beside it: when that
-crafter's stock of the filter falls below the requester's minimum, it asks the crafter for batches of
-the item until the maximum is reached (upstream's `StepRequesterNetworkNode.doWork` rule), and
+The Step Requester keeps filtered items stocked *through* the Step Crafters beside it: each filter
+entry has its own minimum, maximum and batch, and when the stock of that entry's item falls below its
+minimum the requester asks the crafter that maintains it for batches of the item until the maximum is
+reached (upstream's `StepRequesterNetworkNode.doWork` rule), and
 reports a refusal it cannot serve. The Step Crafter Manager, the Step Requester Manager, the Step
 Crafting Monitor, the sixteen colour variants, the slot upgrade, the energy buffer and the GUIs are
 not ported yet."""

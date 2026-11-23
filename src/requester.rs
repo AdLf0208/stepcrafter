@@ -19,7 +19,7 @@ use mod_api::{
 
 use crate::machine;
 use crate::nbt::{amount, drop_key, int_of, put, string};
-use crate::runtime::{self, Ask, Filter, Phase};
+use crate::runtime::{self, Ask, Band, Entry, Filter, Filters, Phase};
 
 /// The block entity type this mod declares for upstream's requester.
 pub const TYPE: &str = "step_requester";
@@ -30,6 +30,11 @@ pub const BLOCK: &str = "stepcrafter:step_requester";
 /// network's; this is the documented re-root: `LINK_RADIUS` blocks along each axis, nearest first.
 pub const LINK_RADIUS: i32 = 4;
 
+/// Upstream's `rf` container: one saved string per filter entry.
+const KEY_FILTERS: &str = "Filters";
+const KEY_REQUESTS: &str = "Requests";
+/// The 0.2.1–0.2.4 single-entry keys. Read as one entry when a compound has no `Filters`, and
+/// dropped on the next write; a world made by the older package keeps its filter.
 const KEY_ITEM: &str = "FilterItem";
 const KEY_MIN: &str = "FilterMin";
 const KEY_MAX: &str = "FilterMax";
@@ -37,7 +42,6 @@ const KEY_BATCH: &str = "FilterBatch";
 const KEY_PHASE: &str = "Phase";
 const KEY_LINK: &str = "Link";
 const KEY_BACKOFF: &str = "Backoff";
-const KEY_REQUESTS: &str = "Requests";
 
 /// Declare the requester's block entity type and the Part that ticks it.
 pub fn declare(r: &mut dyn Registrar) {
@@ -53,15 +57,9 @@ pub fn declare(r: &mut dyn Registrar) {
 /// What one requester is configured to maintain.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    /// The filter entry, absent until `/stepcrafter requester`.
-    pub filter: Option<Filter>,
-    /// Where the last tick left it; upstream's filter-slot status.
-    pub phase: Phase,
-    /// The crafter it asks, kept so the scan runs once and re-validated every tick.
-    pub link: Option<[i32; 3]>,
-    /// Failed-task ticks left before the next ask, upstream's `failedTaskTimeouts`.
-    pub backoff: u32,
-    /// How many asks this requester has issued (the harness readout).
+    /// The filter entries, one per maintained resource (upstream's 45-slot `rf` container).
+    pub filters: Filters,
+    /// How many asks this requester has issued in all (the harness readout).
     pub requests: u64,
 }
 
@@ -69,153 +67,251 @@ impl State {
     /// Whether the requester has a filter to maintain.
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        self.filter.is_some()
+        !self.filters.is_empty()
     }
 
-    /// The phase as the readout prints it: upstream's task state is `running` while its CRAFTING
-    /// status is set, which is also how the brief names it.
+    /// The first entry's phase, as the readout's single-entry fields print it.
     #[must_use]
     pub fn phase_id(&self) -> &'static str {
-        if self.phase == Phase::Crafting {
-            "running"
-        } else {
-            self.phase.id()
-        }
+        self.filters.first().map_or("idle", Entry::phase_id)
     }
 }
 
 /// Read a requester's configuration out of its saved compound.
+///
+/// A compound written by 0.2.1–0.2.4 has no `Filters` list but the single entry's keys; it reads as
+/// one entry so an existing world keeps its filter. The next tick writes the container form.
 #[must_use]
 pub fn read(nbt: &Compound) -> State {
-    let filter = match (
-        string(nbt, KEY_ITEM),
-        amount(nbt, KEY_MIN),
-        amount(nbt, KEY_MAX),
-    ) {
-        (Some(item), min, max) => {
-            let band = runtime::Band::new(min, max);
-            band.and_then(|band| Filter::new(item, band, amount(nbt, KEY_BATCH)))
-        }
-        (None, _, _) => None,
+    let filters = match crate::nbt::list(nbt, KEY_FILTERS) {
+        Some(entries) => Filters::decode(&entries),
+        None => legacy_filters(nbt),
     };
     State {
-        filter,
-        phase: string(nbt, KEY_PHASE)
-            .as_deref()
-            .map_or(Phase::Idle, Phase::of),
-        link: string(nbt, KEY_LINK).as_deref().and_then(parse_pos),
-        backoff: amount(nbt, KEY_BACKOFF).try_into().unwrap_or(u32::MAX),
+        filters,
         requests: amount(nbt, KEY_REQUESTS),
     }
 }
 
-/// Write a requester's configuration back; an unconfigured requester keeps no filter keys at all.
-pub fn write(nbt: &mut Compound, state: &State) {
-    match &state.filter {
-        Some(filter) => {
-            put(nbt, KEY_ITEM, Tag::String(filter.item().into()));
-            put(nbt, KEY_MIN, int_of(filter.band().min()));
-            put(nbt, KEY_MAX, int_of(filter.band().max()));
-            put(nbt, KEY_BATCH, int_of(filter.batch()));
-        }
-        None => {
-            drop_key(nbt, KEY_ITEM);
-            drop_key(nbt, KEY_MIN);
-            drop_key(nbt, KEY_MAX);
-            drop_key(nbt, KEY_BATCH);
-        }
+/// The 0.2.4 single filter entry, as the one entry of a container.
+fn legacy_filters(nbt: &Compound) -> Filters {
+    let Some(item) = string(nbt, KEY_ITEM) else {
+        return Filters::new();
+    };
+    let Some(band) = Band::new(amount(nbt, KEY_MIN), amount(nbt, KEY_MAX)) else {
+        return Filters::new();
+    };
+    let Some(filter) = Filter::new(item, band, amount(nbt, KEY_BATCH)) else {
+        return Filters::new();
+    };
+    let mut filters = Filters::new();
+    let _ = filters.set(filter);
+    if let Some(entry) = filters.iter_mut().next() {
+        entry.set_phase(
+            string(nbt, KEY_PHASE)
+                .as_deref()
+                .map_or(Phase::Idle, Phase::of),
+        );
+        entry.set_link(string(nbt, KEY_LINK).as_deref().and_then(parse_pos));
+        entry.set_backoff(amount(nbt, KEY_BACKOFF).try_into().unwrap_or(u32::MAX));
     }
-    put(nbt, KEY_PHASE, Tag::String(state.phase.id().into()));
-    match state.link {
-        Some([x, y, z]) => {
-            let text = format!("{x},{y},{z}");
-            put(nbt, KEY_LINK, Tag::String(text.as_str().into()));
-        }
-        None => drop_key(nbt, KEY_LINK),
-    }
-    put(nbt, KEY_BACKOFF, int_of(u64::from(state.backoff)));
-    put(nbt, KEY_REQUESTS, int_of(state.requests));
+    filters
 }
 
-/// One server tick of a requester: find its crafter, read that crafter's stock, then ask or hold.
+/// Write a requester's configuration back: the whole container, plus the ask counter.
+///
+/// The 0.2.4 single-entry keys are superseded, so they are dropped here rather than left as a second
+/// truth beside the container.
+pub fn write(nbt: &mut Compound, state: &State) {
+    let entries = state.filters.encode();
+    if entries.is_empty() {
+        drop_key(nbt, KEY_FILTERS);
+    } else {
+        put(
+            nbt,
+            KEY_FILTERS,
+            Tag::List(
+                entries
+                    .iter()
+                    .map(|entry| Tag::String(entry.as_str().into()))
+                    .collect(),
+            ),
+        );
+    }
+    put(nbt, KEY_REQUESTS, int_of(state.requests));
+    for key in [
+        KEY_ITEM,
+        KEY_MIN,
+        KEY_MAX,
+        KEY_BATCH,
+        KEY_PHASE,
+        KEY_LINK,
+        KEY_BACKOFF,
+    ] {
+        drop_key(nbt, key);
+    }
+}
+
+/// One server tick of a requester: walk every filter entry and ask or hold for each.
+///
+/// Upstream's `StepRequesterNetworkNode.doWork` runs its five guards once per non-empty filter slot,
+/// each with that slot's own status and failed-task timeout. This is the same walk: an entry's
+/// crafter is resolved from the entry's resource, and one entry's refusal or backoff never stops
+/// another entry from being served.
 pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     let me = event.pos;
     let mut state = read(&event.entity.nbt);
-    let Some(filter) = state.filter.clone() else {
+    if state.filters.is_empty() {
         machine::sync_active(host, me, false);
         return;
-    };
+    }
     let Some(level) = host.level(host.dimension()) else {
         machine::sync_active(host, me, false);
         return;
     };
 
-    let (crafter_pos, crafter_entity, crafter) =
-        match resolve(&*host, level, me, filter.item(), state.link) {
-            Found::Crafter { pos, entity, state } => (pos, entity, state),
-            Found::Unreadable => {
-                // The crafter is out of the world for its own tick: keep the link and hold, rather
-                // than rescanning on one unreadable tick.
-                machine::sync_active(host, me, false);
-                return;
-            }
-            Found::NoCrafter => {
-                state.link = None;
-                // Nothing to ask: a run that lost its crafter is not running any more.
-                if state.phase == Phase::Crafting {
-                    state.phase = Phase::Idle;
-                }
-                write(&mut event.entity.nbt, &state);
-                machine::sync_active(host, me, false);
-                return;
-            }
-        };
-    state.link = Some(crafter_pos);
-
-    let stored = stock_count(&*host, crafter_entity, filter.item());
-    // A crafter that refused the ask (its own phase says so, and it has nothing outstanding) is
-    // upstream's failed task: report it, and stop asking for its 20-tick timeout.
-    if state.phase == Phase::Crafting
-        && crafter.request == 0
-        && let Some(refusal) = runtime::refused(crafter.phase, stored, &filter)
-    {
-        state.phase = refusal;
-        state.backoff = runtime::FAILED_TASK_TIMEOUT_TICKS;
-    }
-
-    match runtime::ask(stored, &filter, state.phase, crafter.request, state.backoff) {
-        Ask::Hold => {}
-        Ask::Finish => state.phase = Phase::Idle,
-        Ask::Backoff => state.backoff = state.backoff.saturating_sub(1),
-        Ask::Waiting => state.phase = Phase::Crafting,
-        Ask::Request { amount } => {
-            state.phase = Phase::Crafting;
-            state.requests = state.requests.saturating_add(1);
-            ask_crafter(host, crafter_entity, amount);
+    let mut running = false;
+    let mut asked = 0u64;
+    for entry in state.filters.iter_mut() {
+        if tick_entry(&mut *host, level, me, entry) {
+            asked = asked.saturating_add(1);
         }
+        running |= entry.phase() == Phase::Crafting;
     }
 
+    state.requests = state.requests.saturating_add(asked);
     write(&mut event.entity.nbt, &state);
-    machine::sync_active(host, me, state.phase == Phase::Crafting);
+    machine::sync_active(host, me, running);
 }
 
-/// The crafter a requester asks, and how much of its filter that crafter holds: what the readout
-/// needs, resolved once.
-#[must_use]
-pub fn crafter_and_stock(
-    host: &dyn Host,
-    level: LevelRef,
-    me: [i32; 3],
-    nbt: &Compound,
-) -> (Option<[i32; 3]>, u64) {
-    let state = read(nbt);
-    let Some(filter) = state.filter else {
-        return (None, 0);
+/// One entry's tick: find the crafter that maintains its resource, read that crafter's stock, then
+/// ask or hold. Answers whether it put an ask into the crafter.
+fn tick_entry(host: &mut dyn ServerHost, level: LevelRef, me: [i32; 3], entry: &mut Entry) -> bool {
+    let found = resolve(&*host, level, me, entry.filter().item(), entry.link());
+    let (crafter_pos, crafter_entity, crafter) = match found {
+        Found::Crafter { pos, entity, state } => (pos, entity, state),
+        // The crafter is out of the world for its own tick: keep the link and hold, rather than
+        // rescanning on one unreadable tick.
+        Found::Unreadable => return false,
+        Found::NoCrafter => {
+            entry.set_link(None);
+            // Nothing to ask: a run that lost its crafter is not running any more.
+            if entry.phase() == Phase::Crafting {
+                entry.set_phase(Phase::Idle);
+            }
+            return false;
+        }
     };
-    match resolve(host, level, me, filter.item(), state.link) {
-        Found::Crafter { pos, entity, .. } => (Some(pos), stock_count(host, entity, filter.item())),
-        Found::NoCrafter | Found::Unreadable => (None, 0),
+
+    let stored = stock_count(&*host, crafter_entity, entry.filter().item());
+    let mut phase = entry.phase();
+    let mut backoff = entry.backoff();
+    // A crafter that refused the ask (its own phase says so, and it has nothing outstanding) is
+    // upstream's failed task: report it, and stop asking for its 20-tick timeout.
+    if phase == Phase::Crafting
+        && crafter.request == 0
+        && let Some(refusal) = runtime::refused(crafter.phase, stored, entry.filter())
+    {
+        phase = refusal;
+        backoff = runtime::FAILED_TASK_TIMEOUT_TICKS;
     }
+    let decision = runtime::ask(stored, entry.filter(), phase, crafter.request, backoff);
+
+    entry.set_link(Some(crafter_pos));
+    entry.set_phase(phase);
+    entry.set_backoff(backoff);
+    match decision {
+        Ask::Hold => false,
+        Ask::Finish => {
+            entry.set_phase(Phase::Idle);
+            false
+        }
+        Ask::Backoff => {
+            entry.set_backoff(backoff.saturating_sub(1));
+            false
+        }
+        Ask::Waiting => {
+            entry.set_phase(Phase::Crafting);
+            false
+        }
+        Ask::Request { amount } => {
+            entry.set_phase(Phase::Crafting);
+            ask_crafter(host, crafter_entity, amount);
+            true
+        }
+    }
+}
+
+/// One entry as the readout prints it: what it maintains, how much of it its crafter holds, and how
+/// its last tick went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct View {
+    /// The entry's resource.
+    pub item: String,
+    /// The entry's band.
+    pub min: u64,
+    /// The entry's band.
+    pub max: u64,
+    /// The entry's largest single ask.
+    pub batch: u64,
+    /// How much of the resource the linked crafter holds.
+    pub stored: u64,
+    /// The entry's phase, `running` while it is asking.
+    pub phase: &'static str,
+    /// The crafter this entry asks right now.
+    pub crafter: Option<[i32; 3]>,
+    /// Failed-task ticks left for this entry.
+    pub backoff: u32,
+}
+
+impl View {
+    /// The entry as one readout field: `item|min|max|batch|stored|phase|crafter|backoff`.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let crafter = self
+            .crafter
+            .map_or_else(|| "none".to_owned(), |[x, y, z]| format!("{x},{y},{z}"));
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.item,
+            self.min,
+            self.max,
+            self.batch,
+            self.stored,
+            self.phase,
+            crafter,
+            self.backoff
+        )
+    }
+}
+
+/// Every configured entry as the readout needs it: its crafter and that crafter's stock of its
+/// resource (upstream's `storageComponent.get(resource)`), resolved once.
+#[must_use]
+pub fn views(host: &dyn Host, level: LevelRef, me: [i32; 3], nbt: &Compound) -> Vec<View> {
+    read(nbt)
+        .filters
+        .iter()
+        .map(|entry| {
+            let filter = entry.filter();
+            let (crafter, stored) = match resolve(host, level, me, filter.item(), entry.link()) {
+                Found::Crafter { pos, entity, .. } => {
+                    (Some(pos), stock_count(host, entity, filter.item()))
+                }
+                Found::NoCrafter | Found::Unreadable => (None, 0),
+            };
+            View {
+                item: filter.item().to_owned(),
+                min: filter.band().min(),
+                max: filter.band().max(),
+                batch: filter.batch(),
+                stored,
+                phase: entry.phase_id(),
+                crafter,
+                backoff: entry.backoff(),
+            }
+        })
+        .collect()
 }
 
 /// The filtered item's stock in a crafter's inventory: upstream's `storageComponent.get(resource)`.
@@ -376,48 +472,121 @@ fn torches() -> Filter {
     .expect("a valid filter")
 }
 
+/// A second entry: 8 sticks kept between 8 and 16, asked 8 at a time.
+#[cfg(test)]
+fn sticks() -> Filter {
+    Filter::new(
+        "minecraft:stick".to_owned(),
+        runtime::Band::new(8, 16).expect("a valid band"),
+        8,
+    )
+    .expect("a valid filter")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The requester's configuration lives in its saved compound, so a write that does not
-    /// round-trip loses the filter or the crafter it asks between ticks.
+    /// Two filter entries and their own phases, links and timeouts live in one saved compound, so a
+    /// write that does not round-trip loses one entry or the crafter the other asks.
     #[test]
     fn the_requester_state_round_trips_through_the_saved_compound() {
-        let mut nbt = Compound::new();
+        let mut filters = Filters::new();
+        filters.set(torches()).expect("room for the first entry");
+        filters.set(sticks()).expect("room for the second entry");
+        {
+            let first = filters.iter_mut().next().expect("the first entry");
+            first.set_phase(Phase::Crafting);
+            first.set_link(Some([218, 64, 0]));
+            first.set_backoff(7);
+        }
         let state = State {
-            filter: Some(torches()),
-            phase: Phase::Crafting,
-            link: Some([218, 64, 0]),
-            backoff: 7,
+            filters,
             requests: 3,
         };
+        let mut nbt = Compound::new();
         write(&mut nbt, &state);
         assert_eq!(read(&nbt), state);
+        assert_eq!(
+            read(&nbt).filters.len(),
+            2,
+            "both filter entries must survive the compound between ticks"
+        );
     }
 
     #[test]
     fn an_empty_compound_reads_as_an_unconfigured_requester() {
         let state = read(&Compound::new());
         assert!(!state.is_configured());
-        assert_eq!(state.phase, Phase::Idle);
-        assert_eq!(state.link, None);
+        assert_eq!(state.phase_id(), "idle");
+        assert!(state.filters.is_empty());
+    }
+
+    /// A world saved by 0.2.1–0.2.4 has the single entry's keys and no `Filters` list; the upgrade
+    /// must keep that filter rather than read the requester as unconfigured.
+    #[test]
+    fn a_legacy_single_filter_compound_still_reads_as_one_entry() {
+        let mut nbt = Compound::new();
+        put(&mut nbt, KEY_ITEM, Tag::String("minecraft:torch".into()));
+        put(&mut nbt, KEY_MIN, int_of(4));
+        put(&mut nbt, KEY_MAX, int_of(8));
+        put(&mut nbt, KEY_BATCH, int_of(4));
+        put(&mut nbt, KEY_PHASE, Tag::String("crafting".into()));
+        put(&mut nbt, KEY_LINK, Tag::String("218,64,0".into()));
+        put(&mut nbt, KEY_BACKOFF, int_of(7));
+
+        let state = read(&nbt);
+        assert_eq!(state.filters.len(), 1);
+        let entry = state.filters.first().expect("the legacy entry");
+        assert_eq!(entry.filter().item(), "minecraft:torch");
+        assert_eq!(
+            entry.filter().band(),
+            runtime::Band::new(4, 8).expect("a band")
+        );
+        assert_eq!(entry.filter().batch(), 4);
+        assert_eq!(entry.phase(), Phase::Crafting);
+        assert_eq!(entry.link(), Some([218, 64, 0]));
+        assert_eq!(entry.backoff(), 7);
+
+        // The next write migrates the compound to the container form and drops the old keys.
+        write(&mut nbt, &state);
+        assert_eq!(read(&nbt), state);
+        assert_eq!(
+            crate::nbt::list(&nbt, KEY_FILTERS).map(|list| list.len()),
+            Some(1)
+        );
+        assert_eq!(crate::nbt::string(&nbt, KEY_ITEM), None);
     }
 
     #[test]
     fn the_readout_calls_a_running_ask_running() {
-        let running = State {
-            phase: Phase::Crafting,
-            ..State::default()
-        };
-        assert_eq!(running.phase_id(), "running");
-        let idle = State::default();
-        assert_eq!(idle.phase_id(), "idle");
-        let blocked = State {
-            phase: Phase::NotEnoughIngredients,
-            ..State::default()
-        };
-        assert_eq!(blocked.phase_id(), "not-enough-ingredients");
+        let mut running = Filters::new();
+        running.set(torches()).expect("room for the entry");
+        if let Some(entry) = running.iter_mut().next() {
+            entry.set_phase(Phase::Crafting);
+        }
+        assert_eq!(
+            State {
+                filters: running,
+                requests: 0
+            }
+            .phase_id(),
+            "running"
+        );
+        assert_eq!(State::default().phase_id(), "idle");
+        let mut blocked = Filters::new();
+        blocked.set(torches()).expect("room for the entry");
+        if let Some(entry) = blocked.iter_mut().next() {
+            entry.set_phase(Phase::NotEnoughIngredients);
+        }
+        assert_eq!(
+            State {
+                filters: blocked,
+                requests: 0
+            }
+            .phase_id(),
+            "not-enough-ingredients"
+        );
     }
 
     #[test]

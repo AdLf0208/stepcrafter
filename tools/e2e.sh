@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.4).
+# In-game check for Step Crafter (the SDK package, 0.2.5).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -43,6 +43,10 @@
 #  - the refusal and the retry: with the sticks drained the requester reports
 #    `not-enough-ingredients`, and the restock resumes it;
 #  - the requester's own `active` state follows its run;
+#  - the requester keeps several filter entries: one requester with a torch entry and a stick entry
+#    asks the torch crafter to 8 and the stick crafter to 16, reading `filters=2` with both entries
+#    and their own stored counts, while the same world with only the torch entry leaves the stick
+#    crafter at 0 — the removed entry is the only difference;
 #  - a result that fits no slot is refused: a crafter whose 27 slots are 26 x 64 coal + 60 sticks
 #    (1,724 of an aggregate 1,728) is asked for torches by a requester, and every ask is refused with
 #    nothing consumed, nothing crafted and the ask not served (the free room after the ingredients
@@ -63,7 +67,8 @@
 # SELFTEST=components-room flips the component-room assertion (the named stack counted no room and
 # the step was refused, so the fixed package must fail an inverted run);
 # SELFTEST=take flips the component assertion (a stack rebuilt from its id reads no components);
-# SELFTEST=remainder flips the remainder assertion (today's defect: the buckets are destroyed).
+# SELFTEST=remainder flips the remainder assertion (today's defect: the buckets are destroyed);
+# SELFTEST=filters flips the multi-entry assertion (today's defect: one entry, so `filters=1`).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -809,6 +814,138 @@ case "$PLAIN" in
     *) fail "the four torches did not merge into the plain stack: $PLAIN" ;;
 esac
 
+echo "== the Step Requester keeps several filter entries, each served by its crafter =="
+# Upstream's requester has 45 filter slots (StepRequesterBlockEntity.FILTERS = 9 * 5), each a
+# resource with its own band, batch and status; 0.2.4 kept one. One requester here carries two
+# entries and reaches two crafters, each maintaining the entry's own item. The component-room
+# machines above are cleared first, so this leg's requester and crafters own 221/222/223.
+for pos in 221 222 223; do
+    ctl command "execute in minecraft:the_end run setblock $pos 64 0 minecraft:air" >/dev/null
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run setblock 221 64 0 $BLOCK"
+ctl command "execute in minecraft:the_end run setblock 223 64 0 $BLOCK"
+ctl command "execute in minecraft:the_end run setblock 222 64 0 $REQUESTER"
+ctl wait 8
+say "stepcrafter target 221 64 0 minecraft:torch"
+reply '^stepcrafter target 221 64 0 ' >/dev/null
+say "stepcrafter configure 221 64 0 0 0"
+reply '^stepcrafter configure 221 64 0 ' >/dev/null
+say "stepcrafter target 223 64 0 minecraft:stick"
+reply '^stepcrafter target 223 64 0 ' >/dev/null
+say "stepcrafter configure 223 64 0 0 0"
+reply '^stepcrafter configure 223 64 0 ' >/dev/null
+load 221 64 0 minecraft:coal 4
+load 221 64 0 minecraft:stick 4
+# `minecraft:planks` is a tag, not an item: the stock has to name a real plank (`ctl container`
+# silently stocks nothing for a tag, which is exactly the trap this assertion closes).
+load 223 64 0 minecraft:oak_planks 8
+MULTI_STOCK=$(info 223 64 0)
+echo "  the stick crafter before the filters: $MULTI_STOCK"
+case "$MULTI_STOCK" in
+    *"stock=minecraft:oak_planks:8"*) ;;
+    *) fail "the stick crafter was not stocked with 8 planks: $MULTI_STOCK" ;;
+esac
+say "stepcrafter requester add 222 64 0 minecraft:torch 4 8 4"
+MULTI_FIRST=$(reply '^stepcrafter requester 222 64 0 ')
+echo "  the first entry: $MULTI_FIRST"
+case "$MULTI_FIRST" in
+    *"item=minecraft:torch min=4 max=8 batch=4 filters=1"*) ;;
+    *) fail "the first filter entry was not added: $MULTI_FIRST" ;;
+esac
+say "stepcrafter requester add 222 64 0 minecraft:stick 8 16 8"
+MULTI_SECOND=$(reply '^stepcrafter requester 222 64 0 ')
+echo "  the second entry: $MULTI_SECOND"
+case "$MULTI_SECOND" in
+    *"item=minecraft:stick min=8 max=16 batch=8 filters=2"*) ;;
+    *) fail "the second filter entry was not added beside the first: $MULTI_SECOND" ;;
+esac
+ctl wait 80
+MULTI=$(info 222 64 0)
+MULTI_TORCH=$(info 221 64 0)
+MULTI_STICK=$(info 223 64 0)
+echo "  the requester:      $MULTI"
+echo "  the torch crafter:  $MULTI_TORCH"
+echo "  the stick crafter:  $MULTI_STICK"
+if [ "$SELFTEST" = filters ]; then
+    # The defect this version closes, deliberately asserted: with one entry the requester would read
+    # `filters=1` and only the newest resource would be served. The package keeps both, so this
+    # inverted run has to end here, non-zero.
+    case "$MULTI" in
+        *"filters=1"*) ;;
+        *) fail "SELFTEST=filters: the requester keeps both filter entries (filters=2) where today's defect keeps one (filters=1), so the run must end non-zero: $MULTI" ;;
+    esac
+else
+    case "$MULTI" in
+        *"filters=2"*) ;;
+        *) fail "the requester did not keep both filter entries: $MULTI" ;;
+    esac
+    # Both entries and their own stored counts, from the readout's per-entry list.
+    case "$MULTI" in
+        *"entries=minecraft:torch|4|8|4|8|idle|221,64,0|0;minecraft:stick|8|16|8|16|idle|223,64,0|0"*) ;;
+        *) fail "the two entries were not both served by their own crafter: $MULTI" ;;
+    esac
+    case "$MULTI_TORCH" in
+        *"crafted=8"*) ;;
+        *) fail "the torch entry's ask did not make 8 torches: $MULTI_TORCH" ;;
+    esac
+    case "$MULTI_STICK" in
+        *"crafted=16"*) ;;
+        *) fail "the stick entry's ask did not make 16 sticks: $MULTI_STICK" ;;
+    esac
+fi
+
+echo "== the same world with one entry removed leaves the stick crafter at zero =="
+# A second requester with only the torch entry, beside its own two crafters (the same items and
+# stocks). The stick crafter is configured and stocked exactly like the one above and stays at
+# crafted=0 because no entry asks for sticks: the removed entry is the only difference.
+for pos in 221 222 223; do
+    ctl command "execute in minecraft:the_end run setblock $pos 64 4 minecraft:air" >/dev/null
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run setblock 221 64 4 $BLOCK"
+ctl command "execute in minecraft:the_end run setblock 223 64 4 $BLOCK"
+ctl command "execute in minecraft:the_end run setblock 222 64 4 $REQUESTER"
+ctl wait 8
+say "stepcrafter target 221 64 4 minecraft:torch"
+reply '^stepcrafter target 221 64 4 ' >/dev/null
+say "stepcrafter configure 221 64 4 0 0"
+reply '^stepcrafter configure 221 64 4 ' >/dev/null
+say "stepcrafter target 223 64 4 minecraft:stick"
+reply '^stepcrafter target 223 64 4 ' >/dev/null
+say "stepcrafter configure 223 64 4 0 0"
+reply '^stepcrafter configure 223 64 4 ' >/dev/null
+load 221 64 4 minecraft:coal 4
+load 221 64 4 minecraft:stick 4
+load 223 64 4 minecraft:oak_planks 8
+# The 0.2.1–0.2.4 spelling sets (or replaces) one entry, so this requester carries a single one.
+say "stepcrafter requester 222 64 4 minecraft:torch 4 8 4"
+ONE=$(reply '^stepcrafter requester 222 64 4 ')
+echo "  the one-entry requester: $ONE"
+case "$ONE" in
+    *"item=minecraft:torch min=4 max=8 batch=4 filters=1"*) ;;
+    *) fail "the one-entry requester was not configured: $ONE" ;;
+esac
+ctl wait 80
+ONE_REQ=$(info 222 64 4)
+ONE_TORCH=$(info 221 64 4)
+ONE_STICK=$(info 223 64 4)
+echo "  the requester:     $ONE_REQ"
+echo "  the torch crafter: $ONE_TORCH"
+echo "  the stick crafter: $ONE_STICK"
+case "$ONE_REQ" in
+    *"filters=1"*) ;;
+    *) fail "the one-entry requester did not read one entry: $ONE_REQ" ;;
+esac
+case "$ONE_TORCH" in
+    *"crafted=8"*) ;;
+    *) fail "the one entry did not serve its own torch crafter: $ONE_TORCH" ;;
+esac
+case "$ONE_STICK" in
+    *"crafted=0"*) ;;
+    *) fail "a crafter was asked without a filter entry for its item: $ONE_STICK" ;;
+esac
+
 echo "== take hands over the stored stacks: components and damage survive =="
 ctl command "execute in minecraft:the_end run setblock 218 64 0 $BLOCK"
 ctl wait 6
@@ -1093,4 +1230,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

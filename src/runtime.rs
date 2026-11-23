@@ -805,6 +805,242 @@ pub fn refused(crafter: Phase, stored: u64, filter: &Filter) -> Option<Phase> {
     }
 }
 
+/// How many filter entries one requester carries: upstream's `StepRequesterBlockEntity.FILTERS`
+/// (`9 * 5`), the container its screen shows and its node walks every tick.
+pub const MAX_FILTER_ENTRIES: usize = 45;
+
+/// A requester's filter container is full: upstream's 45 slots hold no room for another resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FiltersFull;
+
+impl std::fmt::Display for FiltersFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "all {MAX_FILTER_ENTRIES} filter entries are taken")
+    }
+}
+
+impl std::error::Error for FiltersFull {}
+
+/// One configured filter entry: upstream's `ResourceMinMaxAmount` (the resource, its band and its
+/// batch) plus the two pieces of state this re-root keeps per entry — the crafter it linked and how
+/// many failed-task ticks it is backing off — and its own status, as upstream keeps one per slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    filter: Filter,
+    phase: Phase,
+    link: Option<[i32; 3]>,
+    backoff: u32,
+}
+
+impl Entry {
+    /// A fresh entry for `filter`: idle, unlinked and not backing off.
+    #[must_use]
+    pub fn new(filter: Filter) -> Self {
+        Self {
+            filter,
+            phase: Phase::Idle,
+            link: None,
+            backoff: 0,
+        }
+    }
+
+    /// The resource, band and batch this entry maintains.
+    #[must_use]
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// Where this entry's last tick left it.
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Record where a tick left this entry.
+    pub fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+    }
+
+    /// The crafter this entry asks, kept so the scan runs once and is re-validated every tick.
+    #[must_use]
+    pub fn link(&self) -> Option<[i32; 3]> {
+        self.link
+    }
+
+    /// Remember (or forget) the crafter this entry asks.
+    pub fn set_link(&mut self, link: Option<[i32; 3]>) {
+        self.link = link;
+    }
+
+    /// Failed-task ticks left before this entry asks again.
+    #[must_use]
+    pub fn backoff(&self) -> u32 {
+        self.backoff
+    }
+
+    /// Set the failed-task ticks this entry still has to wait.
+    pub fn set_backoff(&mut self, ticks: u32) {
+        self.backoff = ticks;
+    }
+
+    /// The phase as the readout prints it: upstream's task state is `running` while its CRAFTING
+    /// status is set, which is also how the brief names it.
+    #[must_use]
+    pub fn phase_id(&self) -> &'static str {
+        if self.phase == Phase::Crafting {
+            "running"
+        } else {
+            self.phase.id()
+        }
+    }
+
+    /// The entry's saved form, `item|min|max|batch|phase|link|backoff`; `|` is not an item id, a
+    /// phase name or a position, so the fields cannot run together.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let link = match self.link {
+            Some([x, y, z]) => format!("{x},{y},{z}"),
+            None => "none".to_owned(),
+        };
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.filter.item,
+            self.filter.band.min,
+            self.filter.band.max,
+            self.filter.batch,
+            self.phase.id(),
+            link,
+            self.backoff
+        )
+    }
+
+    /// Read one saved entry; anything malformed is refused rather than guessed at.
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('|').collect();
+        let [item, min, max, batch, phase, link, backoff] = parts.as_slice() else {
+            return None;
+        };
+        let band = Band::new(min.parse().ok()?, max.parse().ok()?)?;
+        let filter = Filter::new((*item).to_owned(), band, batch.parse().ok()?)?;
+        Some(Self {
+            filter,
+            phase: Phase::of(phase),
+            link: if *link == "none" {
+                None
+            } else {
+                Some(parse_link(link)?)
+            },
+            backoff: backoff.parse().ok()?,
+        })
+    }
+}
+
+/// `x,y,z` as an entry saves its linked crafter.
+fn parse_link(text: &str) -> Option<[i32; 3]> {
+    let mut parts = text.split(',');
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    let z = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some([x, y, z])
+}
+
+/// A requester's configured filter entries: upstream's 45-slot container, one entry per resource.
+///
+/// Upstream addresses entries by slot index and skips an empty slot or a zero batch. This port keeps
+/// the entries the operator configured, in the order they were added, and treats a set of the same
+/// resource as a replacement of that entry — the resource is the entry's identity, its saved slot
+/// index is not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filters {
+    entries: Vec<Entry>,
+}
+
+impl Filters {
+    /// An empty container: a requester that maintains nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `filter`, or replace the entry that already maintains its resource, and answer its
+    /// index. A replacement starts idle and unlinked, as setting a new band restarts the run.
+    ///
+    /// # Errors
+    ///
+    /// [`FiltersFull`] when a new resource would be a 46th entry.
+    pub fn set(&mut self, filter: Filter) -> Result<usize, FiltersFull> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.filter.item == filter.item)
+        {
+            self.entries[index] = Entry::new(filter);
+            return Ok(index);
+        }
+        if self.entries.len() >= MAX_FILTER_ENTRIES {
+            return Err(FiltersFull);
+        }
+        self.entries.push(Entry::new(filter));
+        Ok(self.entries.len() - 1)
+    }
+
+    /// Remove the entry that maintains `item`; answers whether one was there.
+    pub fn remove(&mut self, item: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.filter.item != item);
+        self.entries.len() != before
+    }
+
+    /// How many entries are configured.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the requester maintains nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The first entry, the one the readout's legacy fields describe.
+    #[must_use]
+    pub fn first(&self) -> Option<&Entry> {
+        self.entries.first()
+    }
+
+    /// The configured entries in the order they were added.
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter()
+    }
+
+    /// The configured entries, for a tick that updates each one.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
+        self.entries.iter_mut()
+    }
+
+    /// Every entry as its saved string, for a `List` in the block entity's compound.
+    #[must_use]
+    pub fn encode(&self) -> Vec<String> {
+        self.entries.iter().map(Entry::encode).collect()
+    }
+
+    /// Read saved entries; a malformed one is skipped, so the others survive it.
+    #[must_use]
+    pub fn decode(texts: &[String]) -> Self {
+        Self {
+            entries: texts
+                .iter()
+                .filter_map(|text| Entry::decode(text))
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,6 +1703,125 @@ mod tests {
         );
         assert_eq!(refused(Phase::Crafting, 0, &torches(4)), None);
         assert_eq!(refused(Phase::Idle, 0, &torches(4)), None);
+    }
+
+    /// A second entry of its own: 8 sticks kept between 8 and 16, asked 8 at a time.
+    fn sticks() -> Filter {
+        Filter::new("minecraft:stick".to_owned(), band(8, 16), 8).expect("a valid filter")
+    }
+
+    #[test]
+    fn a_second_filter_entry_is_kept_beside_the_first() {
+        let mut filters = Filters::new();
+        assert_eq!(filters.set(torches(4)), Ok(0));
+        assert_eq!(
+            filters.set(sticks()),
+            Ok(1),
+            "a second resource gets its own entry, as upstream's next filter slot"
+        );
+        assert_eq!(filters.len(), 2, "the requester keeps both filter entries");
+        assert!(!filters.is_empty());
+        let items: Vec<&str> = filters.iter().map(|entry| entry.filter().item()).collect();
+        assert_eq!(items, ["minecraft:torch", "minecraft:stick"]);
+    }
+
+    #[test]
+    fn a_filter_entry_is_replaced_by_its_own_resource() {
+        let mut filters = Filters::new();
+        assert_eq!(filters.set(torches(4)), Ok(0));
+        let wider = Filter::new("minecraft:torch".to_owned(), band(8, 16), 4).expect("a filter");
+        assert_eq!(
+            filters.set(wider),
+            Ok(0),
+            "the same resource keeps its index"
+        );
+        assert_eq!(filters.len(), 1, "a resource names one entry, not two");
+        assert_eq!(
+            filters.first().map(|entry| entry.filter().band()),
+            Some(band(8, 16))
+        );
+        assert_eq!(
+            filters.first().map(Entry::phase),
+            Some(Phase::Idle),
+            "a new band restarts the entry's run"
+        );
+    }
+
+    #[test]
+    fn a_requester_carries_at_most_the_containers_45_entries() {
+        let mut filters = Filters::new();
+        for n in 0..MAX_FILTER_ENTRIES {
+            let filter =
+                Filter::new(format!("minecraft:test_{n}"), band(1, 2), 1).expect("a valid filter");
+            assert!(filters.set(filter).is_ok());
+        }
+        assert_eq!(filters.len(), MAX_FILTER_ENTRIES);
+        let overflow =
+            Filter::new("minecraft:one_too_many".to_owned(), band(1, 2), 1).expect("a filter");
+        assert_eq!(
+            filters.set(overflow),
+            Err(FiltersFull),
+            "upstream's container has 45 filter slots"
+        );
+        assert_eq!(
+            filters.len(),
+            MAX_FILTER_ENTRIES,
+            "the refused entry took no slot"
+        );
+    }
+
+    #[test]
+    fn a_removed_entry_leaves_the_others() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        assert!(filters.remove("minecraft:stick"));
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            filters.first().map(|entry| entry.filter().item()),
+            Some("minecraft:torch")
+        );
+        assert!(
+            !filters.remove("minecraft:stick"),
+            "removing an absent resource changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_filter_entry_round_trips_through_its_saved_form() {
+        let mut entry = Entry::new(torches(4));
+        entry.set_phase(Phase::Crafting);
+        entry.set_link(Some([221, 64, 0]));
+        entry.set_backoff(7);
+        let text = entry.encode();
+        assert_eq!(Entry::decode(&text), Some(entry));
+        assert!(
+            Entry::decode("minecraft:torch|8|4|4|idle|none|0").is_none(),
+            "min above max"
+        );
+        assert!(Entry::decode("nonsense").is_none());
+        assert!(
+            Entry::decode("minecraft:torch|4|8|4|idle|221,64|0").is_none(),
+            "short position"
+        );
+        assert_eq!(
+            Entry::decode("minecraft:torch|4|8|4|idle|none|0").map(|entry| entry.phase_id()),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn the_filter_container_round_trips_through_its_saved_form() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let texts = filters.encode();
+        assert_eq!(texts.len(), 2, "one saved string per entry");
+        assert_eq!(Filters::decode(&texts), filters);
+        assert!(
+            Filters::decode(&["nonsense".to_owned()]).is_empty(),
+            "a malformed entry is skipped, not guessed at"
+        );
     }
 
     #[test]

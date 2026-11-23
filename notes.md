@@ -52,7 +52,7 @@ with 5 base recipes, 51 colouring recipes, 51 loot tables, 3 item tags, 1 block 
 |---|---|
 | `step_crafter` block + block entity (the machine, `active` state, red/`side_active` art) | **ported** — the block, its 27-slot inventory, the `active` state, the band rule, `recipes`/`loot`/`lang`/`tab` |
 | its pattern system (a Refined Storage *pattern item* per slot, min/max/batch per slot) | **ported differently**: the pattern is the target item's own `minecraft:crafting` recipe (`/stepcrafter target <pos> <item>`), because an RS pattern item is not representable here; the band is `/stepcrafter configure <pos> <min> <max>` |
-| `step_requester` block + entity (asks *other* autocrafters for a resource) | **ported differently (0.2.1)** — the ask goes to a **nearby Step Crafter** instead of the parent's autocrafting network: the filter (item, min, max, batch) is `/stepcrafter requester`, the store it watches is that crafter's inventory, and the ask is a `Request` count in the crafter's saved compound |
+| `step_requester` block + entity (asks *other* autocrafters for a resource) | **ported differently (0.2.1, several entries in 0.2.5)** — the ask goes to a **nearby Step Crafter** instead of the parent's autocrafting network: up to 45 filter entries (item, min, max, batch) set by `/stepcrafter requester add|remove`, each linked to the crafter that maintains its item, whose inventory is the store it watches; the ask is a `Request` count in that crafter's saved compound |
 | `step_crafter_manager`, `step_requester_manager` (+16 colours each), `step_crafting_monitor` (+16 colours) | `blocked(no-parent-addon-surface)` — each is a mixin into Refined Storage's grid screen, which the parent port does not ship (0 hits for `wireless_grid`) |
 | `slot_upgrade` item (a slot upgrade, `Items.INSTANCE.getSlotUpgrade`) | `not ported` — upgrades are the RS `UpgradeContainer`; the machine has 27 slots and no upgrade slots |
 | the 51 colouring recipes + the three colour tags | `not ported` — they recolour the managers/monitor, which are blocked |
@@ -117,9 +117,11 @@ requester needed no fallback.
 
 What the requester is:
 
-- `/stepcrafter requester <pos> <item> <min> <max> <batch>` sets its one filter entry (upstream's
+- `/stepcrafter requester <pos> <item> <min> <max> <batch>` sets one filter entry (upstream's
   `ResourceMinMaxAmount`: resource, min, max, batch size; batch 0 disables the entry, as upstream
-  skips it).
+  skips it). 0.2.5 makes that entry one of the container's entries: `requester add` and
+  `requester remove` edit several (§2f), and the legacy spelling still replaces the entry for its
+  resource.
 - It finds the **nearest** Step Crafter within **4 blocks** (a 9×9×9 cube, nearest first) whose
   `Target` is its filter item — upstream's reach is the network's, this is the documented re-root. The
   link is saved and re-validated every tick (block id and `Target`), so a moved or re-targeted
@@ -134,7 +136,9 @@ What the requester is:
 - `/stepcrafter info <pos>` answers for either block; the requester's line is
   `stepcrafter <x> <y> <z> kind=requester item=… min=… max=… batch=… stored=… phase=… crafter=… backoff=… requests=…`,
   its `stored` being the filtered item's count in the linked crafter and its `running` being
-  upstream's `CRAFTING` status (the crafter's own readout keeps `phase=crafting`).
+  upstream's `CRAFTING` status (the crafter's own readout keeps `phase=crafting`). 0.2.5 appends
+  `filters=<n>` and `entries=<item|min|max|batch|stored|phase|crafter|backoff;…>` (one field per
+  entry), while the single-entry fields describe the first entry.
 
 ## 2c. The review slice (version 0.2.2): two defects the review found
 
@@ -191,6 +195,55 @@ What changed:
   `phase=not-enough-ingredients` with it.
 - The stock's **count** still counts a named torch as a torch: a name does not stop an ingredient
   matching a vanilla recipe, so consumption is unchanged; only the room for a plain *insert* changed.
+
+## 2f. The slice (version 0.2.5): the requester's several filter entries
+
+0.2.4's own gap line (§6) was *"The requester has one filter entry, set by command (upstream: 45
+filter slots plus 8 upgrade slots edited in a screen)"* — the last mechanics gap before the GUI that
+line defers.
+
+### The artefact's saved shape, read before any code
+
+Read from `starforcraft/Step-Crafter` at the port's analysis commit
+`963cd494187ea762b4d78cecd55a45f3cb479812`:
+
+| file | what it settles |
+|---|---|
+| `common/.../steprequester/StepRequesterBlockEntity.java` | `FILTERS = 9 * 5` (**45**); `TAG_RESOURCE_FILTER = "rf"` is written with `PatternResourceContainerContents.CODEC`; the 8 upgrade slots are a separate `upgr` container |
+| `common/.../support/patternresource/PatternResourceContainerContents.java` | the saved value is `Codec.list(ResourceMinMaxAmount.OPTIONAL_CODEC)` — **45 optional entries, one per filter slot** |
+| `common/.../support/ResourceMinMaxAmount.java` | one entry is `{resource, minAmount, maxAmount, batchSize, status}`, with `status` in `FINISHED, CRAFTING, NOT_ENOUGH_INGREDIENTS, NETWORK_FULL, EXTERNAL_CONTAINER_FULL` |
+| `common/.../steprequester/StepRequesterNetworkNode.java` | a `runningTasks` and a `failedTaskTimeouts` map **per slot index**; `batchSize == 0` skips the entry; the five guards run for every entry each tick |
+
+**The entry's target is a resource (an item), not a block position and not a crafter id.** The
+resource is the entry's identity and what its band and batch belong to; its position in the saved
+list is only the filter-slot index. The **block position** in this port is the *link*: which nearby
+Step Crafter is asked for that resource (the network-less re-root of §2b), so the link is saved
+beside each entry, not in place of its identity.
+
+### What changed
+
+- `runtime::Entry` is one `Filter` plus its **own** phase, link and backoff, saved as
+  `item|min|max|batch|phase|link|backoff` (`|` appears in no id, phase name or position).
+- `runtime::Filters` is upstream's 45-slot container: `set` adds an entry, or replaces the one that
+  already maintains that resource; a 46th distinct resource is refused (`FiltersFull`); `remove`
+  drops one; `encode`/`decode` are the `List` the block entity saves. A malformed saved entry is
+  skipped rather than guessed at.
+- `requester::State` is `{ filters, requests }`. Reading a 0.2.1–0.2.4 compound (the single
+  `FilterItem/FilterMin/FilterMax/FilterBatch/Phase/Link/Backoff` keys) yields **one entry**, so an
+  existing world keeps its filter; the next write uses the container and drops the old keys.
+- `requester::tick` walks every entry: it resolves **that entry's** crafter and spends **that
+  entry's** phase/backoff; the outstanding ask it reads is the linked crafter's own `Request`, so two
+  entries on two crafters are independent, and one entry's refusal or backoff never stops another.
+  `active` is true while any entry is asking.
+- `commands`: `requester add <pos> <item> <min> <max> <batch>` and `requester remove <pos> <item>`
+  join the legacy `requester <pos> <item> <min> <max> <batch>` (add-or-replace, so the four existing
+  legs' replies are unchanged). The readout keeps the first entry's legacy fields and appends
+  `filters=N entries=…` with every entry's own stored count, phase, crafter and backoff.
+
+**A scenario correction, found in game:** the brief said "8 planks", but `minecraft:planks` is a
+**tag**, not an item id at 26.3. `ctl container` stocked nothing for it (silently), so the stick
+crafter could not step. The leg names `minecraft:oak_planks` and asserts the stock reads
+`minecraft:oak_planks:8` before the filters, so the mistake can never pass unnoticed again.
 
 ## 2d. The slice (version 0.2.3): crafting remainders
 
@@ -328,7 +381,42 @@ leg's new phase, answers `/stepcrafter step` with `result=crafted` and leaves th
 `result=network-full`, `crafted=0`, stock unchanged (§4); `SELFTEST=components-room` asserts the
 fixed behaviour and ends non-zero.
 
+Green at 0.2.5 (the multi-entry slice): **46 tests** (`sdk-test.log`). Its red transcript is
+`red-unit-filters.log`: `Filters::set` was written as the 0.2.4 shape (keep whichever entry was set
+last) while the new tests demand the 45-slot container, so five tests failed for exactly that defect:
 
+```
+---- runtime::tests::a_second_filter_entry_is_kept_beside_the_first stdout ----
+
+thread 'runtime::tests::a_second_filter_entry_is_kept_beside_the_first' (137363) panicked at src/runtime.rs:1705:9:
+assertion `left == right` failed: a second resource gets its own entry, as upstream's next filter slot
+  left: Ok(0)
+ right: Ok(1)
+
+---- runtime::tests::a_requester_carries_at_most_the_containers_45_entries stdout ----
+
+thread 'runtime::tests::a_requester_carries_at_most_the_containers_45_entries' (137358) panicked at src/runtime.rs:1739:9:
+assertion `left == right` failed
+  left: 1
+ right: 45
+
+---- runtime::tests::a_removed_entry_leaves_the_others stdout ----
+
+thread 'runtime::tests::a_removed_entry_leaves_the_others' (137355) panicked at src/runtime.rs:1756:9:
+assertion `left == right` failed
+  left: 0
+ right: 1
+
+test result: FAILED. 40 passed; 5 failed
+```
+
+(The other two reds are the same one-entry defect seen through the container's saved form:
+`the_filter_container_round_trips_through_its_saved_form` saved 1 string where 2 entries were set,
+and `a_filter_entry_round_trips_through_its_saved_form` caught the decoder accepting a malformed
+`link` instead of refusing the entry.) The game half's red is the `SELFTEST=filters` run (§4), which
+asserts today's `filters=1` reply and ends non-zero on the fixed package; the running leg's own red
+was found in the first run — `minecraft:planks` is a tag, so the stick crafter was never stocked
+(§2f's correction) — and is closed by the scenario's stock assertion.
 
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
@@ -360,8 +448,8 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — eight run logs plus the build log, all `--strict`
-green (`logs=8 ok=8 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — nine run logs plus the build log, all `--strict`
+green (`logs=9 ok=9 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
@@ -373,7 +461,8 @@ green (`logs=8 ok=8 missing-exit=0 bad-exit=0`):
 | `e2e-selftest-components-room.log` | `FAIL` + `EXIT:1` | `SELFTEST=components-room` inverts the **component-room** assertion: the named stack counted no room and the step was refused (`phase=network-full crafted=0`) ends the run non-zero |
 | `e2e-selftest-take.log` | `FAIL` + `EXIT:1` | `SELFTEST=take` inverts the **component** assertion: the defect “a rebuilt stack reads no components” ends the run non-zero |
 | `e2e-selftest-remainder.log` | `FAIL` + `EXIT:1` | `SELFTEST=remainder` inverts the **remainder** assertion: the defect “the step consumes the buckets and leaves none” ends the run non-zero |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.4: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-filters.log` | `FAIL` + `EXIT:1` | `SELFTEST=filters` inverts the **multi-entry** assertion: today's defect is one entry (`filters=1`), so the run ends non-zero on the package that keeps `filters=2` |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.5: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -448,16 +537,27 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     can fail. `SELFTEST=components-room` asserts the fixed refusal and ends the run non-zero (the
     previous package's `result=crafted` is `e2e-red-components-0.2.3.log`);
 21. a non-operator's `/stepcrafter info` is refused.
+22. **the requester's several filter entries (0.2.5)**: after the component-room leg, one requester
+    at `222 64 0` carries `minecraft:torch 4 8 4` and `minecraft:stick 8 16 8` (both added with
+    `requester add`, reading `filters=1` then `filters=2`); the torch crafter at `221 64 0` is stocked
+    with 4 coal + 4 sticks and the stick crafter at `223 64 0` with 8 `minecraft:oak_planks`. After 80
+    ticks the requester reads `filters=2` and
+    `entries=minecraft:torch|4|8|4|8|idle|221,64,0|0;minecraft:stick|8|16|8|16|idle|223,64,0|0`,
+    with `crafted=8` on 221 and `crafted=16` on 223 — each entry served by the crafter that maintains
+    its item. The **differential**: a second requester at `222 64 4` with only the torch entry (the
+    0.2.1–0.2.4 spelling) beside its own fresh pair reads `filters=1`, leaves the torch crafter at
+    `crafted=8` and the stick crafter at `crafted=0` — the removed entry is the only difference.
+    `SELFTEST=filters` asserts the old one-entry reply and ends the run non-zero.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **57,384 B** |
-| sha256 | `675a229bb84827f55df67283c3b0080f1c489c0144a0b9e30966d8ad5a33e33e` |
-| entries | 37 (`186,847 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.4` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **62,413 B** |
+| sha256 | `70e238c3a262ee33e31db0ab10afc44dc14e7655189a258fc56b411413b34525` |
+| entries | 37 (`209,220 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.5` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -501,9 +601,16 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   inside a 9×9×9 cube whose `Target` is its filtered item (`LINK_RADIUS = 4`, saved and re-validated
   every tick). Two crafters that both maintain the same item are interchangeable to it; a crafter
   that maintains something else is never asked, so a filter cannot spend another pattern's items.
-- **The requester has one filter entry, set by command** (upstream: 45 filter slots plus 8 upgrade
-  slots edited in a screen). A screen is the later slice named in §1; the command is the same
-  precedent as `target`/`configure`, and batch 0 disables the entry exactly as upstream skips it.
+- **The requester carries up to 45 filter entries, set by command** (upstream: the same 45 slots plus
+  8 upgrade slots edited in a screen). A resource names one entry: `requester add` replaces the entry
+  for that item rather than adding a second, so two bands for one item are not expressible (upstream's
+  slots would allow it; this port's entry identity is the resource). The 8 upgrade slots stay
+  unported (the RS `UpgradeContainer`), and the screen is the later slice named in §1. Batch 0
+  disables an entry exactly as upstream skips it. A compound written by 0.2.1–0.2.4 reads as one
+  entry and is migrated to the container on the next write.
+- **Each entry links its own crafter.** A Step Crafter maintains one target, so two entries with
+  different resources cannot link the same crafter; a re-targeted crafter drops the entry's saved link
+  and the next tick rescans (the §2b rule), entry by entry.
 - **The ask is one `Int` in the crafter's compound** (`Request`, the pin's `/data merge block` write
   path), spent at one step per tick. A second requester asking the same crafter is not queued — the
   ask is a count, and the stock both requesters watch is the crafter's single inventory; the readout
@@ -535,7 +642,8 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | one step per tick without speed upgrades | `for j < speed + 1` with `speed = 0` | `runtime::STEPS_PER_TICK = 1` |
 | the click | `ExtendedMenuProvider` opens a screen | the vanilla chest menu over the 27-slot container |
 | taking the resource out | `network.extract(resource, count)` | `/stepcrafter take` hands over the **stored stacks themselves**, split to the count asked for: names, enchantments and damage stay on them |
-| the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick` |
+| the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick_entry` |
+| several filter entries, each with its own status and failed-task timeout | the `rf` container (45 `ResourceMinMaxAmount`) and the node's per-index `runningTasks`/`failedTaskTimeouts` | `runtime::Filters`/`Entry` (add-or-replace by resource, 45 cap, saved list), one `tick_entry` per entry; the readout's `filters=N entries=…` |
 | "a task is already running" | `isAlreadyRunningTask` on the task id map | the outstanding `Request` count in the crafter's compound |
 | a failed task (20-tick timeout) | `failedTaskTimeouts`, `FAILED_TASK_TIMEOUT_TICKS` | `runtime::refused` + `State::backoff` (`FAILED_TASK_TIMEOUT_TICKS = 20`) |
 | the store the requester watches | `StorageNetworkComponent.get(resource)` | the linked crafter's own 27 slots (`requester::stock_count`) |
@@ -553,10 +661,10 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `refused` — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
 | `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step, `apply_craft` |
-| `src/requester.rs` | the requester's block entity: its filter, the link to a nearby crafter, the ask, its tick and readout |
+| `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, the ask, per-entry tick and the readout's views |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
 | `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
 | `src/lib.rs` | the one `impl Hooks` and the two `Part`s the game ticks |
@@ -591,6 +699,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |
 | **the interop: the requester asks a nearby Step Crafter** | **tested** in game — the pair reaches `stored=8` / `crafted=8` with 2 coal and 2 sticks consumed, and the *same world with the requester removed* leaves an identically configured machine at `stored=0 crafted=0` |
+| **several filter entries, each served by the crafter that maintains its item** | **tested** — `a_second_filter_entry_is_kept_beside_the_first`, `a_filter_entry_is_replaced_by_its_own_resource`, `a_requester_carries_at_most_the_containers_45_entries`, `a_removed_entry_leaves_the_others`, `a_filter_entry_round_trips_through_its_saved_form`, `the_filter_container_round_trips_through_its_saved_form`, `a_legacy_single_filter_compound_still_reads_as_one_entry`; in game one requester with a torch entry and a stick entry reads `filters=2` with both entries and their stored counts, `crafted=8` on the torch crafter and `crafted=16` on the stick crafter, while the same world with only the torch entry leaves the stick crafter at `crafted=0`; `SELFTEST=filters` ends non-zero |
 | the refusal path across the two blocks | **tested** in game — the crafter with no sticks answers `not-enough-ingredients`, the requester shows `phase=not-enough-ingredients backoff=13`, the restock resumes both to `stored=8 crafted=8` |
 | the requester's own loot | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_requester:1` |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
