@@ -15,7 +15,7 @@ saved band and a tick — the machines shape, no entities, renderers or dimensio
 **Licence rank 0** (MIT, read from the jar's `META-INF/neoforge.mods.toml`; upstream's
 `LICENSE.txt` travels inside the package as `LICENSE`). Publishable under MIT with this source.
 
-**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices`
+**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-review`
 
 ---
 
@@ -136,6 +136,33 @@ What the requester is:
   its `stored` being the filtered item's count in the linked crafter and its `running` being
   upstream's `CRAFTING` status (the crafter's own readout keeps `phase=crafting`).
 
+## 2c. The review slice (version 0.2.2): two defects the review found
+
+Reviewer `levzzz5154`'s static review of `c8a6e83e` raised three points: two gameplay defects and a
+listing/attribution blocker that the orchestrator fixes on the registry entry. This version fixes the
+two defects and answers the third in the archive.
+
+**1. The room check was the stock's budget, not the table's slots.** `runtime::craft` compared
+`stock.total() + produced` against the whole inventory's 1,728 items. That is a budget for the stock,
+not evidence that the result has anywhere to go: 26 slots of 64 coal and one of 60 sticks hold 1,724
+items, so an aggregate 1,728 said four torches fit — and the machine consumed the coal and the stick
+and put nothing in, while the requester's ask was counted as served. The fix models the inventory as
+slots: `Slots`/`Slot` carry each stack's item, count and **stack limit** plus the room an empty slot
+offers the result, and `craft` takes the ingredients from a copy of those slots and commits only when
+`room_for(result)` in that post-consumption inventory holds the complete result. Otherwise it returns
+`NetworkFull`, leaves the ingredients untouched and the ask is refused — not served.
+
+**2. `take` destroyed item components.** It counted by item id and rebuilt `ItemStack::new`, so a
+named, enchanted or damaged stack came out plain. It now hands over the **stored stacks themselves**,
+split to the count asked for, and keeps each remainder in its slot; `put_into_slots` merges a step's
+result only into stacks whose components match, so a plain result cannot take on a named one's
+components.
+
+**3. The listing and the archive's notice.** The registry entry is the orchestrator's and is not
+touched here. The archive carries `LICENSE-NOTICE.md` (Ultramega, Starforcraft and
+`https://github.com/starforcraft/Step-Crafter`, verbatim) beside upstream's `LICENSE` verbatim; §5
+records both, and the packed `README.md` is the tree's current text (`cmp`-identical).
+
 ## 3. TDD: red, then green
 
 The red transcript is `ports/_shared/evidence/stepcrafter/red-unit.log` — the rule and the step
@@ -164,6 +191,32 @@ test result: FAILED. 19 passed; 6 failed
 — and the two hold cases (`a_requester_holds_at_its_minimum_while_idle`,
 `a_zero_batch_filter_is_disabled`) passed against the stub by construction, which is why they are the
 control in the green run.
+
+Green at 0.2.2 (the review slice): **34 tests** (`sdk-test.log`). Its red transcript is
+`red-unit-capacity.log`: the rule had been ported onto the new slot model but `craft` still made the
+review's aggregate check, so the two tests that demand per-slot room failed for exactly that reason:
+
+```
+---- runtime::tests::a_result_that_fits_no_slot_is_refused_even_when_the_counts_add_up stdout ----
+
+thread 'runtime::tests::a_result_that_fits_no_slot_is_refused_even_when_the_counts_add_up' (63033) panicked at src/runtime.rs:831:9:
+assertion `left == right` failed: 1,724 items in 27 full-ish slots leave no room for 4 torches
+  left: Craft { consume: [("minecraft:coal", 1), ("minecraft:stick", 1)], result: "minecraft:torch", result_count: 4 }
+ right: NetworkFull { item: "minecraft:torch", room: 0, produced: 4 }
+
+---- runtime::tests::a_slot_holding_the_result_offers_only_its_own_free_room stdout ----
+
+thread 'runtime::tests::a_slot_holding_the_result_offers_only_its_own_free_room' (63034) panicked at src/runtime.rs:857:9:
+assertion `left == right` failed
+  left: Craft { consume: [("minecraft:coal", 1), ("minecraft:stick", 1)], result: "minecraft:torch", result_count: 4 }
+ right: NetworkFull { item: "minecraft:torch", room: 1, produced: 4 }
+
+test result: FAILED. 32 passed; 2 failed
+```
+
+The `take` fix has no unit-level red: handing stacks to a player needs the game's host, so its red is
+the in-game counterfactual `SELFTEST=take` (§4), which asserts the defect (a rebuilt stack reads no
+components) and fails on the fixed package.
 
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
@@ -195,15 +248,17 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — three run logs plus the build log, all `--strict`
-green (`logs=3 ok=3 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — five run logs plus the build log, all `--strict`
+green (`logs=5 ok=5 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
 | `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package, plus an in-run control leg on the same Nightly built without it |
 | `e2e-control.log` | `FAIL` + `EXIT:1` | the same script with `GAME` = the Nightly **without** the package: `setblock stepcrafter:step_crafter` leaves air |
 | `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the **requester's** headline assertion (`stored=8`) and the run ends non-zero; `SELFTEST=crafter` inverts the machine's (`stored=16`) instead |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.1: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-capacity.log` | `FAIL` + `EXIT:1` | `SELFTEST=capacity` inverts the **no-room** assertion: “nothing fit, so nothing was served” (`crafted=0`) ends the run non-zero |
+| `e2e-selftest-take.log` | `FAIL` + `EXIT:1` | `SELFTEST=take` inverts the **component** assertion: the defect “a rebuilt stack reads no components” ends the run non-zero |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.2: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -243,24 +298,37 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     (`stored=8`, `crafted=8`);
 14. a 32-step run (filter `4 128 4`, 32 + 32 loaded) reads `phase=running` while it works,
     `active=true` on the requester, then `active=false` and `stored=128` / `crafted=128` at rest;
-15. `/stepcrafter requester` refuses an inverted band, an unknown item and a negative batch, and
+15. **the review's room defect (0.2.2)**: a crafter at 216 with `target minecraft:torch`, band `0..0`
+    and 26 slots of 64 coal + 60 sticks (`items=1724`, an aggregate budget of 1,728) is asked for
+    torches by the requester at 217; after 60 ticks the crafter reads `stored=0 phase=network-full
+    crafted=0` with its stock **unchanged** (`coal:1664,stick:60`) and the requester reads
+    `stored=0 phase=network-full` — nothing was consumed and no ask was served;
+16. **the review's component defect (0.2.2)**: `/data merge block` plants two named torch stacks
+    (Alpha ×2, Beta ×3) and one damaged, enchanted sword (Blade, `damage 7`, `sharpness 3`) in the
+    machine at 218; `/stepcrafter take … minecraft:torch 5` and `… minecraft:diamond_sword 1` hand
+    them over and `ctl inventory` reads two torch stacks with their own names and counts and a sword
+    with `components {"custom_name":"Blade","damage":7,"enchantments":{"sharpness":3}}`, `damage 7`
+    and `durability_left 1554`;
+17. `/stepcrafter requester` refuses an inverted band, an unknown item and a negative batch, and
     `/stepcrafter target` on a requester answers "that is a Step Requester";
-16. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
+18. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
     its item **and spills the 8 torches** (`drops: minecraft:torch:8, stepcrafter:step_crafter:1`);
     placing the machine's item again gives an unconfigured machine (the recorded limit, §6);
-17. a non-operator's `/stepcrafter info` is refused.
+19. a non-operator's `/stepcrafter info` is refused.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **49,241 B** |
-| sha256 | `b40307c5ddf08c4ea9f7d6e358248dff1d27c5774b41e46eabcbcca6cdc6de63` |
-| entries | 37 (`151,783 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.1` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **52,361 B** |
+| sha256 | `d7f5eb112ed6bd2e06d4ae83432a4744bc3a0f32cf849ed65a3a59f0d5d7bff5` |
+| entries | 37 (`165,157 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.2` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
+| notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
+| gate | `python3 ports/tools/verify-sdk-package.py stepcrafter` → **1/1** (`verify-sdk-package.log`) |
 
 ## 6. Known limits and deviations (recorded, not implied)
 
@@ -313,12 +381,13 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 |---|---|---|
 | the band rule (start below min, fill to max, hold at max) | `StepCrafterNetworkNode.doWork`, three guards | `runtime::decide`, `runtime::plan` |
 | one step = resolve every cell, take, insert | `StepCraftingAlgorithm.prepareCraft/extractResolvedInputs/insertIntoNetwork` | `runtime::craft` (candidate resolution, reservation by counting), `machine::take_from_slots` / `put_into_slots` |
-| `NETWORK_FULL` | `canInsertIntoNetwork` before extracting | `runtime::craft`'s capacity check (the whole inventory, 27 × 64) |
+| `NETWORK_FULL` | `canInsertIntoNetwork` before extracting | `runtime::craft`'s room check **after** the ingredients are taken: the free room in the slots that hold the result plus one empty slot's worth per empty slot (the result's stack limit) — the stock's item count is not the room |
 | `NOT_ENOUGH_INGREDIENTS` | `prepareCraft` returns null | `Outcome::NotEnoughIngredients` naming the short cell |
 | status per pattern slot | `ResourceStatus` (`CRAFTING`, `FINISHED`, `NOT_ENOUGH_INGREDIENTS`, `NETWORK_FULL`) | `runtime::Phase`, saved as `Phase` |
 | `active` block state | the RS network node's `active` property | true while the machine is crafting |
 | one step per tick without speed upgrades | `for j < speed + 1` with `speed = 0` | `runtime::STEPS_PER_TICK = 1` |
 | the click | `ExtendedMenuProvider` opens a screen | the vanilla chest menu over the 27-slot container |
+| taking the resource out | `network.extract(resource, count)` | `/stepcrafter take` hands over the **stored stacks themselves**, split to the count asked for: names, enchantments and damage stay on them |
 | the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick` |
 | "a task is already running" | `isAlreadyRunningTask` on the task id map | the outstanding `Request` count in the crafter's compound |
 | a failed task (20-tick timeout) | `failedTaskTimeouts`, `FAILED_TASK_TIMEOUT_TICKS` | `runtime::refused` + `State::backoff` (`FAILED_TASK_TIMEOUT_TICKS = 20`) |
@@ -337,7 +406,7 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Pattern`, `plan`, `step_now`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room), `Pattern`, `plan`, `step_now`, `apply`, and the requester's `Filter`, `Ask`, `ask`, `refused` — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration) |
 | `src/machine.rs` | the crafter's block entity: saved compound (including a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step |
 | `src/requester.rs` | the requester's block entity: its filter, the link to a nearby crafter, the ask, its tick and readout |
@@ -361,13 +430,15 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the band rule: start below `min`, fill to `max`, hold at `max` | **tested** — unit `decide_holds_at_the_minimum_while_idle` / `decide_crafts_below_the_minimum` / `decide_keeps_crafting_above_the_minimum_until_the_maximum` / `decide_finishes_at_the_maximum`; in game `stored=16 crafted=16` then 60 idle ticks unchanged, and the 64..128 band filling to 128 |
 | one step: every cell out, the result in | **tested** — `a_step_consumes_every_cell_and_makes_the_result`, `a_step_prefers_the_first_candidate_the_stock_holds`, `apply_moves_the_stock_by_exactly_the_outcome`; in game 4 coal + 4 sticks → 16 torches, `stock=minecraft:coal:4,minecraft:stick:4,minecraft:torch:16` |
 | `not-enough-ingredients` | **tested** — `a_missing_ingredient_refuses_the_step_and_names_the_cell`; in game `phase=not-enough-ingredients` at `crafted=16`, then the restock resumes to `crafted=32` |
-| `network-full` | **tested** (unit only) — `a_full_inventory_refuses_the_step`; in game only by construction (1,728 items), recorded as such |
+| `network-full` | **tested** — `a_full_inventory_refuses_the_step`, `a_result_that_fits_no_slot_is_refused_even_when_the_counts_add_up`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`; in game a 26 × 64 coal + 60 sticks machine refuses every ask with nothing consumed or crafted (`SELFTEST=capacity` inverts it) |
 | the manual step | **tested** — `a_manual_step_crafts_even_inside_the_band`, `a_manual_step_still_needs_the_ingredients`; in game `result=crafted` then `result=not-enough-ingredients` |
 | the pattern from the item's recipe | **tested** in game — `target=minecraft:torch cells=2 result=minecraft:torch:4`; refusals for a recipe-less item and an unknown id |
 | the container (the stock) | **tested** in game — `ctl container` loads 8+8 and the readout agrees; empty for a fresh machine |
 | the recipes (both) | **tested** in game — `tools/craft_check.py`: one Step Crafter and one Step Requester, five ingredients consumed each, another pattern crafts nothing |
 | the blocks and the items (both) | **tested** in game — placed, given, read back; `stepcrafter:step_crafter_manager` refused by `setblock` and `give` |
 | the commands | **tested** in game — every reply parsed, incl. `min 9 is above max 4`, the requester's three refusals, the wrong-block refusal and the operator refusal |
+| `/stepcrafter take` (the stored stacks themselves) | **tested** in game — two named torch stacks (Alpha ×2, Beta ×3) and a damaged, enchanted sword come out with both names, both counts, `damage 7` and `sharpness 3` (`durability_left 1554`); `SELFTEST=take` asserts the defect (no components) and the run ends non-zero |
+| the slots' room for the result (per-slot limits, post-consumption) | **tested** — `a_result_that_fits_no_slot_…`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`; in game the 1,724-item machine (`items=1724` of 1,728) refuses |
 | the `active` states (both) | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle, on the machine and on the requester |
 | loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |

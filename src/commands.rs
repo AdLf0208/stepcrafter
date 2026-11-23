@@ -226,6 +226,10 @@ fn step(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
 }
 
 /// `/stepcrafter take <pos> <item> <count>`: hand stored items to the command's player.
+///
+/// The **stored stacks themselves** are handed over, split down to the count asked for. A stack's
+/// components and damage belong to what the machine holds — a named torch is still that torch, an
+/// enchanted or damaged item keeps its state — so rebuilding it from its id would lose them.
 fn take(host: &mut dyn ServerHost, pos: [i32; 3], item: &str, count: i32) -> String {
     let Some(level) = host.level(host.dimension()) else {
         return NO_MACHINE.to_owned();
@@ -252,28 +256,35 @@ fn take(host: &mut dyn ServerHost, pos: [i32; 3], item: &str, count: i32) -> Str
     let Some(player) = acting_player(host) else {
         return "stepcrafter: only a player can be handed items".to_owned();
     };
-    let Some(id) = mod_api::Identifier::parse(item).ok() else {
-        return format!("stepcrafter: {item} is not an item id");
-    };
-    let Some(key) = host.item_key(&id) else {
-        return format!("stepcrafter: {item} is not an item this world knows");
-    };
-    let per_stack = host.max_stack_size(key).unwrap_or(64).max(1);
-    let mut given = 0;
-    while given < take {
-        let piece = (take - given).min(u64::from(per_stack));
-        let Ok(piece) = u32::try_from(piece) else {
-            break;
-        };
-        let Some(stack) = mod_api::ItemStack::new(key, piece) else {
-            break;
-        };
-        if player.give_stack(host, stack).is_err() {
+    let mut left = u32::try_from(take).unwrap_or(u32::MAX);
+    let mut given = 0u64;
+    for slot in &mut items {
+        if left == 0 {
             break;
         }
-        given += u64::from(piece);
+        let Some(stack) = slot.as_ref() else {
+            continue;
+        };
+        if stack.item().id(&*host) != item {
+            continue;
+        }
+        let Some(stack) = slot.take() else {
+            continue;
+        };
+        let split = stack.split(left);
+        let Some(taken) = split.taken else {
+            *slot = split.remainder;
+            continue;
+        };
+        *slot = split.remainder;
+        // A refused hand-over leaves the piece in its slot, so `given` counts only what arrived.
+        if player.give_stack(host, taken.clone()).is_err() {
+            *slot = Some(taken);
+            break;
+        }
+        left -= taken.count();
+        given += u64::from(taken.count());
     }
-    machine::take_from_slots(&*host, &mut items, &[(item.to_owned(), given)]);
     machine::replace_items(&mut *host, entity, &items);
     stock.remove(item, given);
     format!(

@@ -182,10 +182,174 @@ impl Stock {
         self.counts.is_empty()
     }
 
-    /// How many items the stock holds in all, which is what the machine's capacity bounds.
+    /// How many items the stock holds in all (the readout's `items=`).
     #[must_use]
     pub fn total(&self) -> u64 {
         self.counts.values().sum()
+    }
+}
+
+/// One occupied slot of the machine's inventory: what it holds, how many, and how many fit.
+///
+/// The game bounds a slot by the item's own stack limit (`max_stack_size`), so the room a step's
+/// result has is a **per-slot** quantity: a full slot of coal leaves no room for a torch, even
+/// though the inventory's item count says there is space. That is what [`Slots::room_for`] measures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slot {
+    item: String,
+    count: u32,
+    max: u32,
+}
+
+impl Slot {
+    /// A slot holding `count` of `item`, which fits up to `max`; `None` for an empty item id, a
+    /// zero count or a slot that can hold nothing.
+    #[must_use]
+    pub fn new(item: impl Into<String>, count: u32, max: u32) -> Option<Self> {
+        let item = item.into();
+        (count > 0 && max > 0 && !item.is_empty()).then_some(Self { item, count, max })
+    }
+
+    /// The item this slot holds.
+    #[must_use]
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    /// How many of it this slot holds.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// How many of it this slot can hold.
+    #[must_use]
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+}
+
+/// The machine's inventory as the rules see it: one entry per slot, in slot order.
+///
+/// `empty_room` is the room an **empty** slot offers for the step's result — the result item's
+/// stack limit, which only the game knows. A slot that already holds something carries its own
+/// limit in its [`Slot`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slots {
+    slots: Vec<Option<Slot>>,
+    empty_room: u32,
+}
+
+impl Slots {
+    /// No slots yet; an empty slot will hold up to `empty_room` of the result item.
+    #[must_use]
+    pub fn new(empty_room: u32) -> Self {
+        Self {
+            slots: Vec::new(),
+            empty_room,
+        }
+    }
+
+    /// Add one slot, empty (`None`) or holding `slot`.
+    pub fn push(&mut self, slot: Option<Slot>) {
+        self.slots.push(slot);
+    }
+
+    /// The slots, in order.
+    #[must_use]
+    pub fn slots(&self) -> &[Option<Slot>] {
+        &self.slots
+    }
+
+    /// How many of `item` the slots hold in all.
+    #[must_use]
+    pub fn count(&self, item: &str) -> u64 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|slot| slot.item == item)
+            .map(|slot| u64::from(slot.count))
+            .sum()
+    }
+
+    /// The slots as the counted [`Stock`].
+    #[must_use]
+    pub fn stock(&self) -> Stock {
+        let mut stock = Stock::new();
+        for slot in self.slots.iter().flatten() {
+            stock.add(&slot.item, u64::from(slot.count));
+        }
+        stock
+    }
+
+    /// Take up to `count` of `item` out of the slots, first slot first, as the machine's own
+    /// `take_from_slots` does; answers how many were taken.
+    pub fn take(&mut self, item: &str, count: u64) -> u64 {
+        let mut left = count;
+        for cell in &mut self.slots {
+            if left == 0 {
+                break;
+            }
+            let Some(slot) = cell.as_mut() else {
+                continue;
+            };
+            if slot.item != item {
+                continue;
+            }
+            let taken = u64::from(slot.count).min(left);
+            slot.count -= u32::try_from(taken).unwrap_or(slot.count);
+            left -= taken;
+            if slot.count == 0 {
+                *cell = None;
+            }
+        }
+        count - left
+    }
+
+    /// Put up to `count` of `item` into the slots: the slots already holding it first, then empty
+    /// slots, each up to its own limit. Answers how many went in.
+    pub fn put(&mut self, item: &str, count: u32) -> u32 {
+        let mut left = count;
+        for slot in self.slots.iter_mut().flatten() {
+            if left == 0 {
+                break;
+            }
+            if slot.item != item {
+                continue;
+            }
+            let added = slot.max.saturating_sub(slot.count).min(left);
+            slot.count += added;
+            left -= added;
+        }
+        for cell in &mut self.slots {
+            if left == 0 {
+                break;
+            }
+            if cell.is_some() {
+                continue;
+            }
+            let added = left.min(self.empty_room);
+            if added > 0 {
+                *cell = Slot::new(item, added, self.empty_room);
+                left -= added;
+            }
+        }
+        count - left
+    }
+
+    /// How many of `item` the slots can still hold: the room left in the slots already holding it
+    /// plus one full empty slot's worth per empty slot. Any other item's free room is not room for
+    /// this one.
+    #[must_use]
+    pub fn room_for(&self, item: &str) -> u64 {
+        self.slots
+            .iter()
+            .map(|slot| match slot {
+                None => u64::from(self.empty_room),
+                Some(slot) if slot.item == item => u64::from(slot.max.saturating_sub(slot.count)),
+                Some(_) => 0,
+            })
+            .sum()
     }
 }
 
@@ -280,41 +444,37 @@ pub enum Outcome {
     },
     /// A cell of the pattern has no item in stock; the cell's candidates are named.
     NotEnoughIngredients { missing: Vec<String> },
-    /// The output would not fit in the machine's inventory.
+    /// The result has no room in the slots the ingredients would leave free.
     NetworkFull {
         item: String,
-        stored: u64,
-        capacity: u64,
+        /// How many of the result those slots can still hold.
+        room: u64,
+        /// How many the step makes.
+        produced: u32,
     },
 }
 
 /// Upstream's `craftOneItemNew`, as a pure decision: the band rule, then the ingredient
-/// resolution, then the room for the output. The stock is only read.
+/// resolution, then the room for the output. The slots are only read.
 #[must_use]
-pub fn plan(
-    stock: &Stock,
-    band: Band,
-    phase: Phase,
-    pattern: Option<&Pattern>,
-    capacity: u64,
-) -> Outcome {
+pub fn plan(slots: &Slots, band: Band, phase: Phase, pattern: Option<&Pattern>) -> Outcome {
     // No pattern configured yet: upstream has nothing to maintain in that slot.
     let Some(pattern) = pattern else {
         return Outcome::Hold;
     };
-    let stored = stock.count(pattern.result());
+    let stored = slots.count(pattern.result());
     match decide(stored, band, phase) {
         Step::Hold => Outcome::Hold,
         Step::Finish => Outcome::Finished,
-        Step::Craft => craft(stock, pattern, stored, capacity),
+        Step::Craft => craft(slots, pattern),
     }
 }
 
 /// One step's ingredients out and result in, once the band said to craft:
 /// upstream's `prepareCraft` (resolve every cell against the stock, reserving what earlier cells
 /// took) and its `canInsertIntoNetwork` room check.
-fn craft(stock: &Stock, pattern: &Pattern, stored: u64, capacity: u64) -> Outcome {
-    let mut remaining = stock.clone();
+fn craft(slots: &Slots, pattern: &Pattern) -> Outcome {
+    let mut remaining = slots.stock();
     let mut consume: BTreeMap<String, u64> = BTreeMap::new();
     let mut missing = Vec::new();
     for cell in pattern.cells() {
@@ -330,12 +490,19 @@ fn craft(stock: &Stock, pattern: &Pattern, stored: u64, capacity: u64) -> Outcom
     if !missing.is_empty() {
         return Outcome::NotEnoughIngredients { missing };
     }
-    let produced = u64::from(pattern.result_count());
-    if stock.total().saturating_add(produced) > capacity {
+    let produced = pattern.result_count();
+    // The room is measured **after** the ingredients are taken: consuming the last item of a slot
+    // frees that slot, and only the slots that hold the result (or are empty) have room for it.
+    let mut after = slots.clone();
+    for (item, count) in &consume {
+        after.take(item, *count);
+    }
+    let room = after.room_for(pattern.result());
+    if u64::from(produced) > room {
         return Outcome::NetworkFull {
             item: pattern.result().to_owned(),
-            stored,
-            capacity,
+            room,
+            produced,
         };
     }
     Outcome::Craft {
@@ -348,12 +515,11 @@ fn craft(stock: &Stock, pattern: &Pattern, stored: u64, capacity: u64) -> Outcom
 /// One step now, whatever the band says: the manual step (`/stepcrafter step`) and the harness
 /// driver. The band is the machine's own timing rule; asking for a step is outside it.
 #[must_use]
-pub fn step_now(stock: &Stock, pattern: Option<&Pattern>, capacity: u64) -> Outcome {
+pub fn step_now(slots: &Slots, pattern: Option<&Pattern>) -> Outcome {
     let Some(pattern) = pattern else {
         return Outcome::Hold;
     };
-    let stored = stock.count(pattern.result());
-    craft(stock, pattern, stored, capacity)
+    craft(slots, pattern)
 }
 
 /// One filter entry of a Step Requester: upstream's `ResourceMinMaxAmount` — the resource to keep,
@@ -442,9 +608,9 @@ pub fn ask(stored: u64, filter: &Filter, phase: Phase, outstanding: u64, backoff
     }
 }
 
-/// Apply [`Outcome::Craft`] to a stock; answers whether the stock changed. Every other outcome
-/// leaves it as it was.
-pub fn apply(stock: &mut Stock, outcome: &Outcome) -> bool {
+/// Apply [`Outcome::Craft`] to the slots; answers whether they changed. Every other outcome
+/// leaves them as they were.
+pub fn apply(slots: &mut Slots, outcome: &Outcome) -> bool {
     let Outcome::Craft {
         consume,
         result,
@@ -454,9 +620,9 @@ pub fn apply(stock: &mut Stock, outcome: &Outcome) -> bool {
         return false;
     };
     for (item, count) in consume {
-        stock.remove(item, *count);
+        slots.take(item, *count);
     }
-    stock.add(result, u64::from(*result_count));
+    slots.put(result, *result_count);
     true
 }
 
@@ -494,6 +660,29 @@ mod tests {
             4,
         )
         .expect("a valid pattern")
+    }
+
+    /// A machine's 27 slots from `(item, count)` pairs — one slot each, 64 to a stack, the rest
+    /// empty — so the room an empty slot offers is the same 64.
+    fn slots(entries: &[(&str, u32)]) -> Slots {
+        let mut slots = Slots::new(64);
+        for (item, count) in entries {
+            slots.push(Slot::new(*item, *count, 64));
+        }
+        while slots.slots().len() < 27 {
+            slots.push(None);
+        }
+        slots
+    }
+
+    /// A machine whose every slot holds `64` of `(item, count)`'s items, in order, with no empty
+    /// slot left.
+    fn full_slots(entries: &[(&str, u32)]) -> Slots {
+        let mut slots = Slots::new(64);
+        for (item, count) in entries {
+            slots.push(Slot::new(*item, *count, 64));
+        }
+        slots
     }
 
     #[test]
@@ -540,11 +729,8 @@ mod tests {
 
     #[test]
     fn a_step_consumes_every_cell_and_makes_the_result() {
-        let stock = Stock::of([
-            ("minecraft:coal".to_owned(), 2),
-            ("minecraft:stick".to_owned(), 2),
-        ]);
-        let outcome = plan(&stock, band(4, 16), Phase::Idle, Some(&torch()), 1728);
+        let slots = slots(&[("minecraft:coal", 2), ("minecraft:stick", 2)]);
+        let outcome = plan(&slots, band(4, 16), Phase::Idle, Some(&torch()));
         assert_eq!(
             outcome,
             Outcome::Craft {
@@ -560,11 +746,8 @@ mod tests {
 
     #[test]
     fn a_step_prefers_the_first_candidate_the_stock_holds() {
-        let stock = Stock::of([
-            ("minecraft:charcoal".to_owned(), 1),
-            ("minecraft:stick".to_owned(), 1),
-        ]);
-        let outcome = plan(&stock, band(4, 16), Phase::Idle, Some(&torch()), 1728);
+        let slots = slots(&[("minecraft:charcoal", 1), ("minecraft:stick", 1)]);
+        let outcome = plan(&slots, band(4, 16), Phase::Idle, Some(&torch()));
         assert_eq!(
             outcome,
             Outcome::Craft {
@@ -581,9 +764,9 @@ mod tests {
 
     #[test]
     fn a_missing_ingredient_refuses_the_step_and_names_the_cell() {
-        let stock = Stock::of([("minecraft:coal".to_owned(), 3)]);
-        let before = stock.clone();
-        let outcome = plan(&stock, band(4, 16), Phase::Idle, Some(&torch()), 1728);
+        let slots = slots(&[("minecraft:coal", 3)]);
+        let before = slots.clone();
+        let outcome = plan(&slots, band(4, 16), Phase::Idle, Some(&torch()));
         assert_eq!(
             outcome,
             Outcome::NotEnoughIngredients {
@@ -597,33 +780,125 @@ mod tests {
 
     #[test]
     fn a_full_inventory_refuses_the_step() {
-        let stock = Stock::of([
-            ("minecraft:coal".to_owned(), 1),
-            ("minecraft:stick".to_owned(), 1),
-            ("minecraft:torch".to_owned(), 1726),
-        ]);
-        // The band asks for more torches than the 27-slot inventory can hold: 1726 is below this
-        // `min`, so the step is attempted, and its 4 torches would pass the capacity.
-        let outcome = plan(&stock, band(1800, 2000), Phase::Idle, Some(&torch()), 1728);
+        // Every slot holds 64: one coal, one stick and 25 slots of coal, so the step's ingredients
+        // are there but nothing is empty and no slot holds a torch.
+        let mut slots = Slots::new(64);
+        slots.push(Slot::new("minecraft:coal", 64, 64));
+        slots.push(Slot::new("minecraft:stick", 64, 64));
+        for _ in 0..25 {
+            slots.push(Slot::new("minecraft:coal", 64, 64));
+        }
+        let before = slots.clone();
+        // The band asks for torches and the stock is short, so the step is attempted.
+        let outcome = plan(&slots, band(1800, 2000), Phase::Idle, Some(&torch()));
         assert_eq!(
             outcome,
             Outcome::NetworkFull {
                 item: "minecraft:torch".to_owned(),
-                stored: 1726,
-                capacity: 1728,
+                room: 0,
+                produced: 4,
             },
-            "4 torches do not fit beside 1726"
+            "no slot has room for the 4 torches"
         );
-        let mut after = stock.clone();
+        let mut after = before.clone();
         assert!(!apply(&mut after, &outcome), "a refusal consumes nothing");
-        assert_eq!(after, stock);
+        assert_eq!(after, before);
+    }
+
+    /// The review's defect: the whole inventory's item count must not stand in for the room the
+    /// result actually has. 26 slots of 64 coal and one of 60 sticks hold 1,724 items, so an
+    /// aggregate budget of 1,728 says 4 torches fit; no slot is empty and none holds a torch, so
+    /// the result has **no** room and the step must not consume the coal and stick it selected.
+    #[test]
+    fn a_result_that_fits_no_slot_is_refused_even_when_the_counts_add_up() {
+        let mut slots = Slots::new(64);
+        for _ in 0..26 {
+            slots.push(Slot::new("minecraft:coal", 64, 64));
+        }
+        slots.push(Slot::new("minecraft:stick", 60, 64));
+        let before = slots.clone();
+        let outcome = plan(&slots, band(4, 16), Phase::Idle, Some(&torch()));
+        assert_eq!(
+            outcome,
+            Outcome::NetworkFull {
+                item: "minecraft:torch".to_owned(),
+                room: 0,
+                produced: 4,
+            },
+            "1,724 items in 27 full-ish slots leave no room for 4 torches"
+        );
+        let mut after = before.clone();
+        assert!(!apply(&mut after, &outcome), "a refusal consumes nothing");
+        assert_eq!(
+            after, before,
+            "the ingredients stay in the machine when the result does not fit"
+        );
+    }
+
+    #[test]
+    fn a_slot_holding_the_result_offers_only_its_own_free_room() {
+        // Three full-ish slots and no empty one: the torch stack allows 1 more (64 - 63), the
+        // ingredient slots keep their leftovers, so 4 torches do not fit.
+        let slots = full_slots(&[
+            ("minecraft:torch", 63),
+            ("minecraft:coal", 2),
+            ("minecraft:stick", 2),
+        ]);
+        assert_eq!(
+            step_now(&slots, Some(&torch())),
+            Outcome::NetworkFull {
+                item: "minecraft:torch".to_owned(),
+                room: 1,
+                produced: 4,
+            }
+        );
+        // Four of room inside the torch's own slot is enough, with no empty slot at all.
+        let slots = full_slots(&[
+            ("minecraft:torch", 60),
+            ("minecraft:coal", 2),
+            ("minecraft:stick", 2),
+        ]);
+        assert_eq!(
+            step_now(&slots, Some(&torch())),
+            Outcome::Craft {
+                consume: vec![
+                    ("minecraft:coal".to_owned(), 1),
+                    ("minecraft:stick".to_owned(), 1),
+                ],
+                result: "minecraft:torch".to_owned(),
+                result_count: 4,
+            },
+            "the free room in the torch's own slot holds the step"
+        );
+    }
+
+    #[test]
+    fn consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result() {
+        // 26 slots of coal and one stick: the step empties the stick's slot, and that slot's room
+        // (64) is what holds the 4 torches — the room is measured after the ingredients are taken.
+        let mut slots = Slots::new(64);
+        for _ in 0..26 {
+            slots.push(Slot::new("minecraft:coal", 64, 64));
+        }
+        slots.push(Slot::new("minecraft:stick", 1, 64));
+        assert_eq!(
+            plan(&slots, band(4, 16), Phase::Idle, Some(&torch())),
+            Outcome::Craft {
+                consume: vec![
+                    ("minecraft:coal".to_owned(), 1),
+                    ("minecraft:stick".to_owned(), 1),
+                ],
+                result: "minecraft:torch".to_owned(),
+                result_count: 4,
+            }
+        );
     }
 
     #[test]
     fn an_unconfigured_machine_holds() {
-        let stock = Stock::of([("minecraft:coal".to_owned(), 9)]);
+        let slots = slots(&[("minecraft:coal", 9)]);
         assert_eq!(
-            plan(&stock, band(8, 32), Phase::Idle, None, 1728),
+            plan(&slots, band(8, 32), Phase::Idle, None),
             Outcome::Hold,
             "no pattern yet: nothing to maintain"
         );
@@ -631,31 +906,28 @@ mod tests {
 
     #[test]
     fn apply_moves_the_stock_by_exactly_the_outcome() {
-        let mut stock = Stock::of([
-            ("minecraft:coal".to_owned(), 2),
-            ("minecraft:stick".to_owned(), 1),
-        ]);
-        let outcome = plan(&stock, band(8, 16), Phase::Idle, Some(&torch()), 1728);
-        assert!(apply(&mut stock, &outcome));
-        assert_eq!(stock.count("minecraft:coal"), 1);
-        assert_eq!(stock.count("minecraft:stick"), 0, "the stick was used up");
-        assert_eq!(stock.count("minecraft:torch"), 4);
+        let mut slots = slots(&[("minecraft:coal", 2), ("minecraft:stick", 1)]);
+        let outcome = plan(&slots, band(8, 16), Phase::Idle, Some(&torch()));
+        assert!(apply(&mut slots, &outcome));
+        assert_eq!(slots.count("minecraft:coal"), 1);
+        assert_eq!(slots.count("minecraft:stick"), 0, "the stick was used up");
+        assert_eq!(slots.count("minecraft:torch"), 4);
     }
 
     #[test]
     fn a_manual_step_crafts_even_inside_the_band() {
         // The band says hold at 8 (idle, at min); asking for a step still crafts one.
-        let stock = Stock::of([
-            ("minecraft:coal".to_owned(), 1),
-            ("minecraft:stick".to_owned(), 1),
-            ("minecraft:torch".to_owned(), 8),
+        let slots = slots(&[
+            ("minecraft:coal", 1),
+            ("minecraft:stick", 1),
+            ("minecraft:torch", 8),
         ]);
         assert_eq!(
-            plan(&stock, band(8, 16), Phase::Idle, Some(&torch()), 1728),
+            plan(&slots, band(8, 16), Phase::Idle, Some(&torch())),
             Outcome::Hold
         );
         assert_eq!(
-            step_now(&stock, Some(&torch()), 1728),
+            step_now(&slots, Some(&torch())),
             Outcome::Craft {
                 consume: vec![
                     ("minecraft:coal".to_owned(), 1),
@@ -669,15 +941,42 @@ mod tests {
 
     #[test]
     fn a_manual_step_still_needs_the_ingredients() {
-        let stock = Stock::of([("minecraft:torch".to_owned(), 8)]);
+        let slots = slots(&[("minecraft:torch", 8)]);
         assert_eq!(
-            step_now(&stock, Some(&torch()), 1728),
+            step_now(&slots, Some(&torch())),
             Outcome::NotEnoughIngredients {
                 missing: vec![
                     "minecraft:coal,minecraft:charcoal".to_owned(),
                     "minecraft:stick".to_owned(),
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn a_slot_takes_and_puts_within_its_own_limit() {
+        let mut slots = full_slots(&[("minecraft:torch", 62)]);
+        assert_eq!(slots.room_for("minecraft:torch"), 2);
+        assert_eq!(
+            slots.room_for("minecraft:coal"),
+            0,
+            "a slot holding torches is no room for coal"
+        );
+        assert_eq!(slots.take("minecraft:torch", 3), 3);
+        assert_eq!(slots.count("minecraft:torch"), 59);
+        assert_eq!(slots.room_for("minecraft:torch"), 5);
+        assert_eq!(slots.put("minecraft:torch", 9), 5, "the slot stops at 64");
+        assert_eq!(slots.count("minecraft:torch"), 64);
+        assert_eq!(
+            slots.take("minecraft:torch", 100),
+            64,
+            "a slot empties once"
+        );
+        assert_eq!(slots.count("minecraft:torch"), 0);
+        assert_eq!(
+            slots.room_for("minecraft:torch"),
+            64,
+            "the emptied slot is an empty slot, which offers its full room"
         );
     }
 

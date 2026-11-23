@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.1).
+# In-game check for Step Crafter (the SDK package, 0.2.2).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -43,10 +43,18 @@
 #  - the refusal and the retry: with the sticks drained the requester reports
 #    `not-enough-ingredients`, and the restock resumes it;
 #  - the requester's own `active` state follows its run;
+#  - a result that fits no slot is refused: a crafter whose 27 slots are 26 x 64 coal + 60 sticks
+#    (1,724 of an aggregate 1,728) is asked for torches by a requester, and every ask is refused with
+#    nothing consumed, nothing crafted and the ask not served (the free room after the ingredients
+#    are taken is per slot, not the inventory's item count);
+#  - take hands over the stored stacks themselves: two differently named, damaged swords are taken
+#    and their custom names and damage are read back from the player's inventory;
 #  - `/stepcrafter` needs an operator: a non-operator's `info` is refused.
 #
 # SELFTEST=1 flips the requester's headline assertion (`stored=8`), so the run must end `EXIT:1`;
-# SELFTEST=crafter flips the machine's first "filled to the maximum" assertion instead.
+# SELFTEST=crafter flips the machine's first "filled to the maximum" assertion instead;
+# SELFTEST=capacity flips the no-room assertion (nothing fit, so nothing was served);
+# SELFTEST=take flips the component assertion (a stack rebuilt from its id reads no components).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -640,6 +648,124 @@ case "$FILLED_CRAFT" in
     *) fail "the long run did not craft exactly 128 torches: $FILLED_CRAFT" ;;
 esac
 
+echo "== a result that fits no slot is refused: nothing consumed, nothing served =="
+# The review's defect: the machine's own band never fires (0..0) and its 27 slots are 26 stacks of
+# 64 coal plus 60 sticks — 1,724 items, so an aggregate budget of 1,728 says four torches fit. No
+# slot is empty and none holds a torch, so the result has nowhere to go: every ask the requester
+# beside it makes must be refused, consuming nothing and recording nothing as crafted.
+ctl command "execute in minecraft:the_end run setblock 216 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 216 64 0 minecraft:torch"
+reply '^stepcrafter target 216 64 0 ' >/dev/null
+say "stepcrafter configure 216 64 0 0 0"
+reply '^stepcrafter configure 216 64 0 ' >/dev/null
+for _ in $(seq 1 26); do load 216 64 0 minecraft:coal 64; done
+load 216 64 0 minecraft:stick 60
+FULL=$(info 216 64 0)
+echo "  the full-ish machine: $FULL"
+case "$FULL" in
+    *"stock=minecraft:coal:1664,minecraft:stick:60"*) ;;
+    *) fail "the machine was not stocked 26x64 coal + 60 sticks: $FULL" ;;
+esac
+ctl command "execute in minecraft:the_end run setblock 217 64 0 $REQUESTER"
+ctl wait 6
+say "stepcrafter requester 217 64 0 minecraft:torch 4 8 4"
+reply '^stepcrafter requester 217 64 0 ' >/dev/null
+ctl wait 60
+NO_ROOM=$(info 216 64 0)
+NO_ROOM_REQ=$(info 217 64 0)
+echo "  after the asks, the machine:   $NO_ROOM"
+echo "  after the asks, the requester: $NO_ROOM_REQ"
+case "$NO_ROOM" in
+    *"stored=0"*"phase=network-full"*"crafted=0"*) ;;
+    *) fail "a step that fits no slot was not refused as network-full with nothing crafted: $NO_ROOM" ;;
+esac
+case "$NO_ROOM" in
+    *"minecraft:coal:1664"*"minecraft:stick:60"*) ;;
+    *) fail "the refused step consumed ingredients: $NO_ROOM" ;;
+esac
+case "$NO_ROOM_REQ" in
+    *"kind=requester"*"stored=0"*) ;;
+    *) fail "the requester did not read the refusal with nothing stored: $NO_ROOM_REQ" ;;
+esac
+if [ "$SELFTEST" = capacity ]; then
+    # The fixed behaviour, deliberately inverted: nothing fit and nothing was served, so a run that
+    # must be able to fail has to end here, non-zero.
+    case "$NO_ROOM" in
+        *"crafted=0"*) fail "SELFTEST=capacity: the step fit no slot and served nothing, and the run must end non-zero: $NO_ROOM" ;;
+        *) ;;
+    esac
+fi
+
+echo "== take hands over the stored stacks: components and damage survive =="
+ctl command "execute in minecraft:the_end run setblock 218 64 0 $BLOCK"
+ctl wait 6
+# An empty inventory, so the named stacks have room when they are handed over.
+ctl command "clear"
+ctl wait 4
+# Two differently named torch stacks and one damaged, enchanted sword, planted in the machine's
+# container through the pin's block-entity write path (the same `/data merge block` the requester's
+# ask uses). A sword stacks to one, so its count is one.
+ctl command 'data merge block 218 64 0 {Items:[{Slot:0b,id:"minecraft:torch",count:2,components:{"minecraft:custom_name":"Alpha"}},{Slot:1b,id:"minecraft:torch",count:3,components:{"minecraft:custom_name":"Beta"}},{Slot:2b,id:"minecraft:diamond_sword",count:1,components:{"minecraft:custom_name":"Blade","minecraft:damage":7,"minecraft:enchantments":{"minecraft:sharpness":3}}}]}' >/dev/null
+ctl wait 6
+PLANTED=$(info 218 64 0)
+echo "  the planted stacks: $PLANTED"
+case "$PLANTED" in
+    *"stored=0"*"items=6"*"minecraft:diamond_sword:1"*"minecraft:torch:5"*) ;;
+    *) fail "the component-carrying stacks were not planted: $PLANTED" ;;
+esac
+say "stepcrafter take 218 64 0 minecraft:torch 5"
+TOOK=$(reply '^stepcrafter take 218 64 0 ')
+echo "  $TOOK"
+case "$TOOK" in
+    *"item=minecraft:torch stored=0 taken=5"*) ;;
+    *) fail "take did not hand over the five torches: $TOOK" ;;
+esac
+say "stepcrafter take 218 64 0 minecraft:diamond_sword 1"
+TOOK_SWORD=$(reply '^stepcrafter take 218 64 0 ')
+echo "  $TOOK_SWORD"
+case "$TOOK_SWORD" in
+    *"item=minecraft:diamond_sword stored=0 taken=1"*) ;;
+    *) fail "take did not hand over the sword: $TOOK_SWORD" ;;
+esac
+ctl wait 6
+TORCHES=$(ctl inventory | jq -c '[.hotbar[], .main[] | select(.item == "minecraft:torch") | {count, components}]')
+TORCH_COMPONENTS=$(jq -r 'map(.components // "") | join(" ")' <<<"$TORCHES")
+SWORD=$(ctl inventory | jq -c '[.hotbar[], .main[] | select(.item == "minecraft:diamond_sword")][0]')
+SWORD_COMPONENTS=$(jq -r '.components // ""' <<<"$SWORD")
+SWORD_DAMAGE=$(jq -r '.damage // 0' <<<"$SWORD")
+echo "  torches now in the inventory: $TORCHES"
+echo "  the sword now in the inventory: $SWORD"
+case "$TORCH_COMPONENTS" in
+    *"Alpha"*) ;;
+    *) fail "the taken stack named Alpha lost its components: $TORCHES" ;;
+esac
+case "$TORCH_COMPONENTS" in
+    *"Beta"*) ;;
+    *) fail "the taken stack named Beta lost its components: $TORCHES" ;;
+esac
+jq -e 'map(select(.count == 2)) | length == 1' >/dev/null <<<"$TORCHES" \
+    || fail "the two Alpha torches were not handed over as their own stack: $TORCHES"
+jq -e 'map(select(.count == 3)) | length == 1' >/dev/null <<<"$TORCHES" \
+    || fail "the three Beta torches were not handed over as their own stack: $TORCHES"
+case "$SWORD_COMPONENTS" in
+    *"Blade"*) ;;
+    *) fail "the taken sword lost its name: $SWORD" ;;
+esac
+case "$SWORD_COMPONENTS" in
+    *"sharpness"*) ;;
+    *) fail "the taken sword lost its enchantment: $SWORD" ;;
+esac
+[ "$SWORD_DAMAGE" = 7 ] || fail "the taken sword lost its damage 7: $SWORD"
+if [ "$SELFTEST" = take ]; then
+    # The defect, deliberately asserted: a stack rebuilt from its item id carries no components and
+    # no damage. The package keeps them, so this inverted run has to end here, non-zero.
+    case "$TORCH_COMPONENTS$SWORD_COMPONENTS" in
+        "") ;;
+        *) fail "SELFTEST=take: the taken stacks kept their components and the run must end non-zero: $TORCHES $SWORD" ;;
+    esac
+fi
+
 echo "== /stepcrafter requester refuses what it cannot configure =="
 say "stepcrafter requester 215 64 0 minecraft:torch 9 4 4"
 INVERTED_FILTER=$(reply '^stepcrafter: min 9 is above max 4')
@@ -783,4 +909,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

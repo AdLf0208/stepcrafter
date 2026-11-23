@@ -6,8 +6,11 @@
   (2026-11-20) and from the ATM10 jar `stepcrafter-neoforge-1.21.1-0.1.10.jar`
   (`META-INF/neoforge.mods.toml`: `license = "MIT"`, `authors = "Ultramega"`). No Java code was
   translated and no jar was decompiled.
-- **Licence:** MIT. Upstream's `LICENSE.txt` is the package's `LICENSE`, verbatim
-  (Copyright (c) 2025 Starforcraft).
+- **Licence:** MIT. **Ultramega**'s notice — the MIT licence text of the mod, whose copyright holder is
+  **Starforcraft** — is the package's `LICENSE`, byte-identical to upstream's `LICENSE.txt`
+  (`Copyright (c) 2025 Starforcraft`). The mod's home is
+  <https://github.com/starforcraft/Step-Crafter>; `README.md` and `horizon-mod.toml` name both the
+  author and the upstream repository.
 - **Textures carried from the jar (MIT):** `assets/stepcrafter/textures/block/step_crafter/`
   `top.png`, `side_active.png`, `side_inactive.png` — byte-identical to the jar's own, whose art is
   the mod's (MIT covers it; the mod is not an `assets-arr` row).

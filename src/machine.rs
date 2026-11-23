@@ -18,7 +18,7 @@ use mod_api::{
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
-use crate::runtime::{self, Band, Outcome, Pattern, Phase, Stock};
+use crate::runtime::{self, Band, Outcome, Pattern, Phase, Slot, Slots, Stock};
 
 /// The block entity type this mod declares, and the `id` its carried data is tagged with.
 pub const TYPE: &str = "step_crafter";
@@ -26,9 +26,6 @@ pub const TYPE: &str = "step_crafter";
 pub const BLOCK: &str = "stepcrafter:step_crafter";
 /// The machine's inventory: upstream's stock is the network, this port's is its own slots.
 pub const SLOTS: usize = 27;
-/// The stock a full machine holds: [`SLOTS`] slots of 64, as vanilla's own container arithmetic
-/// bounds it.
-pub const CAPACITY: u64 = SLOTS as u64 * 64;
 
 const KEY_TARGET: &str = "Target";
 const KEY_MIN: &str = "Min";
@@ -182,6 +179,31 @@ pub fn write(nbt: &mut Compound, state: &State) {
 // The inventory, as the runtime's stock
 // ---------------------------------------------------------------------------
 
+/// The machine's 27 slots as the rules see them: each stack's item, count and stack limit, with
+/// `empty_room` as the room an empty slot offers for the step's result.
+#[must_use]
+pub fn slots_of(host: &dyn Host, items: &[Option<ItemStack>], empty_room: u32) -> Slots {
+    let mut slots = Slots::new(empty_room);
+    for stack in items {
+        slots.push(stack.as_ref().and_then(|stack| {
+            let max = host.max_stack_size(stack.item()).unwrap_or(64).max(1);
+            Slot::new(stack.item().id(host), stack.count(), max)
+        }));
+    }
+    slots
+}
+
+/// The room an empty slot offers a step's result: the result item's own stack limit.
+#[must_use]
+pub fn result_room(host: &dyn Host, pattern: Option<&Pattern>) -> u32 {
+    pattern
+        .and_then(|pattern| Identifier::parse(pattern.result()).ok())
+        .and_then(|id| host.item_key(&id))
+        .and_then(|item| host.max_stack_size(item))
+        .unwrap_or(64)
+        .max(1)
+}
+
 /// The machine's 27 slots as one stock: how much of each item it holds, in all.
 #[must_use]
 pub fn stock_of(host: &dyn Host, items: &[Option<ItemStack>]) -> Stock {
@@ -226,6 +248,9 @@ pub fn take_from_slots(
 }
 
 /// Put `count` of `item` into the slots: existing stacks first, then the first empty slot.
+///
+/// A stack is only merged into when its components match too: the step makes a plain item, and
+/// growing a named or enchanted stack with it would launder those components onto the result.
 /// Answers how many went in (all of them, unless the slots are full).
 pub fn put_into_slots(
     host: &dyn Host,
@@ -234,6 +259,7 @@ pub fn put_into_slots(
     count: u32,
 ) -> u32 {
     let max = host.max_stack_size(item).unwrap_or(64).max(1);
+    let plain = ItemStack::of(item);
     let mut left = count;
     for slot in items.iter_mut() {
         if left == 0 {
@@ -242,7 +268,7 @@ pub fn put_into_slots(
         let Some(stack) = slot.as_mut() else {
             continue;
         };
-        if !stack.same_item(&ItemStack::of(item)) {
+        if !stack.is_stackable_with(&plain) {
             continue;
         }
         let room = max.saturating_sub(stack.count());
@@ -302,8 +328,12 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 
     let mut changed = false;
     for _ in 0..runtime::STEPS_PER_TICK {
-        let stock = stock_of(&*host, &event.entity.items);
-        let outcome = runtime::plan(&stock, band, state.phase, state.pattern.as_ref(), CAPACITY);
+        let slots = slots_of(
+            &*host,
+            &event.entity.items,
+            result_room(&*host, state.pattern.as_ref()),
+        );
+        let outcome = runtime::plan(&slots, band, state.phase, state.pattern.as_ref());
         match outcome {
             Outcome::Hold => break,
             Outcome::Finished => {
@@ -345,14 +375,19 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 ///
 /// The ask is spent by what the step produced (`Request` counts items, not steps); a step the
 /// machine cannot take drops the rest of the ask, so the requester reads the refusal from this
-/// machine's `phase` instead of waiting for items that will never come.
+/// machine's `phase` instead of waiting for items that will never come. A refusal produces
+/// nothing, so neither `crafted` nor the ask is served by it: only a step that fits spends.
 fn serve_request(
     host: &mut dyn ServerHost,
     event: &mut BlockEntityTickEvent<'_>,
     state: &mut State,
 ) {
-    let stock = stock_of(&*host, &event.entity.items);
-    match runtime::step_now(&stock, state.pattern.as_ref(), CAPACITY) {
+    let slots = slots_of(
+        &*host,
+        &event.entity.items,
+        result_room(&*host, state.pattern.as_ref()),
+    );
+    match runtime::step_now(&slots, state.pattern.as_ref()) {
         Outcome::Craft {
             consume,
             result,
@@ -395,8 +430,8 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
     let Some(_band) = state.band else {
         return "unconfigured".to_owned();
     };
-    let stock = stock_of(&*host, &items);
-    let outcome = runtime::step_now(&stock, state.pattern.as_ref(), CAPACITY);
+    let slots = slots_of(&*host, &items, result_room(&*host, state.pattern.as_ref()));
+    let outcome = runtime::step_now(&slots, state.pattern.as_ref());
     match outcome {
         Outcome::Craft {
             consume,
@@ -437,9 +472,9 @@ pub fn replace_items(
     let _ = entity.set_changed(host);
 }
 
-/// Put one step's result into slots: existing stacks first, then the first empty slot. The item id
-/// comes from the pattern, so an id this world does not know puts nothing in (the step's own
-/// capacity check already held the room).
+/// Put one step's result into slots: existing stacks that hold the same components first, then the
+/// first empty slot. The item id comes from the pattern, so an id this world does not know puts
+/// nothing in (the step's own room check already held the space).
 fn put_result(
     host: &mut dyn ServerHost,
     items: &mut [Option<ItemStack>],

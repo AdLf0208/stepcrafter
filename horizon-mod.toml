@@ -1,6 +1,6 @@
 id = "stepcrafter"
 name = "Step Crafter"
-version = "0.2.1"
+version = "0.2.2"
 description = """A port of Step Crafter for Horizon: the Step Crafter machine and its Step Requester.
 
 The Step Crafter is a block entity that keeps a configured resource in stock. It is told a target
