@@ -27,10 +27,13 @@ pub mod nbt;
 pub mod pattern;
 pub mod requester;
 pub mod runtime;
+pub mod screen;
 
 use mod_api::{
-    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, Flow, Hooks,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, ClientHost,
+    Flow, Hooks, HostSide, MenuButtonEvent, MenuExtraDataEvent, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ScreenClickEvent,
+    ScreenDrawEvent, ScreenEvent, ServerHost,
 };
 
 /// The mod keeps no state of its own: a machine's pattern, band, phase and stock all live in its
@@ -62,6 +65,27 @@ impl Hooks for Mod {
         } else {
             Flow::Continue
         }
+    }
+
+    /// The requester's filter cells on the client: the entries' resources, one id per line, which
+    /// its screen draws as icons. The numbers travel in the menu's data slots; this payload is what
+    /// the pin has no data slot for (an item id). Answer only for our block and our menu.
+    fn menu_extra_data(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut MenuExtraDataEvent<'_>,
+    ) -> Option<Vec<u8>> {
+        if event.block != requester::BLOCK {
+            return None;
+        }
+        let level = host.level(host.dimension())?;
+        requester::extra_data(&*host, level, event.pos, event.menu)
+    }
+
+    /// A right click on either block opens its menu: the engine never opens a mod container's menu
+    /// by itself (`machine::right_click` records the measurement and the route).
+    fn right_click_block(&self, host: HostSide, event: &mut RightClickBlockEvent<'_>) -> Flow {
+        machine::right_click(host, event)
     }
 }
 
@@ -102,5 +126,42 @@ impl BlockEntityPart for Requester {
     /// One server tick: find the crafter, read its stock, ask or hold.
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         requester::tick(host, event);
+    }
+
+    /// The requester's panel: 45 filter cells drawn by [`screen`], the selected entry's band and
+    /// batch, and the buttons that step them.
+    fn screen(
+        &self,
+        _host: &dyn mod_api::Host,
+        event: &mut ScreenEvent<'_>,
+    ) -> Option<mod_api::Screen> {
+        if event.block != requester::BLOCK {
+            return None;
+        }
+        Some(screen::layout())
+    }
+
+    /// Draw the panel's cells, values and buttons (the client's half of a press).
+    fn screen_draw(&self, host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+        if event.block == requester::BLOCK {
+            screen::draw(host, event);
+        }
+    }
+
+    /// A press on the panel over no slot: a cell or one of the value buttons, as a menu button.
+    fn screen_click(
+        &self,
+        _host: &dyn ClientHost,
+        event: &mut ScreenClickEvent<'_>,
+    ) -> Option<i32> {
+        if event.block != requester::BLOCK {
+            return None;
+        }
+        screen::button_at(event.at)
+    }
+
+    /// The server's half of a press: the filter cell or the value button the client sent.
+    fn menu_button(&self, host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+        requester::press(host, event);
     }
 }

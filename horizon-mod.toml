@@ -1,6 +1,6 @@
 id = "stepcrafter"
 name = "Step Crafter"
-version = "0.2.5"
+version = "0.2.6"
 description = """A port of Step Crafter for Horizon: the Step Crafter machine and its Step Requester.
 
 The Step Crafter is a block entity that keeps a configured resource in stock. It is told a target
@@ -14,10 +14,11 @@ inventory, because a Horizon mod cannot join a Refined Storage network.
 The Step Requester keeps filtered items stocked *through* the Step Crafters beside it: each filter
 entry has its own minimum, maximum and batch, and when the stock of that entry's item falls below its
 minimum the requester asks the crafter that maintains it for batches of the item until the maximum is
-reached (upstream's `StepRequesterNetworkNode.doWork` rule), and
-reports a refusal it cannot serve. The Step Crafter Manager, the Step Requester Manager, the Step
-Crafting Monitor, the sixteen colour variants, the slot upgrade, the energy buffer and the GUIs are
-not ported yet."""
+reached (upstream's `StepRequesterNetworkNode.doWork` rule), and reports a refusal it cannot serve.
+Both are configured in game: the Step Crafter by command, the Step Requester on its own screen, its
+45 filter cells each holding a resource, a minimum, a maximum and a batch. The Step Crafter Manager,
+the Step Requester Manager, the Step Crafting Monitor, the sixteen colour variants, the slot upgrade,
+the energy buffer and the requester's eight upgrade slots are not ported yet."""
 authors = ["Ultramega", "AdLf0208"]
 # The original's licence: MIT (the 1.21.1 jar's META-INF/neoforge.mods.toml declares
 # `license = "MIT"`); upstream's LICENSE.txt travels inside the package as LICENSE.

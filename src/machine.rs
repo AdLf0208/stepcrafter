@@ -13,8 +13,9 @@
 //! configuration is set with `/stepcrafter`.
 
 use mod_api::{
-    BlockEntityTickEvent, Compound, Host, HostTransaction, Identifier, ItemKey, ItemStack,
-    LevelRef, ModContainer, Registrar, ServerHost, Tag,
+    BlockClick, BlockEntityTickEvent, Compound, Flow, Hand, Host, HostSide, HostTransaction,
+    Identifier, InteractionResult, ItemKey, ItemStack, LevelRef, ModContainer, Registrar,
+    RightClickBlockEvent, ServerHost, Tag,
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
@@ -26,7 +27,6 @@ pub const TYPE: &str = "step_crafter";
 pub const BLOCK: &str = "stepcrafter:step_crafter";
 /// The machine's inventory: upstream's stock is the network, this port's is its own slots.
 pub const SLOTS: usize = 27;
-
 const KEY_TARGET: &str = "Target";
 const KEY_MIN: &str = "Min";
 const KEY_MAX: &str = "Max";
@@ -67,7 +67,8 @@ fn container() -> ModContainer {
         ],
         inputs: (0..SLOTS).collect(),
         outputs: (0..SLOTS).collect(),
-        menu: Some("minecraft:chest".to_owned()),
+        // The *menu type*, not the block: a chest's menu is `minecraft:generic_9x3` (27 slots).
+        menu: Some("minecraft:generic_9x3".to_owned()),
     }
 }
 
@@ -579,6 +580,67 @@ fn item_key(host: &dyn Host, item: &str) -> Option<ItemKey> {
     Identifier::parse(item)
         .ok()
         .and_then(|id| host.item_key(&id))
+}
+
+/// A player's right click on one of this package's two blocks opens its menu.
+///
+/// **The engine never opens a mod container's menu on its own**, and its empty-hand hook does not
+/// fire for a mod block's click at this pin: measured in game on this package, with an empty hand
+/// and with an item, a right click on both blocks left `ctl screen` at `playing` — the block's
+/// class reaches the engine's own container openers only. The route the campaign has green in game
+/// (`bibliocraft`, `rftoolsstorage`, `functionalstorage`) is the mod asking for its own menu:
+/// `PlayerRef::open_menu(server, entity)`. The block's template class is therefore not the gate;
+/// the call is. Both sides consume the click, so a held item is not used behind the menu.
+pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+    if event.cancelled {
+        return Flow::Continue;
+    }
+    let click = event.click;
+    if click.hand != Hand::Main {
+        return Flow::Continue;
+    }
+    match host {
+        HostSide::Client(client) => {
+            if !is_ours(&*client, click) {
+                return Flow::Continue;
+            }
+            *event.cancellation_result = InteractionResult::Success;
+            Flow::Cancel
+        }
+        HostSide::Server(server) => {
+            if !is_ours(&*server, click) {
+                return Flow::Continue;
+            }
+            let Some(level) = server.level(server.dimension()) else {
+                return Flow::Continue;
+            };
+            let Some(entity) = server.block_entity(level, click.pos) else {
+                return Flow::Continue;
+            };
+            let Some(player) = server.player(click.player) else {
+                return Flow::Continue;
+            };
+            if !player.open_menu(server, entity).unwrap_or(false) {
+                return Flow::Continue;
+            }
+            *event.cancellation_result = InteractionResult::Success;
+            Flow::Cancel
+        }
+    }
+}
+
+/// Whether the clicked block is the machine or the requester: both open a menu on a click.
+fn is_ours(host: &dyn Host, click: &BlockClick<'_>) -> bool {
+    let Some(level) = host.level(click.dimension.key().id()) else {
+        return false;
+    };
+    level
+        .block(host, click.pos)
+        .map(|block| {
+            let id = block.id(host);
+            id == BLOCK || id == crate::requester::BLOCK
+        })
+        .unwrap_or(false)
 }
 
 /// The `active` state shows the machine is crafting (upstream's `active` is the network node's;

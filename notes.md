@@ -31,10 +31,10 @@ is `ports/_shared/evidence/stepcrafter/parent-surface.md`. In one line:
   `UpgradeContainer`, the network-node base, the grid screens, and the `refinedstorage:autocrafter`
   / `:detector` / `:upgrade` / `:pattern` items three of its recipes name) is **absent** from the
   parent port *and* from the pin, and no Horizon mod can call another port's Rust — so the two
-  managers, the monitor, the colour variants, the slot upgrade, the FE buffer and the GUIs are
-  `blocked(no-parent-addon-surface)`, exactly as `mifa` was; the **requester** is the exception
-  (0.2.1): its rule needs no network, only a machine to ask, so it is re-rooted on a nearby Step
-  Crafter (§2b);
+  managers, the monitor, the colour variants, the slot upgrade, the FE buffer and the managers'/
+  monitor's GUIs are `blocked(no-parent-addon-surface)`, exactly as `mifa` was; the **requester**,
+  its screen included, is the exception (0.2.1, 0.2.6): its rule needs no network, only a machine to
+  ask, so it is re-rooted on a nearby Step Crafter (§2b) and configured on its own panel (§2g);
 - the **core mechanic** — *keep a resource between a minimum and a maximum by stepping its own
   crafting pattern* — is the add-on's own rule (`StepCrafterNetworkNode.doWork`,
   `StepCraftingAlgorithm`), and it needs only the pin's recipe surface
@@ -52,12 +52,12 @@ with 5 base recipes, 51 colouring recipes, 51 loot tables, 3 item tags, 1 block 
 |---|---|
 | `step_crafter` block + block entity (the machine, `active` state, red/`side_active` art) | **ported** — the block, its 27-slot inventory, the `active` state, the band rule, `recipes`/`loot`/`lang`/`tab` |
 | its pattern system (a Refined Storage *pattern item* per slot, min/max/batch per slot) | **ported differently**: the pattern is the target item's own `minecraft:crafting` recipe (`/stepcrafter target <pos> <item>`), because an RS pattern item is not representable here; the band is `/stepcrafter configure <pos> <min> <max>` |
-| `step_requester` block + entity (asks *other* autocrafters for a resource) | **ported differently (0.2.1, several entries in 0.2.5)** — the ask goes to a **nearby Step Crafter** instead of the parent's autocrafting network: up to 45 filter entries (item, min, max, batch) set by `/stepcrafter requester add|remove`, each linked to the crafter that maintains its item, whose inventory is the store it watches; the ask is a `Request` count in that crafter's saved compound |
+| `step_requester` block + entity (asks *other* autocrafters for a resource) | **ported differently (0.2.1, several entries in 0.2.5, its screen in 0.2.6)** — the ask goes to a **nearby Step Crafter** instead of the parent's autocrafting network: up to 45 filter entries (item, min, max, batch) edited on the requester's **own screen** (§2g) or by `/stepcrafter requester add|remove`, each linked to the crafter that maintains its item, whose inventory is the store it watches; the ask is a `Request` count in that crafter's saved compound |
 | `step_crafter_manager`, `step_requester_manager` (+16 colours each), `step_crafting_monitor` (+16 colours) | `blocked(no-parent-addon-surface)` — each is a mixin into Refined Storage's grid screen, which the parent port does not ship (0 hits for `wireless_grid`) |
-| `slot_upgrade` item (a slot upgrade, `Items.INSTANCE.getSlotUpgrade`) | `not ported` — upgrades are the RS `UpgradeContainer`; the machine has 27 slots and no upgrade slots |
+| `slot_upgrade` item (a slot upgrade, `Items.INSTANCE.getSlotUpgrade`) | `not ported` — upgrades are the RS `UpgradeContainer`; the machine has 27 slots and no upgrade slots, and the requester's 8 upgrade slots are the same container (§2g) |
 | the 51 colouring recipes + the three colour tags | `not ported` — they recolour the managers/monitor, which are blocked |
 | FE buffer (`energyUsage` per machine, `SimpleNetworkNode`) | `not ported` — energy is the RS network's; this machine's stock is its inventory |
-| GUI (screens, side-button widgets, the preview screen, slots with min/max editors) | `not ported` — the interface is the vanilla chest menu (the container) plus `/stepcrafter`; screens are a later slice |
+| GUI (screens, side-button widgets, the preview screen, slots with min/max editors) | **ported for the requester (0.2.6)**: 45 filter cells, the selected entry's min/max/batch and the buttons that step them (§2g). The machine's 27-slot stock menu opens on a right click too (it never did before 0.2.6: the engine does not open a mod container's menu, §2g). The managers'/monitor's GUIs stay `blocked(no-parent-addon-surface)` |
 | `active` state, `direction` state | `active` ported; `direction` **not ported** (the model is a cube; no facing behaviour in this slice) |
 | advancements, JEI/EMI plugins, config (`energyUsage`, `speedMultiplier`, defaults) | `not ported` — client/optional surface; defaults are documented where the port needs a number |
 
@@ -245,6 +245,82 @@ beside each entry, not in place of its identity.
 crafter could not step. The leg names `minecraft:oak_planks` and asserts the stock reads
 `minecraft:oak_planks:8` before the filters, so the mistake can never pass unnoticed again.
 
+## 2g. The slice (version 0.2.6): the Step Requester's filter screen
+
+0.2.5's own gap line (§6) was *"the requester carries up to 45 filter entries, set by command
+(upstream: the same 45 slots plus 8 upgrade slots edited in a screen)"* and §1 deferred the GUI —
+*"screens are a later slice"*. This is that screen. The 8 upgrade slots stay
+`blocked(no-parent-addon-surface)` (the RS `UpgradeContainer`) and are not part of it.
+
+### The surface, measured before any code (`ports/_shared/sdk/0a875da/`)
+
+| need | symbol | verdict |
+|---|---|---|
+| a menu type a content mod declares | `data/<id>/horizon/menu/<name>.json` — `slots` 1..256, `data_slots` 0..256, `results`; the type is `<id>:<name>` | **yes** |
+| the menu on the block | `Registrar::block_container(&BlockKey, ModContainer { slots, faces, inputs, outputs, menu })`, where `menu` is a **menu type** id | **yes** (`minecraft:generic_9x3` for the stock, this package's own for the filters) |
+| opening it | `Hooks::right_click_block` + `PlayerRef::open_menu(&mut ServerHost, BlockEntityRef)` → `Result<bool, BlockEntityError>` | **yes** |
+| the panel | `BlockEntityPart::screen(&dyn Host, &mut ScreenEvent) -> Option<Screen>` (`width`, `height`, `slots`, `inventory_x/y`, `own_labels`) | **yes** |
+| drawing | `screen_draw(host, &mut ScreenDrawEvent { block, data, draw, origin })`; `DrawContext::{fill, item, text}`; `ClientHost::screen_extra_data()` | **yes** |
+| the press | `BlockEntityPart::screen_click(&dyn ClientHost, &mut ScreenClickEvent { block, data, at, right }) -> Option<i32>` → `ContainerButtonClick` → `BlockEntityPart::menu_button(host, &mut MenuButtonEvent { context, entity, carried })` | **yes** in game |
+| `MenuClickedEvent` / `menu_clicked` | only for menus a mod **opens itself** (`native_open_menu`, a chest-shaped list of item stacks); a block's content menu gets `menu_button` | **not used**: this screen is a block menu, so its presses are `screen_click` → `menu_button` |
+| config entries, not only item slots | the menu's **data slots** (`event.entity.data`, 16-bit on the wire, *not saved*) for the selected entry's numbers; `Hooks::menu_extra_data -> Option<Vec<u8>>` (≤ 32 KiB) + `ClientHost::screen_extra_data()` for the entries' item ids; the saved compound for the truth | **yes** — a chest menu that could only hold items would not express an entry, so the entries are drawn cells with a resource, a band and a batch |
+| the entries on the client | — | the id list is the open payload (sent when the menu opens), the numbers are data slots (refreshed every tick and on each press) |
+
+### Four traps, measured in game (each cost a run)
+
+1. **The engine never opens a mod container's menu.** `data/<id>/horizon/menu/`, `block_container` and a
+   `minecraft:stonecutter`/`barrel` template are not enough: a plain click on either block left
+   `ctl screen` at `playing` (probe: `ports/_shared/evidence/stepcrafter/probe-menu.log`, empty hand
+   and with an item). The campaign brief's trap — "a mod container's menu only opens when the block's
+   template class is a container" — is a misdiagnosis: the class is irrelevant, **the call is the
+   gate**. `bibliocraft` measured it first; the route `bibliocraft`, `rftoolsstorage` and
+   `functionalstorage` have green in game is `Hooks::right_click_block` →
+   `PlayerRef::open_menu(server, entity)` (the mod asking for its own menu, as a block's
+   `getMenuProvider` would). Both blocks use it now (`machine::right_click`), which also repairs this
+   port's 0.2.0–0.2.5 claim that a right click opens the stock: it never did.
+2. **The container's `menu` is a menu type, not a block.** The stock's `menu: Some("minecraft:chest")`
+   (0.2.0–0.2.5) and the requester's `stepcrafter:step_requester_menu` (the first 0.2.6 draft, whose
+   content file was `menu/step_requester.json` ⇒ `stepcrafter:step_requester`) both name no menu type,
+   so `open_menu` answered `Ok(false)` — *non-provider* — and nothing opened. They are
+   `minecraft:generic_9x3` and `stepcrafter:step_requester_filters` now, and the content test
+   `the_menu_declares_the_slots_the_screen_publishes` reads the menu's own file so the two cannot
+   drift.
+3. **A panel taller than the game's 240-pixel GUI is clipped and its clicks land elsewhere.** The
+   first 0.2.6 layout was 176 × 258: the player's inventory was drawn 58 pixels below where the click
+   mapping put it (`screen_click` reported `at [17, 85]` for a press at the first cell), so no press
+   reached a cell. Vanilla's tallest container is 222 for the same reason. The panel is **176 × 238**
+   (grid 18..108, two value rows 110/128, the engine's own "Inventory" label at 144, inventory at
+   156) and the e2e proves the height from the game: the requester's panel top is 36 above the
+   machine's 166-high chest panel, which is `(238 − 166) / 2`.
+4. **`slot-0` in `ctl ui` is the hotbar's first slot**, not the main inventory's (vanilla's inventory
+   order), so the panel's origin is `slot-0's bounds − (8, inventory_y + 58)`; the e2e derives it that
+   way and checks it against the centred panel.
+
+### What changed
+
+- **`runtime.rs`**: `Press` (`Cell(u8)`, `MinDown/MinUp/MaxDown/MaxUp/BatchDown/BatchUp`, `Remove`,
+  `Press::of(button)`/`button()` — ids `100 + cell` and `200..206`), `Editor { filters, selected }`
+  with the screen's rule `apply(press, carried) -> bool`: a cell with an item makes or repoints an
+  entry (a resource is an entry's identity, so a second entry for one item is refused; a repoint
+  keeps the band and batch and drops the link), an empty hand only focuses a cell, and a step keeps
+  the band valid (`min <= max`), never goes below zero and caps at `SCREEN_MAX = 4096`. Plus
+  `view_data_slots` (`[count, selected, min, max, batch]`, 16-bit clamped) and `view_extra_data` /
+  `extra_items` (the entries' ids, one per line, a malformed payload drawing nothing).
+- **`requester.rs`**: `MENU = stepcrafter:step_requester_filters`; `declare` registers the container
+  (one hidden slot, no faces, that menu); `State.selected` saved as `Selected`; the tick publishes the
+  data slots every tick; `press` is `menu_button` on the server; `extra_data` is `menu_extra_data`.
+- **`screen.rs`** (new): the 176 × 238 layout, `cell_at`/`button_at` hit tests and the drawing, with
+  the row-fit as a compile-time assertion.
+- **`machine.rs`**: `right_click` (the click route above) and the stock's menu type.
+- **`lib.rs`**: the `right_click_block` and `menu_extra_data` hooks, and the requester's Part gains
+  `screen`, `screen_draw`, `screen_click`, `menu_button`.
+- **Content**: `data/stepcrafter/horizon/menu/step_requester_filters.json` (`{"slots": 1,
+  "data_slots": 5}`).
+- **Commands unchanged**: they write the same `Filters` the screen edits — one saved container.
+
+The screen shows the selected entry's three values live (data slots) and every entry's icon (the open
+payload, refreshed when the menu is reopened); a cell that is `count` is the next one a click fills.
+
 ## 2d. The slice (version 0.2.3): crafting remainders
 
 0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
@@ -418,6 +494,41 @@ asserts today's `filters=1` reply and ends non-zero on the fixed package; the ru
 was found in the first run — `minecraft:planks` is a tag, so the stick crafter was never stocked
 (§2f's correction) — and is closed by the scenario's stock assertion.
 
+Green at 0.2.6 (the screen slice): **64 tests** (`sdk-test.log`). Its red transcript is
+`red-unit-screen.log`: `Editor`, `Press`, `view_data_slots` and `extra_items` existed as stubs (an
+`apply` answering `false`, empty slots and an empty payload) while the twelve new tests demanded the
+rule, so eleven failed for exactly that reason:
+
+```
+---- runtime::tests::a_click_on_an_empty_cell_with_a_carried_item_adds_the_entry stdout ----
+
+thread 'runtime::tests::a_click_on_an_empty_cell_with_a_carried_item_adds_the_entry' (212593) panicked at src/runtime.rs:1997:9:
+assertion failed: editor.apply(Press::Cell(0), Some("minecraft:torch"))
+
+---- runtime::tests::a_step_keeps_the_band_valid stdout ----
+
+thread 'runtime::tests::a_step_keeps_the_band_valid' (212622) panicked at src/runtime.rs:2061:9:
+assertion failed: editor.apply(Press::MinUp, None)
+
+---- runtime::tests::a_remove_press_drops_the_selected_entry_and_keeps_the_others stdout ----
+
+thread 'runtime::tests::a_remove_press_drops_the_selected_entry_and_keeps_the_others' (212609) panicked at src/runtime.rs:2121:9:
+assertion failed: editor.apply(Press::Remove, None)
+
+---- runtime::tests::the_data_slots_are_the_selected_entry stdout ----
+
+thread 'runtime::tests::the_data_slots_are_the_selected_entry' (212638) panicked at src/runtime.rs:2175:9:
+assertion `left == right` failed
+  left: [0, 0, 0, 0, 0]
+ right: [2, 1, 8, 16, 8]
+
+test result: FAILED. 49 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+The game half's red is `SELFTEST=screen` (§4): it asserts today's behaviour — a right click opens no
+screen (`ctl screen` says `playing`) and no entry can be made from a menu — and ends non-zero on this
+package. The route itself has its own measurement log, `probe-menu.log` (`notes.md` §2g trap 1).
+
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
 `decide_finishes_at_the_maximum`), the step (`a_step_consumes_every_cell_and_makes_the_result`,
@@ -448,8 +559,8 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — nine run logs plus the build log, all `--strict`
-green (`logs=9 ok=9 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — ten run logs plus the build log, all `--strict` green
+(`logs=10 ok=10 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
@@ -462,7 +573,9 @@ green (`logs=9 ok=9 missing-exit=0 bad-exit=0`):
 | `e2e-selftest-take.log` | `FAIL` + `EXIT:1` | `SELFTEST=take` inverts the **component** assertion: the defect “a rebuilt stack reads no components” ends the run non-zero |
 | `e2e-selftest-remainder.log` | `FAIL` + `EXIT:1` | `SELFTEST=remainder` inverts the **remainder** assertion: the defect “the step consumes the buckets and leaves none” ends the run non-zero |
 | `e2e-selftest-filters.log` | `FAIL` + `EXIT:1` | `SELFTEST=filters` inverts the **multi-entry** assertion: today's defect is one entry (`filters=1`), so the run ends non-zero on the package that keeps `filters=2` |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.5: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-screen.log` | `FAIL` + `EXIT:1` | `SELFTEST=screen` inverts the **screen** assertion: today's defect is a right click that opens no screen (`playing`) and a menu that can make no entry, so the run ends non-zero on the package that opens it |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.6: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `screen-requester.png` | screenshot | the filter screen on a requester at `223 64 0`: the title, the 9 × 5 cells with the torch's icon, `min 4`, `max 8`, `batch 4` and the remove button |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -548,16 +661,32 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     0.2.1–0.2.4 spelling) beside its own fresh pair reads `filters=1`, leaves the torch crafter at
     `crafted=8` and the stick crafter at `crafted=0` — the removed entry is the only difference.
     `SELFTEST=filters` asserts the old one-entry reply and ends the run non-zero.
+23. **the requester's filter screen (0.2.6)**: the machine's own stock menu opens on a right click —
+    `ctl screen` `container` with **27** slots at 300..326 (it never opened before this version: the
+    engine does not open a mod container's menu, §2g) — and so does the requester's screen at
+    `223 64 0`: `container`, a 36-slot player inventory and no visible container slot (the one it
+    needs is hidden by the layout). The panel is checked from the game: its top is 36 pixels above the
+    166-high chest panel's, i.e. the declared `238`. Picking the torch up onto the cursor and
+    clicking the first cell makes filter entry 0 (`filters=1 item=minecraft:torch min=0 max=0
+    batch=0`); the drawn buttons then step it: at 0..0 a `min +` is **refused** (the band cannot
+    invert), eight `max +`, four `min +` and four `batch +` read `min=4 max=8 batch=4` — the brief's
+    assertion. A carried stick clicked onto that cell **repoints** it to `minecraft:stick` while
+    keeping `min=4 max=8 batch=4`; `/stepcrafter requester add … minecraft:torch 4 8 4` then reads
+    `filters=2` (the command's entry is a cell of the same container) and the screen's remove button
+    on the second cell brings it back to `filters=1 item=minecraft:stick`. The **differential**: the
+    requester at `223 64 4`, never opened, reads `filters=0 item=none`. The screenshot
+    `screen-requester.png` is the open screen. `SELFTEST=screen` asserts today's `screen: playing` /
+    `filters=0` and ends the run non-zero.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **62,413 B** |
-| sha256 | `70e238c3a262ee33e31db0ab10afc44dc14e7655189a258fc56b411413b34525` |
-| entries | 37 (`209,220 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.5` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **78,612 B** |
+| sha256 | `6463ca1d05de67a3a2d6d890a76658b672e98aad82b655ff7b65479c4ea251b9` |
+| entries | 39 (`274,262 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.6` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -601,13 +730,36 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   inside a 9×9×9 cube whose `Target` is its filtered item (`LINK_RADIUS = 4`, saved and re-validated
   every tick). Two crafters that both maintain the same item are interchangeable to it; a crafter
   that maintains something else is never asked, so a filter cannot spend another pattern's items.
-- **The requester carries up to 45 filter entries, set by command** (upstream: the same 45 slots plus
-  8 upgrade slots edited in a screen). A resource names one entry: `requester add` replaces the entry
-  for that item rather than adding a second, so two bands for one item are not expressible (upstream's
-  slots would allow it; this port's entry identity is the resource). The 8 upgrade slots stay
-  unported (the RS `UpgradeContainer`), and the screen is the later slice named in §1. Batch 0
-  disables an entry exactly as upstream skips it. A compound written by 0.2.1–0.2.4 reads as one
-  entry and is migrated to the container on the next write.
+- **The requester carries up to 45 filter entries, edited on its screen or by command** (upstream:
+  the same 45 slots plus 8 upgrade slots edited in a screen). A resource names one entry: a cell click
+  or `requester add` repoints/replaces the entry for that item rather than adding a second, so two
+  bands for one item are not expressible (upstream's slots would allow it; this port's entry identity
+  is the resource). `requester add` keeps the command path and writes the same container the screen
+  edits. The **8 upgrade slots stay unported** (the RS `UpgradeContainer`), which is this screen's
+  one missing column. Batch 0 disables an entry exactly as upstream skips it. A compound written by
+  0.2.1–0.2.4 reads as one entry and is migrated to the container on the next write.
+- **The screen edits one entry's values at a time.** The 45 cells are drawn (a resource, a band and a
+  batch are not an item stack, and a container slot cannot hold them); clicking a cell focuses it and
+  a click with a carried item makes or repoints its entry there, as upstream's ghost filter slot does.
+  The `min`/`max`/`batch` buttons then step the focused entry by one, refusing a step that would
+  invert the band (`min <= max`, the command's own rule) or go below zero, and capping a screen edit
+  at 4096. Upstream draws a min/max editor beside *every* slot; this is one focused row, which is the
+  recorded deviation, and the entry's numbers are read from `/stepcrafter info` as well.
+- **The cells' icons are the menu's open payload.** The item ids travel in `menu_extra_data` (32 KiB)
+  and the numbers in the data slots, which are a view and not saved. A resource set *from* the screen
+  shows its icon when the menu is reopened (the payload is sent when the menu opens); the numbers
+  update at every press.
+- **A stale sentence in the crate's module summary.** `src/lib.rs`'s module doc still lists "the
+  requester … and the GUIs" among the families blocked on the parent's surface. That sentence
+  predates 0.2.1 (which ported the requester) and this slice's screen; §1, §2g and `screen.rs`'s own
+  module doc are the authority. Correcting it changes the packed source and so needs its own build
+  and leg re-run, which is left for the next touch of `lib.rs` rather than done after the evidence
+  below was recorded.
+- **A panel taller than the game's 240-pixel GUI is unreachable** (§2g trap 3): the requester's is
+  176 × 238, which fits. A future row must come out of the layout, not be added below it.
+- **The machine's stock menu and the requester's screen both open from the mod's own click handler**
+  (§2g trap 1), not from the engine: a click is consumed on both sides, so a held item is not used
+  behind the menu. Before 0.2.6 the stock menu did not open at all, though §2 claimed it did.
 - **Each entry links its own crafter.** A Step Crafter maintains one target, so two entries with
   different resources cannot link the same crafter; a re-targeted crafter drops the entry's saved link
   and the next tick rescans (the §2b rule), entry by entry.
@@ -640,7 +792,9 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | status per pattern slot | `ResourceStatus` (`CRAFTING`, `FINISHED`, `NOT_ENOUGH_INGREDIENTS`, `NETWORK_FULL`) | `runtime::Phase`, saved as `Phase` |
 | `active` block state | the RS network node's `active` property | true while the machine is crafting |
 | one step per tick without speed upgrades | `for j < speed + 1` with `speed = 0` | `runtime::STEPS_PER_TICK = 1` |
-| the click | `ExtendedMenuProvider` opens a screen | the vanilla chest menu over the 27-slot container |
+| the click | `getMenuProvider`/`ExtendedMenuProvider` opens the block's menu on use | the mod asks for its own menu on `right_click_block` → `PlayerRef::open_menu` (the engine does not open a mod container's menu at this pin, §2g); the stock opens `minecraft:generic_9x3`, the requester `stepcrafter:step_requester_filters` |
+| the requester's filter screen | `StepRequesterScreen`: 45 filter slots with a resource, a min/max editor and a batch each, plus the 8 upgrade slots | a 176 × 238 panel: 45 drawn cells (the entries' icons from the menu's open payload), the focused entry's `min`/`max`/`batch` from the data slots, `-`/`+` buttons per value and a `remove` button; a cell click with a carried item makes or repoints that entry (upstream's ghost slot). The 8 upgrade slots are not ported |
+| a screen press | a slot click or a side button in the mod's screen | `screen_click` (the client's hit test) → the menu's button id → `menu_button` on the server (`runtime::Editor::apply`), which writes the same saved container the command writes |
 | taking the resource out | `network.extract(resource, count)` | `/stepcrafter take` hands over the **stored stacks themselves**, split to the count asked for: names, enchantments and damage stay on them |
 | the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick_entry` |
 | several filter entries, each with its own status and failed-task timeout | the `rf` container (45 `ResourceMinMaxAmount`) and the node's per-index `runningTasks`/`failedTaskTimeouts` | `runtime::Filters`/`Entry` (add-or-replace by resource, 45 cap, saved list), one `tick_entry` per entry; the readout's `filters=N entries=…` |
@@ -663,8 +817,9 @@ a deviation, not as an upstream defect.
 |---|---|
 | `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `refused` — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
-| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step, `apply_craft` |
-| `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, the ask, per-entry tick and the readout's views |
+| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
+| `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, the ask, per-entry tick and the readout's views, the selected cell, the menu's data slots and open payload, and `press` (the server half of a screen press) |
+| `src/screen.rs` | the filter screen: the 176 × 238 layout, `cell_at`/`button_at` hit tests and the drawing (cells, icons, the selected entry's values, the buttons) |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
 | `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
 | `src/lib.rs` | the one `impl Hooks` and the two `Part`s the game ticks |
@@ -702,6 +857,10 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | **several filter entries, each served by the crafter that maintains its item** | **tested** — `a_second_filter_entry_is_kept_beside_the_first`, `a_filter_entry_is_replaced_by_its_own_resource`, `a_requester_carries_at_most_the_containers_45_entries`, `a_removed_entry_leaves_the_others`, `a_filter_entry_round_trips_through_its_saved_form`, `the_filter_container_round_trips_through_its_saved_form`, `a_legacy_single_filter_compound_still_reads_as_one_entry`; in game one requester with a torch entry and a stick entry reads `filters=2` with both entries and their stored counts, `crafted=8` on the torch crafter and `crafted=16` on the stick crafter, while the same world with only the torch entry leaves the stick crafter at `crafted=0`; `SELFTEST=filters` ends non-zero |
 | the refusal path across the two blocks | **tested** in game — the crafter with no sticks answers `not-enough-ingredients`, the requester shows `phase=not-enough-ingredients backoff=13`, the restock resumes both to `stored=8 crafted=8` |
 | the requester's own loot | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_requester:1` |
+| **the requester's filter screen** (open, cells, values, remove) | **tested** — `a_press_round_trips_through_its_button_id`, `a_click_on_an_empty_cell_with_a_carried_item_adds_the_entry`, `a_click_on_a_filled_cell_selects_it`, `a_click_with_another_item_repoints_the_entry_and_keeps_its_band`, `a_click_that_would_give_two_entries_one_resource_is_refused`, `a_step_keeps_the_band_valid`, `a_step_never_goes_below_zero_and_a_zero_batch_stays_disabled`, `a_batch_step_enables_an_entry`, `a_remove_press_drops_the_selected_entry_and_keeps_the_others`, `a_cell_beyond_the_next_free_one_changes_nothing`, `a_step_on_an_empty_requester_changes_nothing`, `the_data_slots_are_the_selected_entry`, `the_screen_payload_lists_every_entrys_resource`, `the_editor_and_the_command_are_one_container`, `the_grid_is_nine_by_five_and_the_cells_do_not_overlap`, `the_buttons_are_the_presses_the_server_applies`, `the_panel_holds_its_rows_and_the_inventory` (compile-time), and `the_menu_declares_the_slots_the_screen_publishes`; in game the screen opens on a right click, a carried torch makes entry 0, the buttons set `min=4 max=8 batch=4`, a carried stick repoints the cell, the command's entry is a cell the remove button drops, and an unopened requester has none; `SELFTEST=screen` ends non-zero |
+| the screen's panel and its origin | **tested** in game — the panel's top is 36 above the 166-high chest panel's (the declared 238), its left is the centred 176, and `slot-0` (the hotbar's first) is where the layout puts it |
+| the machine's stock menu | **tested** in game — a right click opens `container` with 27 slots at 300..326 |
+| the 8 upgrade slots | `blocked(no-parent-addon-surface)` — the RS `UpgradeContainer`, which the parent port does not ship |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
 | the slot upgrade, the FE buffer, the GUI, `direction`, advancements, JEI/EMI | **not ported** — upgrades/energy/GUI are the RS harness; `direction` is cosmetic here |
 | crafting remainders (a bucket recipe leaves its bucket) | **tested** — `a_step_returns_the_bucket_the_recipe_leaves` (3 milk buckets → cake + 3 buckets), `a_remainder_that_fits_no_slot_refuses_the_step`, `a_pattern_round_trips_through_its_saved_form` (the saved `Remainders`); in game a cake step reads `stock=minecraft:bucket:3,minecraft:cake:1` with every ingredient consumed, and `SELFTEST=remainder` asserts the old defect (no bucket) and ends non-zero |

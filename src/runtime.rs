@@ -850,6 +850,12 @@ impl Entry {
         &self.filter
     }
 
+    /// Keep the entry's crafter, phase and timeout while its resource's band or batch changes: a
+    /// stepped value is the same resource asked of the same crafter.
+    pub fn set_filter(&mut self, filter: Filter) {
+        self.filter = filter;
+    }
+
     /// Where this entry's last tick left it.
     #[must_use]
     pub fn phase(&self) -> Phase {
@@ -1023,6 +1029,28 @@ impl Filters {
         self.entries.iter_mut()
     }
 
+    /// The entry at `index` (a filter cell), if one is configured there.
+    #[must_use]
+    pub fn entry(&self, index: usize) -> Option<&Entry> {
+        self.entries.get(index)
+    }
+
+    /// Replace the entry at `index` with a fresh one for `filter`: a new resource on that cell keeps
+    /// the cell and drops the old resource's crafter, phase and timeout.
+    pub fn replace(&mut self, index: usize, filter: Filter) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            *entry = Entry::new(filter);
+        }
+    }
+
+    /// Set the entry at `index` to `filter`, keeping the state it has already: a band or batch the
+    /// player stepped is the same resource on the same crafter.
+    pub fn retune(&mut self, index: usize, filter: Filter) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.set_filter(filter);
+        }
+    }
+
     /// Every entry as its saved string, for a `List` in the block entity's compound.
     #[must_use]
     pub fn encode(&self) -> Vec<String> {
@@ -1038,6 +1066,337 @@ impl Filters {
                 .filter_map(|text| Entry::decode(text))
                 .collect(),
         }
+    }
+}
+
+/// The screen's filter grid: upstream's `FILTERS = 9 * 5` cells, drawn 9 across and 5 down.
+pub const SCREEN_COLUMNS: usize = 9;
+/// The filter grid's rows.
+pub const SCREEN_ROWS: usize = 5;
+
+/// The largest amount one screen press reaches. The screen's numbers travel in the menu's data
+/// slots, which are 16-bit on the wire, and an amount a player steps to is a stock band, not a
+/// count of items: a command may still set more (the band is saved, not the view).
+pub const SCREEN_MAX: u64 = 4096;
+
+/// One press on a requester's filter screen, as [`Editor::apply`] takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Press {
+    /// A filter cell: select it, and give its entry the carried item when one is carried.
+    Cell(u8),
+    /// The selected entry's minimum, down one.
+    MinDown,
+    /// The selected entry's minimum, up one.
+    MinUp,
+    /// The selected entry's maximum, down one.
+    MaxDown,
+    /// The selected entry's maximum, up one.
+    MaxUp,
+    /// The selected entry's batch, down one.
+    BatchDown,
+    /// The selected entry's batch, up one.
+    BatchUp,
+    /// Drop the selected entry.
+    Remove,
+}
+
+/// The menu button ids the screen answers, as `screen_click` sends them and `menu_button` reads
+/// them: cell `i` is `100 + i`, the value buttons follow.
+pub const FIRST_CELL_BUTTON: i32 = 100;
+
+impl Press {
+    /// The press a menu button id stands for; `None` for a button the screen does not draw.
+    #[must_use]
+    pub fn of(button: i32) -> Option<Self> {
+        let cell = button - FIRST_CELL_BUTTON;
+        if (0..MAX_FILTER_ENTRIES as i32).contains(&cell) {
+            return Some(Self::Cell(u8::try_from(cell).ok()?));
+        }
+        match button {
+            200 => Some(Self::MinDown),
+            201 => Some(Self::MinUp),
+            202 => Some(Self::MaxDown),
+            203 => Some(Self::MaxUp),
+            204 => Some(Self::BatchDown),
+            205 => Some(Self::BatchUp),
+            206 => Some(Self::Remove),
+            _ => None,
+        }
+    }
+
+    /// The button id this press is sent as.
+    #[must_use]
+    pub fn button(self) -> i32 {
+        match self {
+            Self::Cell(cell) => FIRST_CELL_BUTTON + i32::from(cell),
+            Self::MinDown => 200,
+            Self::MinUp => 201,
+            Self::MaxDown => 202,
+            Self::MaxUp => 203,
+            Self::BatchDown => 204,
+            Self::BatchUp => 205,
+            Self::Remove => 206,
+        }
+    }
+}
+
+/// A requester's screen over its saved filter container: which entry the value buttons edit, plus
+/// the container itself. The screen and `/stepcrafter requester` edit the same [`Filters`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Editor {
+    filters: Filters,
+    selected: usize,
+}
+
+impl Editor {
+    /// The screen over `filters`, with `selected` focused (clamped to the next free cell).
+    #[must_use]
+    pub fn new(filters: Filters, selected: usize) -> Self {
+        let selected = selected.min(filters.len());
+        Self { filters, selected }
+    }
+
+    /// The container the screen edits.
+    #[must_use]
+    pub fn filters(&self) -> &Filters {
+        &self.filters
+    }
+
+    /// The container, as the block entity saves it.
+    #[must_use]
+    pub fn into_filters(self) -> Filters {
+        self.filters
+    }
+
+    /// The entry the value buttons edit; `len()` means "the next cell a click would fill".
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// How many entries the requester carries.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// Apply one press, with the item the player carries (`None` for an empty hand). Answers
+    /// whether the configuration changed.
+    pub fn apply(&mut self, press: Press, carried: Option<&str>) -> bool {
+        match press {
+            Press::Cell(cell) => self.click(usize::from(cell), carried),
+            Press::MinDown => self.step(Field::Min, Direction::Down),
+            Press::MinUp => self.step(Field::Min, Direction::Up),
+            Press::MaxDown => self.step(Field::Max, Direction::Down),
+            Press::MaxUp => self.step(Field::Max, Direction::Up),
+            Press::BatchDown => self.step(Field::Batch, Direction::Down),
+            Press::BatchUp => self.step(Field::Batch, Direction::Up),
+            Press::Remove => self.remove(),
+        }
+    }
+
+    /// A cell's press: select it, and make (or repoint) its entry from the carried item.
+    fn click(&mut self, cell: usize, carried: Option<&str>) -> bool {
+        if cell >= MAX_FILTER_ENTRIES {
+            return false;
+        }
+        let Some(item) = carried else {
+            // An empty hand selects; it cannot make an entry, and a cell past the next free one
+            // has no entry to select.
+            if cell > self.filters.len() || cell == self.selected {
+                return false;
+            }
+            self.selected = cell;
+            return true;
+        };
+        // The resource is an entry's identity, as `/stepcrafter requester add` replaces rather than
+        // duplicating one: two entries for one item are refused, and the click changes nothing.
+        if self
+            .filters
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| index != cell && entry.filter().item() == item)
+        {
+            return false;
+        }
+        if cell < self.filters.len() {
+            let Some(entry) = self.filters.entry(cell) else {
+                return false;
+            };
+            if entry.filter().item() == item {
+                // The same resource on its own slot: this click only focuses it.
+                if self.selected == cell {
+                    return false;
+                }
+                self.selected = cell;
+                return true;
+            }
+            // Another resource on this slot keeps the band and batch the player set for it, and
+            // drops the link, phase and timeout, which belonged to the old resource's crafter.
+            let Some(filter) = Filter::new(
+                item.to_owned(),
+                entry.filter().band(),
+                entry.filter().batch(),
+            ) else {
+                return false;
+            };
+            self.filters.replace(cell, filter);
+            self.selected = cell;
+            return true;
+        }
+        if cell > self.filters.len() {
+            return false;
+        }
+        // The next free cell: upstream's empty filter slot, at 0..0 with the batch off.
+        let Some(band) = Band::new(0, 0) else {
+            return false;
+        };
+        let Some(filter) = Filter::new(item.to_owned(), band, 0) else {
+            return false;
+        };
+        if self.filters.set(filter).is_err() {
+            return false;
+        }
+        self.selected = cell;
+        true
+    }
+
+    /// One value button on the selected entry.
+    fn step(&mut self, field: Field, direction: Direction) -> bool {
+        let Some(entry) = self.filters.entry(self.selected) else {
+            return false;
+        };
+        let filter = entry.filter();
+        let (min, max, batch) = (filter.band().min(), filter.band().max(), filter.batch());
+        let up = direction == Direction::Up;
+        let (min, max, batch) = match field {
+            // The band stays valid: `min` never passes `max`, `max` never drops below it, and no
+            // amount is negative.
+            Field::Min if up && min < max => (min + 1, max, batch),
+            Field::Min if !up && min > 0 => (min - 1, max, batch),
+            Field::Max if up && max < SCREEN_MAX => (min, max + 1, batch),
+            Field::Max if !up && max > min => (min, max - 1, batch),
+            Field::Batch if up && batch < SCREEN_MAX => (min, max, batch + 1),
+            Field::Batch if !up && batch > 0 => (min, max, batch - 1),
+            Field::Min | Field::Max | Field::Batch => return false,
+        };
+        let Some(band) = Band::new(min, max) else {
+            return false;
+        };
+        let Some(filter) = Filter::new(filter.item().to_owned(), band, batch) else {
+            return false;
+        };
+        // The resource is unchanged, so the entry keeps the crafter it linked and its timeout.
+        self.filters.retune(self.selected, filter);
+        true
+    }
+
+    /// Drop the entry the buttons were editing; the selection stays inside the container.
+    fn remove(&mut self) -> bool {
+        if self.selected >= self.filters.len() {
+            return false;
+        }
+        let item = self
+            .filters
+            .entry(self.selected)
+            .map(|entry| entry.filter().item().to_owned());
+        let Some(item) = item else {
+            return false;
+        };
+        let removed = self.filters.remove(&item);
+        self.selected = self.selected.min(self.filters.len());
+        removed
+    }
+
+    /// The menu's data slots: the count, the selected cell and that entry's band and batch, which
+    /// is what the screen draws and the client refreshes as the entry changes.
+    #[must_use]
+    pub fn data_slots(&self) -> [i32; 5] {
+        view_data_slots(&self.filters, self.selected)
+    }
+
+    /// What the entries' cells show: the resources in order, which the screen's open payload
+    /// carries (the numbers are the data slots).
+    #[must_use]
+    pub fn extra_data(&self) -> String {
+        view_extra_data(&self.filters)
+    }
+}
+
+/// A requester's menu data slots without an editor: the count, the selected cell and that entry's
+/// band and batch. A block entity publishes these every tick, which is how the screen's numbers
+/// follow a press.
+#[must_use]
+pub fn view_data_slots(filters: &Filters, selected: usize) -> [i32; 5] {
+    let selected = selected.min(filters.len());
+    let count = slot_value(filters.len() as u64);
+    let Some(entry) = filters.entry(selected) else {
+        return [count, slot_value(selected as u64), 0, 0, 0];
+    };
+    [
+        count,
+        slot_value(selected as u64),
+        slot_value(entry.filter().band().min()),
+        slot_value(entry.filter().band().max()),
+        slot_value(entry.filter().batch()),
+    ]
+}
+
+/// The open screen's payload: the entries' resources in cell order, one namespaced id per line.
+#[must_use]
+pub fn view_extra_data(filters: &Filters) -> String {
+    let items: Vec<&str> = filters.iter().map(|entry| entry.filter().item()).collect();
+    items.join("\n")
+}
+
+/// The three values a screen button steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Min,
+    Max,
+    Batch,
+}
+
+/// Which way a value button steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+/// An amount as a menu data slot: the wire's 16 bits, never a wrapped negative.
+fn slot_value(amount: u64) -> i32 {
+    i32::try_from(amount.min(u64::try_from(i16::MAX).unwrap_or(0))).unwrap_or(0)
+}
+
+/// Whether `text` is a namespaced item id (`namespace:path`), the only thing a screen payload
+/// carries for a cell.
+fn is_item_id(text: &str) -> bool {
+    match text.split_once(':') {
+        Some((namespace, path)) => {
+            !namespace.is_empty() && !path.is_empty() && !text.chars().any(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
+/// The resources an open screen's payload lists, in cell order. An empty payload and a malformed
+/// one both list nothing, so a screen without entries draws empty cells rather than guessing.
+#[must_use]
+pub fn extra_items(data: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Vec::new();
+    };
+    let items: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if items.iter().all(|item| is_item_id(item)) {
+        items
+    } else {
+        Vec::new()
     }
 }
 
@@ -1821,6 +2180,279 @@ mod tests {
         assert!(
             Filters::decode(&["nonsense".to_owned()]).is_empty(),
             "a malformed entry is skipped, not guessed at"
+        );
+    }
+
+    /// The screen's buttons are one vocabulary: a press that reaches the server must be the press
+    /// the client sent, or a click edits a different entry than the one under the pointer.
+    #[test]
+    fn a_press_round_trips_through_its_button_id() {
+        assert_eq!(Press::of(100), Some(Press::Cell(0)));
+        assert_eq!(Press::of(144), Some(Press::Cell(44)));
+        for (button, press) in [
+            (200, Press::MinDown),
+            (201, Press::MinUp),
+            (202, Press::MaxDown),
+            (203, Press::MaxUp),
+            (204, Press::BatchDown),
+            (205, Press::BatchUp),
+            (206, Press::Remove),
+        ] {
+            assert_eq!(Press::of(button), Some(press));
+            assert_eq!(press.button(), button);
+        }
+        assert_eq!(Press::Cell(3).button(), 103);
+        assert_eq!(Press::of(145), None, "a 46th cell is not a filter slot");
+        assert_eq!(Press::of(207), None);
+        assert_eq!(Press::of(-1), None);
+    }
+
+    /// Upstream's screen edits a filter slot: a cell with nothing carried selects it, and a click
+    /// with a resource carried is how an entry is made at all.
+    #[test]
+    fn a_click_on_an_empty_cell_with_a_carried_item_adds_the_entry() {
+        let mut editor = Editor::new(Filters::new(), 0);
+        assert!(editor.apply(Press::Cell(0), Some("minecraft:torch")));
+        assert_eq!(editor.count(), 1);
+        let entry = editor.filters().first().expect("the new entry");
+        assert_eq!(entry.filter().item(), "minecraft:torch");
+        assert_eq!(entry.filter().band(), band(0, 0));
+        assert_eq!(entry.filter().batch(), 0);
+        assert_eq!(editor.selected(), 0);
+        assert!(
+            !editor.apply(Press::Cell(0), None),
+            "an empty hand on the cell that is already focused changes nothing"
+        );
+        assert_eq!(editor.count(), 1, "an empty hand never adds an entry");
+        assert!(
+            editor.apply(Press::Cell(1), None),
+            "an empty hand focuses the next free cell, the one a click would fill"
+        );
+        assert_eq!(editor.selected(), 1);
+        assert_eq!(editor.count(), 1);
+    }
+
+    /// A click on a filled cell selects that entry; it is what the value buttons then edit.
+    #[test]
+    fn a_click_on_a_filled_cell_selects_it() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let mut editor = Editor::new(filters, 0);
+        assert!(editor.apply(Press::Cell(1), None));
+        assert_eq!(editor.selected(), 1);
+        assert_eq!(
+            editor.filters().first().map(|e| e.filter().item()),
+            Some("minecraft:torch"),
+            "selecting the second entry did not touch the first"
+        );
+    }
+
+    /// Upstream's slot takes another resource when one is clicked onto it: the entry keeps its band
+    /// and batch, because those are what the player set for *that* slot.
+    #[test]
+    fn a_click_with_another_item_repoints_the_entry_and_keeps_its_band() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert!(editor.apply(Press::Cell(0), Some("minecraft:stick")));
+        assert_eq!(editor.count(), 1);
+        let entry = editor.filters().first().expect("the entry");
+        assert_eq!(entry.filter().item(), "minecraft:stick");
+        assert_eq!(entry.filter().band(), band(4, 8));
+        assert_eq!(entry.filter().batch(), 4);
+    }
+
+    /// The resource is an entry's identity, as the command's add-or-replace rule says: a click that
+    /// would leave two entries maintaining one item is refused and both entries stay as they were.
+    #[test]
+    fn a_click_that_would_give_two_entries_one_resource_is_refused() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let mut editor = Editor::new(filters, 1);
+        assert!(!editor.apply(Press::Cell(0), Some("minecraft:stick")));
+        let before = Editor::new(editor.filters().clone(), 1);
+        assert_eq!(editor, before, "the refused click changed nothing");
+        assert_eq!(editor.count(), 2);
+    }
+
+    /// A step keeps the band valid: `min` never passes `max` and `max` never drops below `min`, the
+    /// same rule `/stepcrafter configure` answers "min 9 is above max 4" with.
+    #[test]
+    fn a_step_keeps_the_band_valid() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert!(editor.apply(Press::MinUp, None));
+        assert!(editor.apply(Press::MinUp, None));
+        assert!(editor.apply(Press::MinUp, None));
+        assert!(editor.apply(Press::MinUp, None));
+        let entry = editor.filters().first().expect("the entry");
+        assert_eq!(entry.filter().band(), band(8, 8), "four ups reached max");
+        assert!(!editor.apply(Press::MinUp, None), "min cannot pass max");
+        assert!(
+            !editor.apply(Press::MaxDown, None),
+            "max cannot drop below min"
+        );
+        assert!(editor.apply(Press::MaxUp, None));
+        assert_eq!(
+            editor.filters().first().expect("the entry").filter().band(),
+            band(8, 9)
+        );
+    }
+
+    /// No amount is negative: a fresh entry is 0..0 with batch 0, and pressing every `-` on it
+    /// changes nothing (upstream reads a zero batch as a disabled slot, not a negative one).
+    #[test]
+    fn a_step_never_goes_below_zero_and_a_zero_batch_stays_disabled() {
+        let mut filters = Filters::new();
+        filters
+            .set(Filter::new("minecraft:stick".to_owned(), band(0, 0), 0).expect("a filter"))
+            .expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert!(!editor.apply(Press::MinDown, None));
+        assert!(!editor.apply(Press::MaxDown, None));
+        assert!(!editor.apply(Press::BatchDown, None));
+        let entry = editor.filters().first().expect("the entry");
+        assert_eq!(entry.filter().band(), band(0, 0));
+        assert_eq!(entry.filter().batch(), 0);
+        // And a step that is allowed does move: the same entry's maximum, then its minimum.
+        assert!(editor.apply(Press::MaxUp, None));
+        assert!(editor.apply(Press::MinUp, None));
+        let entry = editor.filters().first().expect("the entry");
+        assert_eq!(entry.filter().band(), band(1, 1));
+    }
+
+    /// A zero batch is upstream's disabled slot; one press makes the entry ask, which is how a
+    /// filter set up in a screen starts working.
+    #[test]
+    fn a_batch_step_enables_an_entry() {
+        let mut filters = Filters::new();
+        filters
+            .set(Filter::new("minecraft:stick".to_owned(), band(0, 0), 0).expect("a filter"))
+            .expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert!(editor.apply(Press::BatchUp, None));
+        let entry = editor.filters().first().expect("the entry");
+        assert_eq!(entry.filter().batch(), 1);
+        assert_eq!(entry.filter().band(), band(0, 0));
+    }
+
+    /// Remove drops the cell the buttons were editing and keeps the others, and the selection stays
+    /// inside the container.
+    #[test]
+    fn a_remove_press_drops_the_selected_entry_and_keeps_the_others() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let mut editor = Editor::new(filters, 0);
+        assert!(editor.apply(Press::Remove, None));
+        assert_eq!(editor.count(), 1);
+        assert_eq!(
+            editor.filters().first().map(|e| e.filter().item()),
+            Some("minecraft:stick")
+        );
+        assert_eq!(editor.selected(), 0);
+        assert!(editor.apply(Press::Remove, None));
+        assert_eq!(editor.count(), 0);
+        assert!(!editor.apply(Press::Remove, None), "nothing left to remove");
+    }
+
+    /// A cell past the next free one is a blank frame: it has no entry to select and no resource to
+    /// make one from.
+    #[test]
+    fn a_cell_beyond_the_next_free_one_changes_nothing() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert!(!editor.apply(Press::Cell(7), Some("minecraft:stick")));
+        assert_eq!(editor.count(), 1);
+        assert_eq!(editor.selected(), 0);
+        assert!(
+            editor.apply(Press::Cell(1), Some("minecraft:stick")),
+            "the next free cell takes the entry"
+        );
+        assert_eq!(editor.count(), 2);
+        assert_eq!(editor.selected(), 1);
+    }
+
+    /// A container with no entries has nothing to step: the screen's buttons do nothing.
+    #[test]
+    fn a_step_on_an_empty_requester_changes_nothing() {
+        let mut editor = Editor::new(Filters::new(), 0);
+        for press in [
+            Press::MinUp,
+            Press::MaxUp,
+            Press::BatchUp,
+            Press::MinDown,
+            Press::Remove,
+        ] {
+            assert!(!editor.apply(press, None));
+        }
+        assert_eq!(editor.count(), 0);
+    }
+
+    /// The data slots are the screen's live numbers: the count, the selected cell and that entry's
+    /// band and batch, which is what the client draws as the player presses.
+    #[test]
+    fn the_data_slots_are_the_selected_entry() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let editor = Editor::new(filters, 1);
+        assert_eq!(editor.data_slots(), [2, 1, 8, 16, 8]);
+        let empty = Editor::new(Filters::new(), 0);
+        assert_eq!(
+            empty.data_slots(),
+            [0, 0, 0, 0, 0],
+            "an unconfigured requester shows an empty first cell"
+        );
+    }
+
+    /// The screen's payload lists the entries' resources in cell order; a payload that is not that
+    /// list draws no icons rather than guessing at one.
+    #[test]
+    fn the_screen_payload_lists_every_entrys_resource() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let payload = Editor::new(filters, 0).extra_data();
+        assert_eq!(
+            extra_items(payload.as_bytes()),
+            vec!["minecraft:torch", "minecraft:stick"]
+        );
+        assert!(extra_items(b"").is_empty());
+        assert!(extra_items(b"nonsense").is_empty(), "a bare id-less line");
+        assert_eq!(
+            extra_items(b"minecraft:torch\nminecraft:stick\n"),
+            vec!["minecraft:torch", "minecraft:stick"]
+        );
+    }
+
+    /// The screen and `/stepcrafter requester` are one container: an entry the command adds is in
+    /// the screen's cells, and an entry the screen makes is in the saved form the command reads.
+    #[test]
+    fn the_editor_and_the_command_are_one_container() {
+        let mut filters = Filters::new();
+        filters.set(torches(4)).expect("room for the entry");
+        let mut editor = Editor::new(filters, 0);
+        assert_eq!(editor.data_slots()[0], 1, "the command's entry is a cell");
+        assert!(editor.apply(Press::Cell(1), Some("minecraft:stick")));
+        assert!(editor.apply(Press::MaxUp, None), "the new entry's max");
+        assert!(editor.apply(Press::BatchUp, None), "and its batch");
+        let saved = editor.into_filters();
+        let read_back = Filters::decode(&saved.encode());
+        assert_eq!(read_back, saved, "the screen's edit is the saved container");
+        assert_eq!(read_back.len(), 2);
+        assert_eq!(
+            read_back.first().map(|e| e.filter().item()),
+            Some("minecraft:torch")
+        );
+        assert_eq!(
+            read_back.iter().nth(1).map(|e| e.filter().band()),
+            Some(band(0, 1)),
+            "the stick entry is what the screen set: max 1"
         );
     }
 

@@ -14,7 +14,8 @@
 //! port boundary, and neither block needs the other's crate.
 
 use mod_api::{
-    BlockEntityRef, BlockEntityTickEvent, Compound, Host, LevelRef, Registrar, ServerHost, Tag,
+    BlockEntityRef, BlockEntityTickEvent, Compound, Host, LevelRef, MenuButtonEvent, ModContainer,
+    Registrar, ServerHost, Tag,
 };
 
 use crate::machine;
@@ -25,6 +26,12 @@ use crate::runtime::{self, Ask, Band, Entry, Filter, Filters, Phase};
 pub const TYPE: &str = "step_requester";
 /// The requester block (upstream's own, with its `active` state).
 pub const BLOCK: &str = "stepcrafter:step_requester";
+/// The menu type the content declares (`data/stepcrafter/horizon/menu/step_requester_filters.json`): one
+/// hidden slot and the five data slots the screen reads.
+pub const MENU: &str = "stepcrafter:step_requester_filters";
+/// The menu's container slots: upstream's 45 filter slots are ghost entries, not storage, so the
+/// container the menu needs is a single hidden slot no face reaches.
+const MENU_SLOTS: usize = 1;
 
 /// The cube, in blocks each way, a requester looks for a crafter in. Upstream's reach is the
 /// network's; this is the documented re-root: `LINK_RADIUS` blocks along each axis, nearest first.
@@ -33,6 +40,8 @@ pub const LINK_RADIUS: i32 = 4;
 /// Upstream's `rf` container: one saved string per filter entry.
 const KEY_FILTERS: &str = "Filters";
 const KEY_REQUESTS: &str = "Requests";
+/// The filter cell the screen's value buttons edit, so a reopened screen shows the same entry.
+const KEY_SELECTED: &str = "Selected";
 /// The 0.2.1–0.2.4 single-entry keys. Read as one entry when a compound has no `Filters`, and
 /// dropped on the next write; a world made by the older package keeps its filter.
 const KEY_ITEM: &str = "FilterItem";
@@ -43,15 +52,30 @@ const KEY_PHASE: &str = "Phase";
 const KEY_LINK: &str = "Link";
 const KEY_BACKOFF: &str = "Backoff";
 
-/// Declare the requester's block entity type and the Part that ticks it.
+/// Declare the requester's block entity type, the menu its container opens, and the Part that ticks
+/// it.
 pub fn declare(r: &mut dyn Registrar) {
     let kind = r
         .block_entity_type(TYPE)
         .blocks(&["step_requester"])
         .build();
+    let block = r.block_key(BLOCK);
+    r.block_container(&block, container());
     // A refusal is the game's to report at load; the Part is then unattached and the block keeps
     // no state, which the load log states.
     let _ = r.block_entity_part(&kind, crate::Requester);
+}
+
+/// The requester's container: the one hidden slot its menu type needs, on no face (a filter entry
+/// is a resource, a band and a batch in the saved compound, never an item to pump in and out).
+pub(crate) fn container() -> ModContainer {
+    ModContainer {
+        slots: MENU_SLOTS,
+        faces: std::array::from_fn(|_| Vec::new()),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        menu: Some(MENU.to_owned()),
+    }
 }
 
 /// What one requester is configured to maintain.
@@ -61,6 +85,8 @@ pub struct State {
     pub filters: Filters,
     /// How many asks this requester has issued in all (the harness readout).
     pub requests: u64,
+    /// The filter cell the screen's value buttons edit (`0` on a fresh requester).
+    pub selected: usize,
 }
 
 impl State {
@@ -90,6 +116,7 @@ pub fn read(nbt: &Compound) -> State {
     State {
         filters,
         requests: amount(nbt, KEY_REQUESTS),
+        selected: usize::try_from(amount(nbt, KEY_SELECTED)).unwrap_or(0),
     }
 }
 
@@ -139,6 +166,11 @@ pub fn write(nbt: &mut Compound, state: &State) {
         );
     }
     put(nbt, KEY_REQUESTS, int_of(state.requests));
+    put(
+        nbt,
+        KEY_SELECTED,
+        int_of(state.selected.try_into().unwrap_or(u64::MAX)),
+    );
     for key in [
         KEY_ITEM,
         KEY_MIN,
@@ -161,6 +193,9 @@ pub fn write(nbt: &mut Compound, state: &State) {
 pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     let me = event.pos;
     let mut state = read(&event.entity.nbt);
+    // The screen's numbers are the menu's data slots, which are a view and not saved: publish them
+    // every tick, so a press shows as it lands and a reopened menu opens on the selected entry.
+    event.entity.data = runtime::view_data_slots(&state.filters, state.selected).to_vec();
     if state.filters.is_empty() {
         machine::sync_active(host, me, false);
         return;
@@ -330,6 +365,48 @@ fn ask_crafter(host: &mut dyn ServerHost, entity: BlockEntityRef, amount: u64) {
     let mut data = Compound::new();
     put(&mut data, machine::KEY_REQUEST, int_of(amount));
     let _ = entity.merge_data(host, data);
+}
+
+/// One press on a requester's screen, on the server (`menu_button`): the item the player carries
+/// makes or repoints a cell's entry, a cell focuses the entry the value buttons edit, and those
+/// buttons step the focused entry's band and batch. The saved container and `/stepcrafter
+/// requester` are the same `Filters`, so a press and a command cannot disagree.
+pub fn press(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+    let Some(press) = runtime::Press::of(event.context.id) else {
+        return;
+    };
+    let carried = {
+        let host: &dyn Host = &*host;
+        event.carried.as_ref().map(|stack| stack.item().id(host))
+    };
+    let state = read(&event.entity.nbt);
+    let mut editor = runtime::Editor::new(state.filters, state.selected);
+    if !editor.apply(press, carried.as_deref()) {
+        return;
+    }
+    let selected = editor.selected();
+    let state = State {
+        filters: editor.into_filters(),
+        requests: state.requests,
+        selected,
+    };
+    write(&mut event.entity.nbt, &state);
+    // Publish at once rather than waiting for the next tick: the client redraws the number the
+    // player just stepped.
+    event.entity.data = runtime::view_data_slots(&state.filters, state.selected).to_vec();
+}
+
+/// The screen's open payload (`menu_extra_data`): the entries' resources in cell order, so the
+/// client draws each cell's icon. The numbers are the menu's data slots, which change as the player
+/// presses; a resource set from the screen shows its icon again when the menu is reopened.
+#[must_use]
+pub fn extra_data(host: &dyn Host, level: LevelRef, pos: [i32; 3], menu: &str) -> Option<Vec<u8>> {
+    if menu != MENU {
+        return None;
+    }
+    let entity = host.block_entity(level, pos)?;
+    let data = entity.data(host)?;
+    Some(runtime::view_extra_data(&read(&data).filters).into_bytes())
 }
 
 /// Where a requester's crafter is this tick.
@@ -503,6 +580,7 @@ mod tests {
         let state = State {
             filters,
             requests: 3,
+            selected: 1,
         };
         let mut nbt = Compound::new();
         write(&mut nbt, &state);
@@ -568,7 +646,8 @@ mod tests {
         assert_eq!(
             State {
                 filters: running,
-                requests: 0
+                requests: 0,
+                selected: 0
             }
             .phase_id(),
             "running"
@@ -582,7 +661,8 @@ mod tests {
         assert_eq!(
             State {
                 filters: blocked,
-                requests: 0
+                requests: 0,
+                selected: 0
             }
             .phase_id(),
             "not-enough-ingredients"
@@ -595,5 +675,41 @@ mod tests {
         assert_eq!(parse_pos("218,64"), None);
         assert_eq!(parse_pos("218,64,0,1"), None);
         assert_eq!(parse_pos("a,b,c"), None);
+    }
+
+    /// The menu type declares as many data slots as the screen publishes, and the selected cell
+    /// survives a save: a reopened screen shows the entry the buttons were editing.
+    #[test]
+    fn the_menu_declares_the_slots_the_screen_publishes() {
+        // The content menu is what the engine sizes the data slots from; the screen publishes an
+        // array, so the two are checked against each other rather than against a constant.
+        let declared = include_str!("../data/stepcrafter/horizon/menu/step_requester_filters.json");
+        let published = runtime::view_data_slots(&Filters::new(), 0).len();
+        assert!(
+            declared.contains(&format!("\"data_slots\": {published}")),
+            "the menu's data_slots must be the {published} the screen publishes: {declared}"
+        );
+        assert!(
+            declared.contains("\"slots\": 1"),
+            "the menu has the container's one hidden slot: {declared}"
+        );
+        let mut filters = Filters::new();
+        filters.set(torches()).expect("room for the first");
+        filters.set(sticks()).expect("room for the second");
+        let state = State {
+            filters,
+            requests: 0,
+            selected: 1,
+        };
+        let mut nbt = Compound::new();
+        write(&mut nbt, &state);
+        assert_eq!(read(&nbt), state);
+        assert_eq!(
+            read(&nbt).selected,
+            1,
+            "the screen opens on the cell it last edited"
+        );
+        let empty = read(&Compound::new());
+        assert_eq!(empty.selected, 0, "a fresh requester edits its first cell");
     }
 }
