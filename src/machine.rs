@@ -200,13 +200,23 @@ pub fn write(nbt: &mut Compound, state: &State) {
 
 /// The machine's 27 slots as the rules see them: each stack's item, count and stack limit, with
 /// `empty_room` as the room an empty slot offers for the step's result.
+///
+/// A stack carrying components (a name, an enchantment, damage) is a [`Slot::patched`] slot: the
+/// step inserts plain items, so that stack is no room for the result. The predicate is the one the
+/// real insert uses ([`ItemStack::is_stackable_with`] against the plain stack), so the room check
+/// and [`put_into_slots`] cannot disagree about what a slot will take.
 #[must_use]
 pub fn slots_of(host: &dyn Host, items: &[Option<ItemStack>], empty_room: u32) -> Slots {
     let mut slots = Slots::new(empty_room);
     for stack in items {
         slots.push(stack.as_ref().and_then(|stack| {
-            let max = host.max_stack_size(stack.item()).unwrap_or(64).max(1);
-            Slot::new(stack.item().id(host), stack.count(), max)
+            let key = stack.item();
+            let max = host.max_stack_size(key).unwrap_or(64).max(1);
+            if stack.is_stackable_with(&ItemStack::of(key)) {
+                Slot::new(key.id(host), stack.count(), max)
+            } else {
+                Slot::patched(key.id(host), stack.count(), max)
+            }
         }));
     }
     slots
@@ -385,9 +395,14 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 break;
             }
             Outcome::Craft { result_count, .. } => {
-                apply_craft(host, &mut event.entity.items, &outcome);
-                state.crafted = state.crafted.saturating_add(u64::from(*result_count));
-                state.phase = Phase::Crafting;
+                if apply_craft(host, &mut event.entity.items, &outcome) {
+                    state.crafted = state.crafted.saturating_add(u64::from(*result_count));
+                    state.phase = Phase::Crafting;
+                } else {
+                    // The real merge rule had no room the room model counted: refuse the step
+                    // instead of consuming its ingredients and losing the result.
+                    state.phase = Phase::NetworkFull;
+                }
                 changed = true;
             }
             Outcome::NotEnoughIngredients { .. } => {
@@ -424,10 +439,14 @@ fn serve_request(
     let outcome = runtime::step_now(&slots, state.pattern.as_ref());
     match &outcome {
         Outcome::Craft { result_count, .. } => {
-            apply_craft(host, &mut event.entity.items, &outcome);
-            state.crafted = state.crafted.saturating_add(u64::from(*result_count));
-            state.request = state.request.saturating_sub(u64::from(*result_count));
-            state.phase = Phase::Crafting;
+            if apply_craft(host, &mut event.entity.items, &outcome) {
+                state.crafted = state.crafted.saturating_add(u64::from(*result_count));
+                state.request = state.request.saturating_sub(u64::from(*result_count));
+                state.phase = Phase::Crafting;
+            } else {
+                state.request = 0;
+                state.phase = Phase::NetworkFull;
+            }
         }
         Outcome::NotEnoughIngredients { .. } => {
             state.request = 0;
@@ -446,6 +465,10 @@ fn serve_request(
 
 /// Take one step now, whatever the band says: the harness driver that proves a single step without
 /// waiting for the stock to fall, and the player's manual step. Answers the outcome's name.
+///
+/// A refusal is recorded in the machine's `Phase` exactly as a tick-driven attempt records it: the
+/// readout means "where the last step left this machine", and a manual step is a step (0.2.4: the
+/// component-room refusal has to be readable as `phase=network-full`).
 pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
     let Some(entity) = host.block_entity(level, pos) else {
         return "no-block-entity".to_owned();
@@ -462,25 +485,47 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
     };
     let slots = slots_with_rooms(&*host, &items, state.pattern.as_ref());
     let outcome = runtime::step_now(&slots, state.pattern.as_ref());
-    match &outcome {
+    let result = match &outcome {
         Outcome::Craft { result_count, .. } => {
-            apply_craft(host, &mut items, &outcome);
-            state.crafted = state.crafted.saturating_add(u64::from(*result_count));
-            state.phase = Phase::Crafting;
-            write(&mut nbt, &state);
-            let _ = entity.replace_data(&mut *host, nbt);
-            replace_items(host, entity, &items);
-            "crafted".to_owned()
+            if apply_craft(host, &mut items, &outcome) {
+                state.crafted = state.crafted.saturating_add(u64::from(*result_count));
+                state.phase = Phase::Crafting;
+                "crafted"
+            } else {
+                state.phase = Phase::NetworkFull;
+                "network-full"
+            }
         }
-        Outcome::Hold => "held".to_owned(),
-        Outcome::Finished => "finished".to_owned(),
-        Outcome::NotEnoughIngredients { .. } => "not-enough-ingredients".to_owned(),
-        Outcome::NetworkFull { .. } => "network-full".to_owned(),
-    }
+        // Nothing to record: no pattern, or a run that already ended.
+        Outcome::Hold => return "held".to_owned(),
+        Outcome::Finished => return "finished".to_owned(),
+        Outcome::NotEnoughIngredients { .. } => {
+            state.phase = Phase::NotEnoughIngredients;
+            "not-enough-ingredients"
+        }
+        Outcome::NetworkFull { .. } => {
+            state.phase = Phase::NetworkFull;
+            "network-full"
+        }
+    };
+    write(&mut nbt, &state);
+    let _ = entity.replace_data(&mut *host, nbt);
+    replace_items(host, entity, &items);
+    result.to_owned()
 }
 
 /// Commit one step: the ingredients out, then the result and what the recipe leaves in.
-fn apply_craft(host: &mut dyn ServerHost, items: &mut [Option<ItemStack>], outcome: &Outcome) {
+///
+/// This is the dry run the room model promises, made with the **real** merge rule: the whole
+/// outcome is applied to a copy of the slots first, and every insert must go in completely. If one
+/// does not, the step is refused with nothing consumed — a result the machine counted as crafted
+/// can never be silently lost (the 0.2.4 component-agnostic room defect). Answers whether it
+/// committed.
+fn apply_craft(
+    host: &mut dyn ServerHost,
+    items: &mut [Option<ItemStack>],
+    outcome: &Outcome,
+) -> bool {
     let Outcome::Craft {
         consume,
         result,
@@ -488,13 +533,27 @@ fn apply_craft(host: &mut dyn ServerHost, items: &mut [Option<ItemStack>], outco
         remainders,
     } = outcome
     else {
-        return;
+        return false;
     };
-    take_from_slots(&*host, items, consume);
-    put_item(host, items, result, *result_count);
-    for (item, count) in remainders {
-        put_item(host, items, item, u32::try_from(*count).unwrap_or(u32::MAX));
+    let mut after = items.to_vec();
+    take_from_slots(&*host, &mut after, consume);
+    let inserted = std::iter::once((result, *result_count)).chain(
+        remainders
+            .iter()
+            .map(|(item, count)| (item, u32::try_from(*count).unwrap_or(u32::MAX))),
+    );
+    for (item, count) in inserted {
+        let Some(key) = item_key(&*host, item) else {
+            return false;
+        };
+        if put_into_slots(&*host, &mut after, key, count) != count {
+            return false;
+        }
     }
+    for (slot, stack) in items.iter_mut().zip(after) {
+        *slot = stack;
+    }
+    true
 }
 
 /// Write a machine's inventory back, one transactional slot write per changed slot.
@@ -515,21 +574,11 @@ pub fn replace_items(
     let _ = entity.set_changed(host);
 }
 
-/// Put one item into slots: existing stacks that hold the same components first, then the first
-/// empty slot. The id comes from the pattern, so an id this world does not know puts nothing in
-/// (the step's own room check already held the space). Used for the result and for what the recipe
-/// leaves.
-fn put_item(
-    host: &mut dyn ServerHost,
-    items: &mut [Option<ItemStack>],
-    item: &str,
-    count: u32,
-) {
-    if let Ok(id) = Identifier::parse(item)
-        && let Some(key) = host.item_key(&id)
-    {
-        put_into_slots(&*host, items, key, count);
-    }
+/// The key of an item id this world knows, or nothing.
+fn item_key(host: &dyn Host, item: &str) -> Option<ItemKey> {
+    Identifier::parse(item)
+        .ok()
+        .and_then(|id| host.item_key(&id))
 }
 
 /// The `active` state shows the machine is crafting (upstream's `active` is the network node's;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.3).
+# In-game check for Step Crafter (the SDK package, 0.2.4).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -47,6 +47,9 @@
 #    (1,724 of an aggregate 1,728) is asked for torches by a requester, and every ask is refused with
 #    nothing consumed, nothing crafted and the ask not served (the free room after the ingredients
 #    are taken is per slot, not the inventory's item count);
+#  - a named stack of the target is no room for the step's plain result: the same 1,724-item machine
+#    with 60 **named** torches refuses the step (network-full, nothing consumed, stock unchanged),
+#    while the identical step beside a plain stack of 60 merges its four torches — the differential;
 #  - take hands over the stored stacks themselves: two differently named, damaged swords are taken
 #    and their custom names and damage are read back from the player's inventory;
 #  - a step leaves what its ingredients leave: a cake step from 3 milk buckets, 2 sugar, an egg and
@@ -57,6 +60,8 @@
 # SELFTEST=1 flips the requester's headline assertion (`stored=8`), so the run must end `EXIT:1`;
 # SELFTEST=crafter flips the machine's first "filled to the maximum" assertion instead;
 # SELFTEST=capacity flips the no-room assertion (nothing fit, so nothing was served);
+# SELFTEST=components-room flips the component-room assertion (the named stack counted no room and
+# the step was refused, so the fixed package must fail an inverted run);
 # SELFTEST=take flips the component assertion (a stack rebuilt from its id reads no components);
 # SELFTEST=remainder flips the remainder assertion (today's defect: the buckets are destroyed).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
@@ -142,8 +147,8 @@ arena() {
         fi
     done
     [ "$loaded" = true ] || fail "the End arena chunk never loaded"
-    ctl command "execute in minecraft:the_end run fill 192 63 -8 220 63 8 minecraft:stone"
-    ctl command "execute in minecraft:the_end run fill 192 64 -8 220 74 8 minecraft:air"
+    ctl command "execute in minecraft:the_end run fill 192 63 -8 226 63 8 minecraft:stone"
+    ctl command "execute in minecraft:the_end run fill 192 64 -8 226 74 8 minecraft:air"
     ctl command "execute in minecraft:the_end run kill @e[type=!player]"
     ctl command "gamemode creative"
     ctl wait 20
@@ -186,6 +191,27 @@ box() { # X Y Z
     ctl container "$1" "$2" "$3" | jq -c '[.slots[] | select(. != null) | {item, count}]'
 }
 
+# Plant the 27 slots of the component-room machines directly in the block entity, through the
+# pin's `/data merge block` path: a stack of the target (named or plain) with 4 of nominal room and
+# the torch recipe's ingredients filling every other slot (so no slot is empty). 25 coal stacks plus
+# the stick are the recipe's two cells; the brief's literal 26 coal stacks leave no stick, so the
+# step would stop at `not-enough-ingredients` before the room check this leg is about.
+plant_room() { # X Y Z named|plain
+    local torch
+    if [ "$4" = named ]; then
+        torch='{Slot:0b,id:"minecraft:torch",count:60,components:{"minecraft:custom_name":"Kept"}}'
+    else
+        torch='{Slot:0b,id:"minecraft:torch",count:60}'
+    fi
+    local items=$torch slot
+    for slot in $(seq 1 25); do
+        items="$items,{Slot:${slot}b,id:\"minecraft:coal\",count:64}"
+    done
+    items="$items,{Slot:26b,id:\"minecraft:stick\",count:64}"
+    ctl command "execute in minecraft:the_end run data merge block $1 $2 $3 {Items:[$items]}" >/dev/null
+    ctl wait 6
+}
+
 # Whether a block's `active` state is `true`/`false` right now: the game's own predicate, so the
 # answer is parsed from chat (`Test passed` / `Test failed`), not guessed from the id.
 active_is() { # X Y Z true|false [BLOCK]
@@ -218,7 +244,12 @@ control_leg() {
 echo "== the package carries upstream's licence and the port's own assets =="
 [ -f "$PORT/stepcrafter.hmod" ] || abort "no package at $PORT/stepcrafter.hmod"
 unzip -p "$PORT/stepcrafter.hmod" LICENSE >/dev/null 2>&1 || abort "the package carries no LICENSE"
-unzip -l "$PORT/stepcrafter.hmod" | grep -q 'step_crafter_inactive.json' \
+# List to a file, not `| grep -q`: under `set -o pipefail` a grep that exits on its match can
+# fail the pipeline on the writer's SIGPIPE (`unzip` did once, on 2026-11-23), which reads as a
+# missing model.
+unzip -l "$PORT/stepcrafter.hmod" > "$SCRATCH/package-entries.txt" 2>/dev/null \
+    || abort "the package cannot be listed"
+grep -q 'step_crafter_inactive.json' "$SCRATCH/package-entries.txt" \
     || abort "the package carries no block model"
 echo "  LICENSE and the block model are inside the archive"
 
@@ -434,7 +465,8 @@ case "$STEPPED" in
     *) fail "the manual step did not craft: $STEPPED" ;;
 esac
 expect 206 64 0 "stored=4 phase=idle cells=2 result=minecraft:torch:4 crafted=4"
-# With no ingredients one more step reports the refusal instead of crafting.
+# With no ingredients one more step reports the refusal instead of crafting, and records it in the
+# machine's `phase` exactly as a tick-driven attempt does (0.2.4: a manual step is a step).
 say "stepcrafter step 206 64 0"
 STEP2=$(reply '^stepcrafter step 206 64 0 ')
 echo "  $STEP2"
@@ -442,7 +474,7 @@ case "$STEP2" in
     *"result=not-enough-ingredients"*) ;;
     *) fail "a step with no ingredients was not refused: $STEP2" ;;
 esac
-expect 206 64 0 "stored=4 phase=idle cells=2 result=minecraft:torch:4 crafted=4"
+expect 206 64 0 "stored=4 phase=not-enough-ingredients cells=2 result=minecraft:torch:4 crafted=4"
 
 echo "== the run goes past the minimum to the maximum, and active follows it =="
 ctl command "execute in minecraft:the_end run setblock 210 64 0 $BLOCK"
@@ -701,6 +733,82 @@ if [ "$SELFTEST" = capacity ]; then
     esac
 fi
 
+echo "== a named stack of the target is no room for the step's plain result =="
+# The last silent-loss path (notes.md §6): the room model counted a stack of the result by item id,
+# so 60 named torches offered the 4 items of room their count left, while the insert merges only into
+# a stack with no components. The step counted four torches as crafted and stored none. The machine
+# here holds that named stack and the recipe's ingredients in every other slot (26 x 64 + 60 =
+# 1,724 items, none empty), so the only candidate for the result is the named stack: it must refuse.
+ctl command "execute in minecraft:the_end run setblock 221 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 221 64 0 minecraft:torch"
+reply '^stepcrafter target 221 64 0 ' >/dev/null
+say "stepcrafter configure 221 64 0 0 0"
+reply '^stepcrafter configure 221 64 0 ' >/dev/null
+plant_room 221 64 0 named
+NAMED_BEFORE=$(info 221 64 0)
+echo "  before the step: $NAMED_BEFORE"
+case "$NAMED_BEFORE" in
+    *"stored=60"*"items=1724"*"stock=minecraft:coal:1600,minecraft:stick:64,minecraft:torch:60"*) ;;
+    *) fail "the named torch stack and the full inventory were not planted: $NAMED_BEFORE" ;;
+esac
+say "stepcrafter step 221 64 0"
+NAMED_STEP=$(reply '^stepcrafter step 221 64 0 ')
+echo "  $NAMED_STEP"
+case "$NAMED_STEP" in
+    *"result=network-full"*) ;;
+    *) fail "a step whose result only fits a named stack was not refused: $NAMED_STEP" ;;
+esac
+NAMED=$(info 221 64 0)
+echo "  after the step: $NAMED"
+case "$NAMED" in
+    *"stored=60"*"phase=network-full"*"crafted=0"*) ;;
+    *) fail "the named stack counted room the game would not use: $NAMED" ;;
+esac
+case "$NAMED" in
+    *"stock=minecraft:coal:1600,minecraft:stick:64,minecraft:torch:60"*) ;;
+    *) fail "the refused step consumed ingredients: $NAMED" ;;
+esac
+if [ "$SELFTEST" = components-room ] || [ "$SELFTEST" = components ]; then
+    # The defect, deliberately asserted: today the step counted four torches it never stored beside
+    # the unchanged named stack. The package refuses it, so this inverted run must end non-zero.
+    case "$NAMED" in
+        *"phase=network-full"*"crafted=0"*)
+            fail "SELFTEST=components-room: the named stack counted no room and the step was refused — the fixed behaviour — and the run must end non-zero: $NAMED" ;;
+        *) ;;
+    esac
+fi
+
+echo "== the same step beside a plain stack merges its four torches (the differential) =="
+# Only the component patch differs from the machine above: a plain stack of 60 torches has the same
+# 4 items of nominal room, and this time the merge rule uses it.
+ctl command "execute in minecraft:the_end run setblock 222 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 222 64 0 minecraft:torch"
+reply '^stepcrafter target 222 64 0 ' >/dev/null
+say "stepcrafter configure 222 64 0 0 0"
+reply '^stepcrafter configure 222 64 0 ' >/dev/null
+plant_room 222 64 0 plain
+PLAIN_BEFORE=$(info 222 64 0)
+echo "  before the step: $PLAIN_BEFORE"
+case "$PLAIN_BEFORE" in
+    *"stored=60"*"items=1724"*"stock=minecraft:coal:1600,minecraft:stick:64,minecraft:torch:60"*) ;;
+    *) fail "the plain torch stack and the full inventory were not planted: $PLAIN_BEFORE" ;;
+esac
+say "stepcrafter step 222 64 0"
+PLAIN_STEP=$(reply '^stepcrafter step 222 64 0 ')
+echo "  $PLAIN_STEP"
+case "$PLAIN_STEP" in
+    *"result=crafted"*) ;;
+    *) fail "the same step beside a plain stack was refused: $PLAIN_STEP" ;;
+esac
+PLAIN=$(info 222 64 0)
+echo "  after the step: $PLAIN"
+case "$PLAIN" in
+    *"stored=64"*"crafted=4"*"stock=minecraft:coal:1599,minecraft:stick:63,minecraft:torch:64"*) ;;
+    *) fail "the four torches did not merge into the plain stack: $PLAIN" ;;
+esac
+
 echo "== take hands over the stored stacks: components and damage survive =="
 ctl command "execute in minecraft:the_end run setblock 218 64 0 $BLOCK"
 ctl wait 6
@@ -948,8 +1056,17 @@ ctl select 1 >/dev/null
 ctl wait 3
 # Step back off the block space: a player standing in it cannot place the machine there.
 ctl command "execute in minecraft:the_end run tp @s 214.5 64 3.5" >/dev/null
-ctl wait 6
-PLACED=$(ctl place 214 64 0 2>&1) || fail "cannot place the machine again: $PLACED"
+ctl wait 10
+# The break leaves the spilled stack as item entities; any that are still around the spot block
+# the placement ("blocked by an entity"), so clear the ones beside it (the drops were picked up
+# above, and `held`/`SPILLED` already asserted that).
+ctl command "execute in minecraft:the_end run kill @e[type=item,x=213,y=63,z=-1,dx=3,dy=4,dz=3]" >/dev/null 2>&1 || true
+ctl wait 4
+# `--item` selects the hotbar slot holding the machine by id, not by a remembered slot number; the
+# second attempt covers a teleport that lands after the first click's aim.
+PLACED=$(ctl place 214 64 0 --item "$BLOCK" 2>&1) \
+    || PLACED=$(ctl place 214 64 0 --item "$BLOCK" 2>&1) \
+    || fail "cannot place the machine again: $PLACED"
 ctl wait 10
 REPLACED=$(info 214 64 0)
 echo "  after placing it back: $REPLACED"
@@ -976,4 +1093,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

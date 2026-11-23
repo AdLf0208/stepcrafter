@@ -15,7 +15,7 @@ saved band and a tick — the machines shape, no entities, renderers or dimensio
 **Licence rank 0** (MIT, read from the jar's `META-INF/neoforge.mods.toml`; upstream's
 `LICENSE.txt` travels inside the package as `LICENSE`). Publishable under MIT with this source.
 
-**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-review`
+**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices`
 
 ---
 
@@ -163,6 +163,35 @@ touched here. The archive carries `LICENSE-NOTICE.md` (Ultramega, Starforcraft a
 `https://github.com/starforcraft/Step-Crafter`, verbatim) beside upstream's `LICENSE` verbatim; §5
 records both, and the packed `README.md` is the tree's current text (`cmp`-identical).
 
+## 2e. The slice (version 0.2.4): a named stack is no room for a step's plain result
+
+0.2.3's own gap line (§6) was the last silent-loss path in the step: `Slots` knew a slot's item,
+count and limit, and `machine::put_into_slots` merged a step's plain result only into a stack whose
+components match — but the room check (`Slots::room_for` / `Slots::put`) matched by item id alone.
+A machine holding 60 **named** torches offered the 4 items of room their count left; the step consumed
+a coal and a stick, the insert could not merge into the named stack, and the machine reported
+`crafted=4` while storing nothing. The room check and the insert were two rules for one inventory.
+
+What changed:
+
+- `runtime::Slot` carries whether it accepts a **plain** insert (`plain`): a stack with a component
+  patch or damage does not. `Slots::room_for` and `Slots::put` use only plain stacks of the item;
+  `Slot::new` remains the plain constructor and `Slot::patched` names the other.
+- `machine::slots_of` derives the flag from the **same predicate the insert uses**,
+  `ItemStack::is_stackable_with(&ItemStack::of(key))`, so the room model and `put_into_slots` cannot
+  disagree about what a slot will take.
+- `machine::apply_craft` is now a commit-time dry run: it applies the whole outcome (consume, result,
+  every remainder) to a **copy** of the slots through the real merge rule and commits only when every
+  insert went in completely. A short insert returns `false`, the caller reports `network-full`, and
+  nothing is consumed — a result the machine counted can never be silently lost again, even if a
+  future rule change makes the model and the game diverge.
+- A manual `/stepcrafter step` now records its refusal in `Phase` (`not-enough-ingredients` /
+  `network-full`) exactly as a tick-driven attempt does, so the readout means "where the last step
+  left the machine". The leg's 206 assertion moved from `phase=idle` to
+  `phase=not-enough-ingredients` with it.
+- The stock's **count** still counts a named torch as a torch: a name does not stop an ingredient
+  matching a vanilla recipe, so consumption is unchanged; only the room for a plain *insert* changed.
+
 ## 2d. The slice (version 0.2.3): crafting remainders
 
 0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
@@ -270,6 +299,36 @@ test result: FAILED. 35 passed; 2 failed
 The remainder's own red is that same pair; its in-game red is the `SELFTEST=remainder` run (§4),
 which asserts today's defect (the buckets are gone) and ends non-zero on the fixed package.
 
+Green at 0.2.4 (the component-room slice): **39 tests** (`sdk-test.log`). Its red transcript is
+`red-unit-components.log`: `Slot::patched` existed but no rule used its flag yet, so both new tests
+failed for exactly the defect (the two-line compile red that named the API first is
+`red-unit-components-compile.log`):
+
+```
+---- runtime::tests::a_named_stack_of_the_result_is_no_room_for_a_plain_step stdout ----
+
+thread 'runtime::tests::a_named_stack_of_the_result_is_no_room_for_a_plain_step' (78244) panicked at src/runtime.rs:1166:9:
+assertion `left == right` failed: a named stack of the result is no room for a plain one
+  left: 4
+ right: 0
+
+---- runtime::tests::a_plain_result_is_a_new_stack_beside_a_named_one stdout ----
+
+thread 'runtime::tests::a_plain_result_is_a_new_stack_beside_a_named_one' (78246) panicked at src/runtime.rs:1205:9:
+assertion `left == right` failed: the named stack keeps its name and count and the plain result gets its own slot
+  left: [(64, false)]
+ right: [(60, false), (4, true)]
+
+test result: FAILED. 37 passed; 2 failed
+```
+
+The game half's red is `e2e-red-components-0.2.3.log`: the **previous** package, run with this
+leg's new phase, answers `/stepcrafter step` with `result=crafted` and leaves the named stack at
+`minecraft:torch:60` — the four torches exercised the room and were lost. The fixed package reads
+`result=network-full`, `crafted=0`, stock unchanged (§4); `SELFTEST=components-room` asserts the
+fixed behaviour and ends non-zero.
+
+
 
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
@@ -301,18 +360,20 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — six run logs plus the build log, all `--strict`
-green (`logs=6 ok=6 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — eight run logs plus the build log, all `--strict`
+green (`logs=8 ok=8 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
 | `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package, plus an in-run control leg on the same Nightly built without it |
 | `e2e-control.log` | `FAIL` + `EXIT:1` | the same script with `GAME` = the Nightly **without** the package: `setblock stepcrafter:step_crafter` leaves air |
+| `e2e-red-components-0.2.3.log` | `FAIL` + `EXIT:1` | the **previous** package (0.2.3) run with 0.2.4's leg: `/stepcrafter step` answers `result=crafted` beside the named stack and leaves `torch:60` — the silent loss, reproduced |
 | `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the **requester's** headline assertion (`stored=8`) and the run ends non-zero; `SELFTEST=crafter` inverts the machine's (`stored=16`) instead |
 | `e2e-selftest-capacity.log` | `FAIL` + `EXIT:1` | `SELFTEST=capacity` inverts the **no-room** assertion: “nothing fit, so nothing was served” (`crafted=0`) ends the run non-zero |
+| `e2e-selftest-components-room.log` | `FAIL` + `EXIT:1` | `SELFTEST=components-room` inverts the **component-room** assertion: the named stack counted no room and the step was refused (`phase=network-full crafted=0`) ends the run non-zero |
 | `e2e-selftest-take.log` | `FAIL` + `EXIT:1` | `SELFTEST=take` inverts the **component** assertion: the defect “a rebuilt stack reads no components” ends the run non-zero |
 | `e2e-selftest-remainder.log` | `FAIL` + `EXIT:1` | `SELFTEST=remainder` inverts the **remainder** assertion: the defect “the step consumes the buckets and leaves none” ends the run non-zero |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.3: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.4: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -336,7 +397,8 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 8. drain the sticks, take the target to 0 → `phase=not-enough-ingredients` with `crafted=16`
    unchanged; restock 4 sticks → it resumes to `stored=16 crafted=32`;
 9. `/stepcrafter step` on a band of 0..0 crafts one step (`stored=4 crafted=4`), and a second step
-   with no ingredients answers `not-enough-ingredients`;
+   with no ingredients answers `not-enough-ingredients` and records it (`phase=not-enough-ingredients`,
+   0.2.4 — a manual step is a step);
 10. band 64..128 with 32+32 loaded: `active=true` while it runs, `active=false` once idle, and it
     stops at **128** — past `min` (64), which is the hysteresis;
 11. **the requester asks a nearby crafter**: a machine with `target minecraft:torch` and its own
@@ -375,21 +437,31 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 19. a survival break with a pickaxe drops the requester's own item, and the machine's break drops
     its item **and spills the 8 torches** (`drops: minecraft:torch:8, stepcrafter:step_crafter:1`);
     placing the machine's item again gives an unconfigured machine (the recorded limit, §6);
-20. a non-operator's `/stepcrafter info` is refused.
+20. **the component-room defect (0.2.4)**: `/data merge block` plants a **named** torch stack of 60
+    (4 items of nominal room) in slot 0 and the torch recipe's ingredients in every other slot
+    (25 coal stacks + a stick; `items=1724`, none empty) in the machine at 221; with `target
+    minecraft:torch` and band `0..0`, one `/stepcrafter step` answers `result=network-full` and the
+    machine reads `stored=60 phase=network-full crafted=0` with its stock **unchanged**
+    (`coal:1600,stick:64,torch:60`). The **differential** at 222 is the same machine with a **plain**
+    torch stack of 60: the same step answers `result=crafted` and the stock becomes
+    `coal:1599,stick:63,torch:64` (`stored=64 crafted=4`) — only the name differs, so the assertion
+    can fail. `SELFTEST=components-room` asserts the fixed refusal and ends the run non-zero (the
+    previous package's `result=crafted` is `e2e-red-components-0.2.3.log`);
+21. a non-operator's `/stepcrafter info` is refused.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **55,800 B** |
-| sha256 | `ebbdd9cb13d44f8bd8d0319e86053dd24dd7f3aba832b1ca97f09eed39ef29c5` |
-| entries | 37 (`180,709 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.3` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **57,384 B** |
+| sha256 | `675a229bb84827f55df67283c3b0080f1c489c0144a0b9e30966d8ad5a33e33e` |
+| entries | 37 (`186,847 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.4` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
-| gate | `python3 ports/tools/verify-sdk-package.py stepcrafter` → **1/1** (`verify-sdk-package.log`) |
+| gate | `python3 ports/tools/verify-sdk-package.py stepcrafter` → **1/1** (`verify-sdk-package.log`; also `package matches the tree`) |
 
 ## 6. Known limits and deviations (recorded, not implied)
 
@@ -407,13 +479,12 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   but this port's pattern is derived, so there is nothing to drop. A `block_entity_data` payload
   was tried and removed: it did not restore the block entity, and HANDOVER §9d.23 forbids it on a
   block whose contents the engine already spills.
-- **The room model counts item ids, not components.** `Slots` knows a slot's item, count and limit;
-  `machine::put_into_slots` merges only into a stack whose components match the plain result, so a
-  machine holding a **named** stack of the target item counts room the game would not use: a step can
-  report room, be taken, and then not merge its result into the named stack. No leg reaches it (the
-  named stacks are planted in an empty machine and taken out before any step; a normal load carries
-  plain stacks). It is the gap the next slice should close — carry each stack's components in `Slot`,
-  or drive the room check from the same dry-run insert the step will use.
+- ~~**The room model counts item ids, not components.**~~ **Closed in 0.2.4** (§2e): a patched stack is
+  no room for a plain insert (`Slot::patched`), the flag comes from the same
+  `ItemStack::is_stackable_with` the insert uses, and `machine::apply_craft` re-runs the whole
+  outcome on a copy through the real merge rule and refuses the step if any insert is short. The
+  0.2.4 leg proves both sides: the named stack refuses (`network-full`, nothing consumed) and the
+  plain twin merges its four torches.
 - **Crafting remainders are carried from the *item*, not from a matched grid.** A step's pattern
   keeps what each candidate leaves (`Host::item_crafting_remainder`, one call per candidate at
   `/stepcrafter target`) and inserts it beside the result through the same per-slot room rule
@@ -456,7 +527,8 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | the band rule (start below min, fill to max, hold at max) | `StepCrafterNetworkNode.doWork`, three guards | `runtime::decide`, `runtime::plan` |
 | one step = resolve every cell, take, insert | `StepCraftingAlgorithm.prepareCraft/extractResolvedInputs/insertIntoNetwork` | `runtime::craft` (candidate resolution, reservation by counting), `machine::apply_craft` |
 | what the ingredients leave | `getRemainingItems` on the pattern's recipe | `Pattern.remainders` (per candidate, from `Host::item_crafting_remainder` at configuration), carried in `Outcome::Craft`, inserted beside the result under the same room rule |
-| `NETWORK_FULL` | `canInsertIntoNetwork` before extracting | `runtime::craft`'s room check **after** the ingredients are taken: the free room in the slots that hold the result plus one empty slot's worth per empty slot (the result's stack limit) — the stock's item count is not the room |
+| `NETWORK_FULL` | `canInsertIntoNetwork` before extracting | `runtime::craft`'s room check **after** the ingredients are taken: the free room in the **plain** slots that hold the result plus one empty slot's worth per empty slot (the result's stack limit) — the stock's item count is not the room, and a stack carrying components is no room for a plain insert. `machine::apply_craft` then re-runs the whole outcome on a copy through the real merge rule and commits only if every insert went in, so a counted result cannot be lost |
+| the manual step (`/stepcrafter step`) | a click on a step-crafting request | `runtime::step_now` + `machine::step_once`; band bypassed, and the refusal is saved as `Phase` exactly as a tick-driven attempt saves it |
 | `NOT_ENOUGH_INGREDIENTS` | `prepareCraft` returns null | `Outcome::NotEnoughIngredients` naming the short cell |
 | status per pattern slot | `ResourceStatus` (`CRAFTING`, `FINISHED`, `NOT_ENOUGH_INGREDIENTS`, `NETWORK_FULL`) | `runtime::Phase`, saved as `Phase` |
 | `active` block state | the RS network node's `active` property | true while the machine is crafting |
@@ -514,6 +586,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the commands | **tested** in game — every reply parsed, incl. `min 9 is above max 4`, the requester's three refusals, the wrong-block refusal and the operator refusal |
 | `/stepcrafter take` (the stored stacks themselves) | **tested** in game — two named torch stacks (Alpha ×2, Beta ×3) and a damaged, enchanted sword come out with both names, both counts, `damage 7` and `sharpness 3` (`durability_left 1554`); `SELFTEST=take` asserts the defect (no components) and the run ends non-zero |
 | the slots' room for the result (per-slot limits, post-consumption) | **tested** — `a_result_that_fits_no_slot_…`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`, `an_empty_slot_offers_each_inserted_item_its_own_room`; in game the 1,724-item machine (`items=1724` of 1,728) refuses |
+| the room for a **plain** insert beside a stack with components | **tested** — `a_named_stack_of_the_result_is_no_room_for_a_plain_step` (room 0, `NetworkFull`), `a_plain_result_is_a_new_stack_beside_a_named_one` (the named stack stays 60, the result is its own plain stack); in game the 60-named-torch machine refuses with `phase=network-full crafted=0` and the stock unchanged, while the plain-stack twin merges its four torches (`stock=coal:1599,stick:63,torch:64`); `SELFTEST=components-room` inverts the fixed behaviour and the 0.2.3 package's `result=crafted` is `e2e-red-components-0.2.3.log` |
 | the `active` states (both) | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle, on the machine and on the requester |
 | loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |

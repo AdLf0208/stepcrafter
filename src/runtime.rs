@@ -194,20 +194,42 @@ impl Stock {
 /// The game bounds a slot by the item's own stack limit (`max_stack_size`), so the room a step's
 /// result has is a **per-slot** quantity: a full slot of coal leaves no room for a torch, even
 /// though the inventory's item count says there is space. That is what [`Slots::room_for`] measures.
+///
+/// A stack also carries components (a name, an enchantment, damage), and the step inserts a plain
+/// item: merging it into a named stack would give it that name. So a patched slot is no room for a
+/// plain insert and [`Slots::put`] never merges into one; the machine derives the flag from the
+/// same `ItemStack::is_stackable_with` the real insert uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slot {
     item: String,
     count: u32,
     max: u32,
+    plain: bool,
 }
 
 impl Slot {
-    /// A slot holding `count` of `item`, which fits up to `max`; `None` for an empty item id, a
-    /// zero count or a slot that can hold nothing.
+    /// A slot holding `count` of `item` with no component patch (or damage): a plain insert may
+    /// merge into it. `None` for an empty item id, a zero count or a slot that can hold nothing.
     #[must_use]
     pub fn new(item: impl Into<String>, count: u32, max: u32) -> Option<Self> {
+        Self::make(item, count, max, true)
+    }
+
+    /// A slot holding `count` of `item` **with** a component patch or damage (a name, an
+    /// enchantment, a damaged tool): a plain insert of the same item must not merge into it.
+    #[must_use]
+    pub fn patched(item: impl Into<String>, count: u32, max: u32) -> Option<Self> {
+        Self::make(item, count, max, false)
+    }
+
+    fn make(item: impl Into<String>, count: u32, max: u32, plain: bool) -> Option<Self> {
         let item = item.into();
-        (count > 0 && max > 0 && !item.is_empty()).then_some(Self { item, count, max })
+        (count > 0 && max > 0 && !item.is_empty()).then_some(Self {
+            item,
+            count,
+            max,
+            plain,
+        })
     }
 
     /// The item this slot holds.
@@ -226,6 +248,12 @@ impl Slot {
     #[must_use]
     pub fn max(&self) -> u32 {
         self.max
+    }
+
+    /// Whether the stack carries no components, so a plain item may merge into it.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        self.plain
     }
 }
 
@@ -327,15 +355,17 @@ impl Slots {
         count - left
     }
 
-    /// Put up to `count` of `item` into the slots: the slots already holding it first, then empty
-    /// slots, each up to its own limit. Answers how many went in.
+    /// Put up to `count` of a plain `item` into the slots: the plain stacks already holding it
+    /// first, then empty slots, each up to its own limit. Answers how many went in. A stack with a
+    /// component patch is not a plain stack: merging into it would launder its components onto the
+    /// inserted item.
     pub fn put(&mut self, item: &str, count: u32) -> u32 {
         let mut left = count;
         for slot in self.slots.iter_mut().flatten() {
             if left == 0 {
                 break;
             }
-            if slot.item != item {
+            if slot.item != item || !slot.plain {
                 continue;
             }
             let added = slot.max.saturating_sub(slot.count).min(left);
@@ -361,7 +391,8 @@ impl Slots {
 
     /// How many of `item` the slots can still hold: the room left in the slots already holding it
     /// plus one full empty slot's worth per empty slot. Any other item's free room is not room for
-    /// this one.
+    /// this one, and neither is a stack carrying components: the step inserts a **plain** item, so
+    /// only a plain stack of it can take the insert.
     #[must_use]
     pub fn room_for(&self, item: &str) -> u64 {
         let room = u64::from(self.room_of_empty_slot(item));
@@ -369,7 +400,9 @@ impl Slots {
             .iter()
             .map(|slot| match slot {
                 None => room,
-                Some(slot) if slot.item == item => u64::from(slot.max.saturating_sub(slot.count)),
+                Some(slot) if slot.item == item && slot.plain => {
+                    u64::from(slot.max.saturating_sub(slot.count))
+                }
                 Some(_) => 0,
             })
             .sum()
@@ -518,7 +551,10 @@ impl Pattern {
                 Some((leftover, count)) => (leftover, count.parse::<u32>().ok()?),
                 None => (rest, 1),
             };
-            left.insert(consumed.trim().to_owned(), (leftover.trim().to_owned(), count));
+            left.insert(
+                consumed.trim().to_owned(),
+                (leftover.trim().to_owned(), count),
+            );
         }
         Self::new_with_remainders(cells, left, result.to_owned(), result_count)
     }
@@ -1124,6 +1160,65 @@ mod tests {
                 result_count: 4,
                 remainders: Vec::new(),
             }
+        );
+    }
+
+    /// The last silent-loss path: the room check counted a stack of the result by item id, so a
+    /// **named** torch stack offered the 4 items of room its count left, while the insert merges
+    /// only into a stack with no components. The step must be refused, not counted and lost.
+    #[test]
+    fn a_named_stack_of_the_result_is_no_room_for_a_plain_step() {
+        // 60 named torches (4 of nominal room) and the torch recipe's ingredients in every other
+        // slot: no slot is empty, so the only stack that could take the result is the named one.
+        let mut slots = Slots::new(64);
+        slots.push(Slot::patched("minecraft:torch", 60, 64));
+        for _ in 0..25 {
+            slots.push(Slot::new("minecraft:coal", 64, 64));
+        }
+        slots.push(Slot::new("minecraft:stick", 64, 64));
+        assert_eq!(
+            slots.room_for("minecraft:torch"),
+            0,
+            "a named stack of the result is no room for a plain one"
+        );
+        assert_eq!(
+            step_now(&slots, Some(&torch())),
+            Outcome::NetworkFull {
+                item: "minecraft:torch".to_owned(),
+                room: 0,
+                produced: 4,
+            },
+            "the four torches would be counted and then lost beside the named stack"
+        );
+    }
+
+    #[test]
+    fn a_plain_result_is_a_new_stack_beside_a_named_one() {
+        // One empty slot: the four torches do fit, but they must not be merged into the named
+        // stack (that would launder its name onto them). They become their own plain stack.
+        let mut slots = Slots::new(64);
+        slots.push(Slot::patched("minecraft:torch", 60, 64));
+        slots.push(Slot::new("minecraft:coal", 2, 64));
+        slots.push(Slot::new("minecraft:stick", 2, 64));
+        slots.push(None);
+        let outcome = step_now(&slots, Some(&torch()));
+        assert!(
+            matches!(outcome, Outcome::Craft { .. }),
+            "the free slot and the ingredients hold the step: {outcome:?}"
+        );
+        let mut after = slots.clone();
+        assert!(apply(&mut after, &outcome));
+        let stored: Vec<(u32, bool)> = after
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|slot| slot.item() == "minecraft:torch")
+            .map(|slot| (slot.count(), slot.is_plain()))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![(60, false), (4, true)],
+            "the named stack keeps its name and count and the plain result gets its own slot"
         );
     }
 
