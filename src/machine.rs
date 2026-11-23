@@ -2,9 +2,10 @@
 //!
 //! [`crate::runtime`] is the pure truth — the maintenance band, the ingredient resolution and the
 //! stock arithmetic, with its tests. This module is the only place that reads the game and writes
-//! it back: the block entity's saved compound (the target's pattern, the band, the phase and the
-//! counter), the 27-slot inventory the stock lives in, and the tick that runs
-//! [`crate::runtime::plan`].
+//! it back: the block entity's saved compound (the target's pattern, the band, the phase, the asks
+//! requesters have left here with what each has been served, and the counter), the 27-slot
+//! inventory the stock lives in, and the tick that runs [`crate::runtime::plan`] or serves the head
+//! ask of the queue one step at a time.
 //!
 //! Upstream's stock is the Refined Storage network and its interface is a screen. Neither exists
 //! for a Horizon add-on (see `ports/_shared/evidence/stepcrafter/parent-surface.md`), so the stock
@@ -19,7 +20,7 @@ use mod_api::{
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
-use crate::runtime::{self, Band, Outcome, Pattern, Phase, Slot, Slots, Stock};
+use crate::runtime::{self, Band, Outcome, Pattern, Phase, Queue, Slot, Slots, Stock};
 
 /// The block entity type this mod declares, and the `id` its carried data is tagged with.
 pub const TYPE: &str = "step_crafter";
@@ -36,10 +37,18 @@ const KEY_REMAINDERS: &str = "Remainders";
 const KEY_RESULT_COUNT: &str = "ResultCount";
 const KEY_PHASE: &str = "Phase";
 const KEY_CRAFTED: &str = "Crafted";
-/// How many items a Step Requester has asked this machine for and not yet been given: the ask a
-/// requester writes into this compound (`merge_data`, the `/data merge block` path) and this
-/// machine's tick spends one step at a time.
-pub const KEY_REQUEST: &str = "Request";
+/// The asks a Step Requester has left with this machine, one `x,y,z|item|remaining` per (requester,
+/// item): the list a requester writes into this compound (`merge_data`, the `/data merge block`
+/// path) and this machine's tick serves one step at a time.
+pub const KEY_REQUESTS: &str = "Requests";
+/// What each requester has been served, `x,y,z|item|count`: its own share of the stock.
+const KEY_SERVED: &str = "Served";
+/// The ask this machine last could not serve, `x,y,z|item`: upstream's failed task belongs to the
+/// requester that started it, so the asks behind it are not touched.
+const KEY_FAILED: &str = "Failed";
+/// 0.2.0–0.2.6's single ask. Operational state, not configuration: a world saved with it loses one
+/// pending ask, and its requester re-asks on the next tick.
+const KEY_REQUEST: &str = "Request";
 /// Declare the block entity type holding the machine's one block, its 27-slot container and the
 /// Part that ticks it.
 pub fn declare(r: &mut dyn Registrar) {
@@ -87,8 +96,8 @@ pub struct State {
     pub pattern: Option<Pattern>,
     /// Where the last step left the machine.
     pub phase: Phase,
-    /// How many items a requester has asked for and not yet been given.
-    pub request: u64,
+    /// The asks requesters have left here, in the order this machine serves them.
+    pub queue: Queue,
     /// How many items this machine has crafted in all (the harness readout).
     pub crafted: u64,
 }
@@ -101,11 +110,42 @@ impl State {
     }
 }
 
+/// The part of a machine's saved state another block reads: what it maintains, where its last step
+/// left it, and the asks it holds (with each requester's share and its last failed ask).
+///
+/// A Step Requester reads this every tick and writes the ask list back; the pattern, the band and the
+/// stock stay the machine's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shared {
+    /// The item the machine keeps in stock.
+    pub target: Option<String>,
+    /// Where the machine's last step left it.
+    pub phase: Phase,
+    /// The asks it holds.
+    pub queue: Queue,
+}
+
+/// Read the shared part of a block entity's saved compound.
+#[must_use]
+pub fn shared(nbt: &Compound) -> Shared {
+    Shared {
+        target: string(nbt, KEY_TARGET),
+        phase: string(nbt, KEY_PHASE)
+            .as_deref()
+            .map_or(Phase::Idle, Phase::of),
+        queue: Queue::decode(
+            &list(nbt, KEY_REQUESTS).unwrap_or_default(),
+            &list(nbt, KEY_SERVED).unwrap_or_default(),
+            string(nbt, KEY_FAILED).as_deref(),
+        ),
+    }
+}
+
 /// Read the configuration out of a block entity's saved compound; an empty or foreign compound
 /// reads as an unconfigured machine.
 #[must_use]
 pub fn read(nbt: &Compound) -> State {
-    let target = string(nbt, KEY_TARGET);
+    let shared = shared(nbt);
     let band = match (int(nbt, KEY_MIN), int(nbt, KEY_MAX)) {
         (Some(min), Some(max)) => u64::try_from(min)
             .ok()
@@ -116,20 +156,18 @@ pub fn read(nbt: &Compound) -> State {
     let result_count = int(nbt, KEY_RESULT_COUNT).and_then(|count| u32::try_from(count).ok());
     let cells = list(nbt, KEY_CELLS);
     let remainders = list(nbt, KEY_REMAINDERS).unwrap_or_default();
-    let pattern = match (target.as_deref(), result_count) {
+    let pattern = match (shared.target.as_deref(), result_count) {
         (Some(target), Some(count)) => {
             cells.and_then(|cells| Pattern::decode(&cells, &remainders, target, count))
         }
         _ => None,
     };
     State {
-        target,
+        target: shared.target,
         band,
         pattern,
-        phase: string(nbt, KEY_PHASE)
-            .as_deref()
-            .map_or(Phase::Idle, Phase::of),
-        request: amount(nbt, KEY_REQUEST),
+        phase: shared.phase,
+        queue: shared.queue,
         crafted: amount(nbt, KEY_CRAFTED),
     }
 }
@@ -191,7 +229,46 @@ pub fn write(nbt: &mut Compound, state: &State) {
         }
     }
     put(nbt, KEY_PHASE, Tag::String(state.phase.id().into()));
-    put(nbt, KEY_REQUEST, int_of(state.request));
+    let requests = state.queue.encode();
+    if requests.is_empty() {
+        drop_key(nbt, KEY_REQUESTS);
+    } else {
+        put(
+            nbt,
+            KEY_REQUESTS,
+            Tag::List(
+                requests
+                    .iter()
+                    .map(|entry| Tag::String(entry.as_str().into()))
+                    .collect(),
+            ),
+        );
+    }
+    let served = state.queue.encode_served();
+    if served.is_empty() {
+        drop_key(nbt, KEY_SERVED);
+    } else {
+        put(
+            nbt,
+            KEY_SERVED,
+            Tag::List(
+                served
+                    .iter()
+                    .map(|entry| Tag::String(entry.as_str().into()))
+                    .collect(),
+            ),
+        );
+    }
+    match state.queue.failed() {
+        Some(failed) => put(
+            nbt,
+            KEY_FAILED,
+            Tag::String(failed.encode().as_str().into()),
+        ),
+        None => drop_key(nbt, KEY_FAILED),
+    }
+    // 0.2.6's single ask is superseded by the list; the next tick's list is the only truth.
+    drop_key(nbt, KEY_REQUEST);
     put(nbt, KEY_CRAFTED, int_of(state.crafted));
 }
 
@@ -367,24 +444,44 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         event.entity.items.resize(SLOTS, None);
     }
     let mut state = read(&event.entity.nbt);
+    let before = state.clone();
+
+    // An ask that can never be served is dropped before anything is spent on it: one for another
+    // item (a re-targeted machine), or one whose requester is gone (a broken block). A requester
+    // whose chunk is out this tick is not "gone" — its ask waits.
+    if let Some(level) = host.level(host.dimension()) {
+        let target = state.target.clone();
+        state.queue.retain(|ask| {
+            Some(ask.item()) == target.as_deref()
+                && requester_present(&*host, level, ask.requester())
+        });
+    }
 
     // A Step Requester's ask outranks this machine's own band for the tick it is served: the band
     // is this machine's timing rule, an ask is somebody else's, and either way one tick is one step
     // (`STEPS_PER_TICK`). The step itself is the same one `/stepcrafter step` takes — the ask
-    // bypasses the band, not the pattern.
-    if state.request > 0 {
+    // bypasses the band, not the pattern. The head ask is served first; the asks behind it keep
+    // their place.
+    if !state.queue.is_empty() {
         serve_request(host, event, &mut state);
-        write(&mut event.entity.nbt, &state);
+        // Write only a state that moved: a requester that wrote an ask later in this same tick
+        // must not have it erased by a write that was read before it landed.
+        if state != before {
+            write(&mut event.entity.nbt, &state);
+        }
         sync_active(host, pos, state.phase.is_crafting());
         return;
     }
 
     let Some(band) = state.band else {
+        if state != before {
+            write(&mut event.entity.nbt, &state);
+        }
         sync_active(host, pos, false);
         return;
     };
 
-    let mut changed = false;
+    let mut changed = state != before;
     for _ in 0..runtime::STEPS_PER_TICK {
         let slots = slots_with_rooms(&*host, &event.entity.items, state.pattern.as_ref());
         let outcome = runtime::plan(&slots, band, state.phase, state.pattern.as_ref());
@@ -425,12 +522,23 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     sync_active(host, pos, state.phase.is_crafting());
 }
 
-/// Serve one item of a requester's ask: one step of the pattern, band bypassed.
+/// Whether a queued ask's requester is still a Step Requester this world can see. A block the level
+/// cannot read (an unloaded chunk) keeps its ask; one that reads as another block (or air) has lost
+/// it, and the ask goes with the block.
+fn requester_present(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
+    if !level.is_loaded(host, pos) {
+        return true;
+    }
+    level
+        .block(host, pos)
+        .is_none_or(|block| block.id(host) == crate::requester::BLOCK)
+}
+
+/// Serve the head ask with one step of the pattern, band bypassed.
 ///
-/// The ask is spent by what the step produced (`Request` counts items, not steps); a step the
-/// machine cannot take drops the rest of the ask, so the requester reads the refusal from this
-/// machine's `phase` instead of waiting for items that will never come. A refusal produces
-/// nothing, so neither `crafted` nor the ask is served by it: only a step that fits spends.
+/// The step is spent on the head ask and credited to **its** requester (`Served`); a step the
+/// machine cannot take names that ask as the failed one and leaves it queued, so the asks behind it
+/// are not lost with it — upstream's failed task is the requester's own, not the network's.
 fn serve_request(
     host: &mut dyn ServerHost,
     event: &mut BlockEntityTickEvent<'_>,
@@ -442,25 +550,23 @@ fn serve_request(
         Outcome::Craft { result_count, .. } => {
             if apply_craft(host, &mut event.entity.items, &outcome) {
                 state.crafted = state.crafted.saturating_add(u64::from(*result_count));
-                state.request = state.request.saturating_sub(u64::from(*result_count));
+                state.queue.spend(u64::from(*result_count));
                 state.phase = Phase::Crafting;
             } else {
-                state.request = 0;
                 state.phase = Phase::NetworkFull;
+                state.queue.fail();
             }
         }
         Outcome::NotEnoughIngredients { .. } => {
-            state.request = 0;
             state.phase = Phase::NotEnoughIngredients;
+            state.queue.fail();
         }
         Outcome::NetworkFull { .. } => {
-            state.request = 0;
             state.phase = Phase::NetworkFull;
+            state.queue.fail();
         }
-        Outcome::Hold | Outcome::Finished => {
-            // No pattern configured, nothing to step: the ask cannot be answered.
-            state.request = 0;
-        }
+        // No pattern, nothing to serve: the ask waits for the machine to be configured.
+        Outcome::Hold | Outcome::Finished => {}
     }
 }
 
@@ -676,15 +782,33 @@ mod tests {
                 )]))
             }),
             phase: Phase::Crafting,
-            request: 4,
+            queue: {
+                let mut queue = Queue::new();
+                assert!(
+                    queue.ask([222, 64, 0], "minecraft:torch", 4),
+                    "a queued ask"
+                );
+                assert!(
+                    queue.ask([222, 64, 2], "minecraft:torch", 4),
+                    "a second asker"
+                );
+                queue
+            },
             crafted: 12,
         };
         write(&mut nbt, &state);
         assert_eq!(read(&nbt), state);
         assert_eq!(
-            read(&nbt).request,
+            read(&nbt)
+                .queue
+                .outstanding([222, 64, 0], "minecraft:torch"),
             4,
-            "an outstanding ask must survive the compound between ticks"
+            "a queued ask must survive the compound between ticks"
+        );
+        assert_eq!(
+            read(&nbt).queue.len(),
+            2,
+            "the second requester's ask is not overwritten"
         );
         let saved = read(&nbt);
         let left = saved
@@ -695,6 +819,42 @@ mod tests {
             left,
             Some(("minecraft:coal", 1)),
             "what the recipe leaves must survive the compound too"
+        );
+    }
+
+    /// The shared read is what a Step Requester sees: the target, the phase and the queue — no
+    /// pattern, no band, no stock.
+    #[test]
+    fn the_shared_read_is_the_queue_and_the_phase() {
+        let mut nbt = Compound::new();
+        let mut state = State {
+            target: Some("minecraft:torch".to_owned()),
+            phase: Phase::NotEnoughIngredients,
+            ..State::default()
+        };
+        assert!(state.queue.ask([222, 64, 0], "minecraft:torch", 4));
+        assert!(state.queue.fail().is_some());
+        write(&mut nbt, &state);
+        let shared = shared(&nbt);
+        assert_eq!(shared.target.as_deref(), Some("minecraft:torch"));
+        assert_eq!(shared.phase, Phase::NotEnoughIngredients);
+        assert_eq!(shared.queue.outstanding([222, 64, 0], "minecraft:torch"), 4);
+        assert!(shared.queue.failed_for([222, 64, 0], "minecraft:torch"));
+    }
+
+    /// 0.2.6's single ask is operational state, not configuration: a world saved with it reads as a
+    /// machine with an empty queue, and its requester asks again on the next tick.
+    #[test]
+    fn a_legacy_single_ask_is_not_a_queued_ask() {
+        let mut nbt = Compound::new();
+        put(&mut nbt, KEY_REQUEST, int_of(4));
+        assert!(read(&nbt).queue.is_empty());
+        let state = State::default();
+        write(&mut nbt, &state);
+        assert_eq!(
+            crate::nbt::int(&nbt, KEY_REQUEST),
+            None,
+            "the old key is dropped"
         );
     }
 

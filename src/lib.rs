@@ -3,9 +3,9 @@
 //! Ported from Step Crafter 1.21.1-0.1.10 (`starforcraft/Step-Crafter`, MIT), a Refined Storage
 //! add-on. [`runtime`] is the pure truth — the maintenance band, the ingredient resolution and the
 //! stock arithmetic, with its tests. [`pattern`] resolves a target item's own crafting recipe into
-//! the machine's step pattern, [`machine`] is the block entity (its saved state, its tick, the
-//! 27-slot inventory (a vanilla chest menu) and the tick), and [`commands`] is
-//! `/stepcrafter …`.
+//! the machine's step pattern, [`machine`] is the crafter's block entity (its saved state, its tick,
+//! its 27-slot inventory and its ask queue), [`requester`] the Step Requester's (its filter entries,
+//! its screen and the asks it leaves with a nearby machine), and [`commands`] is `/stepcrafter …`.
 //!
 //! # What this slice is
 //!
@@ -16,10 +16,11 @@
 //!
 //! Upstream's stock is a Refined Storage network and its pattern is an RS pattern item. Neither is
 //! reachable from a Horizon add-on (`ports/_shared/evidence/stepcrafter/parent-surface.md`), so the
-//! stock is the machine's own (27 slots' worth, held as a ledger in its saved compound) and the
-//! pattern is resolved from the target item's own `minecraft:crafting` recipe. The network
-//! families — the requester, the two managers, the crafting monitor, the colour variants, the slot
-//! upgrade, the FE buffer and the GUIs — are the gap list in `notes.md`, `blocked` on that surface.
+//! stock is the machine's own (its 27 slots, a declared container) and the pattern is resolved from
+//! the target item's own `minecraft:crafting` recipe. The requester is re-rooted on a nearby machine
+//! and edits its 45 filter entries on its own screen; the two managers, the crafting monitor, the
+//! colour variants, the slot upgrade and the FE buffer are the gap list in `notes.md`, `blocked` on
+//! that surface.
 
 pub mod commands;
 pub mod machine;

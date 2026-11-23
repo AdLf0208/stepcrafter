@@ -92,6 +92,12 @@ impl Phase {
     pub fn is_crafting(self) -> bool {
         matches!(self, Self::Crafting)
     }
+
+    /// Whether this phase is a refusal the crafter could not carry out (the two ways a step fails).
+    #[must_use]
+    pub fn is_refusal(self) -> bool {
+        matches!(self, Self::NotEnoughIngredients | Self::NetworkFull)
+    }
 }
 
 /// What the band says to do, before the ingredients are looked at.
@@ -790,19 +796,390 @@ pub fn apply(slots: &mut Slots, outcome: &Outcome) -> bool {
     true
 }
 
-/// Whether a crafter's own phase is a refusal the requester must report, and which one.
+/// One ask in a Step Crafter's queue: who asked, for which item, and how many items are still owed.
 ///
-/// Upstream learns this from the failed task (`startTask` answering empty, or its timeout); here the
-/// crafter states it in its saved `Phase`, and the stock still being short of `max` is what says the
-/// run is unfinished. `None` means "nothing was refused".
-#[must_use]
-pub fn refused(crafter: Phase, stored: u64, filter: &Filter) -> Option<Phase> {
-    match crafter {
-        Phase::NotEnoughIngredients | Phase::NetworkFull if stored < filter.band.max => {
-            Some(crafter)
-        }
-        _ => None,
+/// Upstream's `startTask` creates a task per request (`StepTaskImpl`, with its own `amount` and
+/// `craftedAmount`), so an ask is an object in the crafter's queue, not a count that the next
+/// requester overwrites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Queued {
+    requester: [i32; 3],
+    item: String,
+    remaining: u64,
+}
+
+impl Queued {
+    /// An ask for `remaining` of `item` from the block at `requester`; `None` for an ask that owes
+    /// nothing or names no item (an ask that could never be served).
+    #[must_use]
+    pub fn new(requester: [i32; 3], item: impl Into<String>, remaining: u64) -> Option<Self> {
+        let item = item.into();
+        (remaining > 0 && is_item_id(&item)).then_some(Self {
+            requester,
+            item,
+            remaining,
+        })
     }
+
+    /// The requester's block position, the ask's identity beside its item.
+    #[must_use]
+    pub fn requester(&self) -> [i32; 3] {
+        self.requester
+    }
+
+    /// The item the ask is for.
+    #[must_use]
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    /// How many items this ask is still owed.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// The saved form, `x,y,z|item|remaining`; `|` is in no id and no position, so the fields
+    /// cannot run together.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let [x, y, z] = self.requester;
+        format!("{x},{y},{z}|{}|{}", self.item, self.remaining)
+    }
+
+    /// Read one saved ask; anything malformed is refused rather than guessed at.
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('|').collect();
+        let [pos, item, remaining] = parts.as_slice() else {
+            return None;
+        };
+        Self::new(parse_link(pos)?, *item, remaining.parse().ok()?)
+    }
+}
+
+/// What one requester has been served by a crafter: its own share of the stock, not the stock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Served {
+    requester: [i32; 3],
+    item: String,
+    count: u64,
+}
+
+impl Served {
+    fn encode(&self) -> String {
+        let [x, y, z] = self.requester;
+        format!("{x},{y},{z}|{}|{}", self.item, self.count)
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('|').collect();
+        let [pos, item, count] = parts.as_slice() else {
+            return None;
+        };
+        if !is_item_id(item) {
+            return None;
+        }
+        let count: u64 = count.parse().ok()?;
+        (count > 0).then_some(Self {
+            requester: parse_link(pos)?,
+            item: (*item).to_owned(),
+            count,
+        })
+    }
+}
+
+/// The ask a crafter could not serve: whose it was and for what. Upstream's failed task belongs to
+/// the requester that started it, so a refusal names one ask and leaves the queue behind it intact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedAsk {
+    requester: [i32; 3],
+    item: String,
+}
+
+impl FailedAsk {
+    /// The failed ask of the block at `requester` for `item`.
+    #[must_use]
+    pub fn new(requester: [i32; 3], item: impl Into<String>) -> Self {
+        Self {
+            requester,
+            item: item.into(),
+        }
+    }
+
+    /// The requester whose ask failed.
+    #[must_use]
+    pub fn requester(&self) -> [i32; 3] {
+        self.requester
+    }
+
+    /// The item that ask was for.
+    #[must_use]
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    /// The saved form, `x,y,z|item`.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let [x, y, z] = self.requester;
+        format!("{x},{y},{z}|{}", self.item)
+    }
+
+    /// Read a saved failure; malformed text is no failure.
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('|').collect();
+        let [pos, item] = parts.as_slice() else {
+            return None;
+        };
+        if !is_item_id(item) {
+            return None;
+        }
+        Some(Self::new(parse_link(pos)?, *item))
+    }
+}
+
+/// The asks one Step Crafter holds, in the order it serves them, plus what each requester has been
+/// served and the ask it last failed to serve.
+///
+/// Upstream's autocrafting component owns the queued tasks and runs them one at a time; a task's
+/// `amount` and progress are its own. This is that queue in the crafter's saved compound: one ask per
+/// (requester, item), served head first, one step per tick.
+///
+/// The order is the queue's own rule, not the order the writes landed: asks are kept sorted by
+/// requester position, then item. Two requesters asking in the same tick therefore cannot race for
+/// the head, and the same world always serves them in the same order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Queue {
+    asks: Vec<Queued>,
+    served: Vec<Served>,
+    failed: Option<FailedAsk>,
+}
+
+impl Queue {
+    /// An empty queue: a crafter nobody has asked.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue `amount` of `item` for `requester`, or keep what it already has queued (`amount` larger
+    /// than the remaining count raises it). Answers whether the queue changed; an ask that owes
+    /// nothing is not an ask.
+    pub fn ask(&mut self, requester: [i32; 3], item: &str, amount: u64) -> bool {
+        if amount == 0 || !is_item_id(item) {
+            return false;
+        }
+        if let Some(ask) = self
+            .asks
+            .iter_mut()
+            .find(|ask| ask.requester == requester && ask.item == item)
+        {
+            if amount <= ask.remaining {
+                return false;
+            }
+            ask.remaining = amount;
+            return true;
+        }
+        self.asks.push(Queued {
+            requester,
+            item: item.to_owned(),
+            remaining: amount,
+        });
+        self.sort();
+        true
+    }
+
+    /// Keep the asks in the queue's own order: requester position first, then item. The order is
+    /// what makes a shared crafter deterministic — two asks written in one tick cannot race.
+    fn sort(&mut self) {
+        self.asks.sort_by(|a, b| {
+            a.requester
+                .cmp(&b.requester)
+                .then_with(|| a.item.cmp(&b.item))
+        });
+    }
+
+    /// How many items the ask of `requester` for `item` is still owed.
+    #[must_use]
+    pub fn outstanding(&self, requester: [i32; 3], item: &str) -> u64 {
+        self.asks
+            .iter()
+            .find(|ask| ask.requester == requester && ask.item == item)
+            .map_or(0, Queued::remaining)
+    }
+
+    /// How many items the crafter has served `requester` for `item`, in all.
+    #[must_use]
+    pub fn served_for(&self, requester: [i32; 3], item: &str) -> u64 {
+        self.served
+            .iter()
+            .find(|served| served.requester == requester && served.item == item)
+            .map_or(0, |served| served.count)
+    }
+
+    /// A requester's own part of the stock: what its asks produced, never more than the stock holds
+    /// (only ever a whole number of the stock that is there, never a claim on another's share).
+    #[must_use]
+    pub fn share(&self, requester: [i32; 3], item: &str, stock: u64) -> u64 {
+        self.served_for(requester, item).min(stock)
+    }
+
+    /// Spend the head ask by what the step produced: its remaining count falls and its requester is
+    /// credited with the produced items. Answers the ask that was served (gone from the queue when
+    /// it owed nothing more).
+    pub fn spend(&mut self, produced: u64) -> Option<Queued> {
+        if produced == 0 {
+            return None;
+        }
+        let mut head = self.asks.first()?.clone();
+        head.remaining = head.remaining.saturating_sub(produced);
+        match self
+            .served
+            .iter_mut()
+            .find(|served| served.requester == head.requester && served.item == head.item)
+        {
+            Some(served) => served.count = served.count.saturating_add(produced),
+            None => self.served.push(Served {
+                requester: head.requester,
+                item: head.item.clone(),
+                count: produced,
+            }),
+        }
+        // A step that went in is no failure: the ask it served has its items.
+        self.failed = None;
+        if head.remaining == 0 {
+            self.asks.remove(0);
+        } else {
+            self.asks[0] = head.clone();
+        }
+        Some(head)
+    }
+
+    /// Name the head ask as the one the crafter could not serve, without dropping it: the asks
+    /// behind it are not its failure.
+    pub fn fail(&mut self) -> Option<FailedAsk> {
+        let head = self.asks.first()?;
+        self.failed = Some(FailedAsk::new(head.requester, head.item.clone()));
+        self.failed.clone()
+    }
+
+    /// Forget the last failure; a step that went in clears it.
+    pub fn clear_failed(&mut self) {
+        self.failed = None;
+    }
+
+    /// The ask the crafter could not serve.
+    #[must_use]
+    pub fn failed(&self) -> Option<&FailedAsk> {
+        self.failed.as_ref()
+    }
+
+    /// Whether the ask of `requester` for `item` is the one the crafter could not serve.
+    #[must_use]
+    pub fn failed_for(&self, requester: [i32; 3], item: &str) -> bool {
+        self.failed
+            .as_ref()
+            .is_some_and(|failed| failed.requester == requester && failed.item == item)
+    }
+
+    /// Keep only the asks `keep` accepts (a different item, a requester that is gone); a failure
+    /// that named a dropped ask is cleared with it.
+    pub fn retain(&mut self, keep: impl FnMut(&Queued) -> bool) {
+        self.asks.retain(keep);
+        if self.failed.as_ref().is_some_and(|failed| {
+            !self
+                .asks
+                .iter()
+                .any(|ask| ask.requester == failed.requester && ask.item == failed.item)
+        }) {
+            self.failed = None;
+        }
+    }
+
+    /// The ask the crafter serves next.
+    #[must_use]
+    pub fn head(&self) -> Option<&Queued> {
+        self.asks.first()
+    }
+
+    /// How many asks are queued.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.asks.len()
+    }
+
+    /// Whether nobody has asked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.asks.is_empty()
+    }
+
+    /// The queued asks, head first.
+    pub fn iter(&self) -> impl Iterator<Item = &Queued> {
+        self.asks.iter()
+    }
+
+    /// The queued asks as their saved strings, for a `List` in the block entity's compound.
+    #[must_use]
+    pub fn encode(&self) -> Vec<String> {
+        self.asks.iter().map(Queued::encode).collect()
+    }
+
+    /// What each requester has been served, as its saved strings.
+    #[must_use]
+    pub fn encode_served(&self) -> Vec<String> {
+        self.served.iter().map(Served::encode).collect()
+    }
+
+    /// Read a saved queue; a malformed ask, credit or failure is skipped, so the others survive it.
+    /// A duplicated ask (two writes of one requester's ask for one item) is one ask, the larger.
+    #[must_use]
+    pub fn decode(asks: &[String], served: &[String], failed: Option<&str>) -> Self {
+        let mut queue = Self {
+            asks: Vec::new(),
+            served: Vec::new(),
+            failed: failed.and_then(FailedAsk::decode),
+        };
+        for ask in asks.iter().filter_map(|text| Queued::decode(text)) {
+            queue.ask(ask.requester, &ask.item, ask.remaining);
+        }
+        for credit in served.iter().filter_map(|text| Served::decode(text)) {
+            match queue
+                .served
+                .iter_mut()
+                .find(|held| held.requester == credit.requester && held.item == credit.item)
+            {
+                Some(held) => held.count = held.count.saturating_add(credit.count),
+                None => queue.served.push(credit),
+            }
+        }
+        queue
+    }
+}
+
+/// Where an entry stands with its crafter before [`ask`]: the phase the band decides from and the
+/// failed-task ticks it has left.
+///
+/// `refused` is the crafter's refusal when it named *this* entry's ask as the one it could not
+/// serve (upstream's failed task, which belongs to the requester that started it). `outstanding` is
+/// this entry's own queued ask: a served ask whose entry was left in a refusal resumes the run, so a
+/// restock carries it on to its maximum.
+#[must_use]
+pub fn settle(
+    phase: Phase,
+    backoff: u32,
+    refused: Option<Phase>,
+    outstanding: u64,
+) -> (Phase, u32) {
+    if let Some(refusal) = refused {
+        return (refusal, FAILED_TASK_TIMEOUT_TICKS);
+    }
+    if phase.is_refusal() && outstanding == 0 {
+        return (Phase::Crafting, 0);
+    }
+    (phase, backoff)
 }
 
 /// How many filter entries one requester carries: upstream's `StepRequesterBlockEntity.FILTERS`
@@ -2044,26 +2421,6 @@ mod tests {
         assert!(Filter::new(String::new(), band(4, 8), 4).is_none());
     }
 
-    #[test]
-    fn a_crafter_that_refused_is_the_requesters_failed_task() {
-        assert_eq!(
-            refused(Phase::NotEnoughIngredients, 4, &torches(4)),
-            Some(Phase::NotEnoughIngredients),
-            "the crafter has too few ingredients and the stock is still short"
-        );
-        assert_eq!(
-            refused(Phase::NetworkFull, 0, &torches(4)),
-            Some(Phase::NetworkFull)
-        );
-        assert_eq!(
-            refused(Phase::NotEnoughIngredients, 8, &torches(4)),
-            None,
-            "a refusal that no longer matters is not reported"
-        );
-        assert_eq!(refused(Phase::Crafting, 0, &torches(4)), None);
-        assert_eq!(refused(Phase::Idle, 0, &torches(4)), None);
-    }
-
     /// A second entry of its own: 8 sticks kept between 8 and 16, asked 8 at a time.
     fn sticks() -> Filter {
         Filter::new("minecraft:stick".to_owned(), band(8, 16), 8).expect("a valid filter")
@@ -2467,5 +2824,214 @@ mod tests {
             assert_eq!(Phase::of(phase.id()), phase);
         }
         assert_eq!(Phase::of("nonsense"), Phase::Idle);
+    }
+
+    /// The two requesters of the queue's own scenario: the first at `222 64 0`, the second a block
+    /// along at `222 64 2`.
+    const ASKER_A: [i32; 3] = [222, 64, 0];
+    const ASKER_B: [i32; 3] = [222, 64, 2];
+
+    /// The queue's headline: two requesters asking one crafter for the same item are two asks, not
+    /// one — the 0.2.6 `Request` `Int` kept only the last, so the second's ask was lost.
+    #[test]
+    fn a_second_requester_is_queued_beside_the_first() {
+        let mut queue = Queue::new();
+        assert!(
+            queue.ask(ASKER_A, "minecraft:torch", 4),
+            "the first ask is queued"
+        );
+        assert!(
+            queue.ask(ASKER_B, "minecraft:torch", 4),
+            "the second ask joins it rather than being lost"
+        );
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.outstanding(ASKER_A, "minecraft:torch"), 4);
+        assert_eq!(queue.outstanding(ASKER_B, "minecraft:torch"), 4);
+        assert_eq!(queue.head().map(Queued::requester), Some(ASKER_A));
+    }
+
+    /// The order is the queue's own rule, not the order the writes landed: the lower position is the
+    /// head, so two askers that write in the same tick cannot race for it.
+    #[test]
+    fn the_queue_serves_in_a_fixed_order_whatever_order_it_was_written() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_B, "minecraft:torch", 4));
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert_eq!(
+            queue.head().map(Queued::requester),
+            Some(ASKER_A),
+            "the lower position is the head"
+        );
+        assert_eq!(
+            queue.encode(),
+            vec![
+                "222,64,0|minecraft:torch|4".to_owned(),
+                "222,64,2|minecraft:torch|4".to_owned(),
+            ]
+        );
+    }
+
+    /// A step's product is credited to the ask that paid for it: the first four torches are the
+    /// first requester's share, and the second's share is still zero.
+    #[test]
+    fn a_step_is_credited_to_the_ask_it_served() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert!(queue.ask(ASKER_B, "minecraft:torch", 4));
+        let served = queue.spend(4).expect("the head ask is spent");
+        assert_eq!(served.requester(), ASKER_A);
+        assert_eq!(
+            queue.outstanding(ASKER_A, "minecraft:torch"),
+            0,
+            "the first ask is served"
+        );
+        assert_eq!(queue.served_for(ASKER_A, "minecraft:torch"), 4);
+        assert_eq!(
+            queue.served_for(ASKER_B, "minecraft:torch"),
+            0,
+            "the second's share is not the first's"
+        );
+        assert_eq!(queue.head().map(Queued::requester), Some(ASKER_B));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.share(ASKER_B, "minecraft:torch", 4), 0);
+        assert_eq!(
+            queue.share(ASKER_A, "minecraft:torch", 4),
+            4,
+            "the first's four torches, and no claim on the second's"
+        );
+        assert_eq!(
+            queue.share(ASKER_A, "minecraft:torch", 2),
+            2,
+            "a share never exceeds the stock that is there"
+        );
+    }
+
+    /// Upstream's `isAlreadyRunningTask`: one requester holds one ask per resource, and a larger ask
+    /// raises that one's remaining count instead of queuing a second.
+    #[test]
+    fn a_requester_holds_one_ask_per_resource() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert!(
+            !queue.ask(ASKER_A, "minecraft:torch", 4),
+            "a second ask for the same item is the same ask"
+        );
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue.ask(ASKER_A, "minecraft:torch", 8),
+            "a larger ask raises the remaining count"
+        );
+        assert_eq!(queue.outstanding(ASKER_A, "minecraft:torch"), 8);
+        assert!(
+            !queue.ask(ASKER_A, "minecraft:torch", 0),
+            "an ask that owes nothing is not an ask"
+        );
+        assert!(
+            queue.ask(ASKER_A, "minecraft:stick", 1),
+            "another resource is another ask"
+        );
+        assert_eq!(queue.len(), 2);
+    }
+
+    /// A failed ask keeps its place: the crafter names the requester whose step it could not take,
+    /// the ask stays queued, and the asks behind it are untouched.
+    #[test]
+    fn a_failed_ask_keeps_its_place_and_names_its_requester() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert!(queue.ask(ASKER_B, "minecraft:torch", 4));
+        let failed = queue.fail().expect("the head ask is the failed one");
+        assert_eq!(failed.requester(), ASKER_A);
+        assert!(queue.failed_for(ASKER_A, "minecraft:torch"));
+        assert!(
+            !queue.failed_for(ASKER_B, "minecraft:torch"),
+            "the refusal is not the second's"
+        );
+        assert_eq!(queue.len(), 2, "a failed ask is not dropped");
+        assert_eq!(
+            queue.failed().map(FailedAsk::encode),
+            Some("222,64,0|minecraft:torch".to_owned())
+        );
+        assert_eq!(
+            queue.head().map(Queued::requester),
+            Some(ASKER_A),
+            "the failed ask is still the head"
+        );
+        let served = queue.spend(4).expect("the retried ask is served");
+        assert_eq!(served.requester(), ASKER_A);
+        assert!(queue.failed().is_none(), "a served ask clears the failure");
+    }
+
+    /// The queue is the machine's saved state: its asks, its credits and its failure round-trip, and
+    /// a malformed entry is skipped rather than guessed at.
+    #[test]
+    fn the_queue_round_trips_through_its_saved_form() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert!(queue.ask(ASKER_B, "minecraft:stick", 8));
+        assert!(queue.spend(4).is_some());
+        assert!(queue.fail().is_some());
+        let asks = queue.encode();
+        let served = queue.encode_served();
+        let failed = queue.failed().map(FailedAsk::encode);
+        let read_back = Queue::decode(&asks, &served, failed.as_deref());
+        assert_eq!(read_back, queue);
+        assert_eq!(read_back.served_for(ASKER_A, "minecraft:torch"), 4);
+        assert!(read_back.failed_for(ASKER_B, "minecraft:stick"));
+
+        let torn = Queue::decode(
+            &[
+                "222,64,0|minecraft:torch|4".to_owned(),
+                "not-an-ask".to_owned(),
+                "222,64,2|minecraft:torch|0".to_owned(),
+            ],
+            &["nonsense".to_owned()],
+            Some("nowhere"),
+        );
+        assert_eq!(torn.len(), 1, "only the well-formed ask survives");
+        assert_eq!(torn.served_for(ASKER_A, "minecraft:torch"), 0);
+        assert!(torn.failed().is_none(), "a malformed failure is no failure");
+    }
+
+    /// The entry's phase before the band decides: the crafter's refusal while it names this entry's
+    /// ask, and the run continuing once that ask has been served.
+    #[test]
+    fn a_refusal_settles_the_entry_and_a_served_ask_resumes_it() {
+        assert_eq!(
+            settle(Phase::Crafting, 0, Some(Phase::NotEnoughIngredients), 4),
+            (Phase::NotEnoughIngredients, FAILED_TASK_TIMEOUT_TICKS),
+            "the failed task times out"
+        );
+        assert_eq!(
+            settle(Phase::NotEnoughIngredients, 19, None, 0),
+            (Phase::Crafting, 0),
+            "the ask was served: the run continues to its maximum"
+        );
+        assert_eq!(
+            settle(Phase::NotEnoughIngredients, 19, None, 4),
+            (Phase::NotEnoughIngredients, 19),
+            "an ask still queued keeps its timeout"
+        );
+        assert_eq!(settle(Phase::Idle, 0, None, 0), (Phase::Idle, 0));
+    }
+
+    /// An ask that can never be served is dropped (its item is not the machine's target, or the
+    /// requester is gone), and a failure that named a dropped ask is cleared with it.
+    #[test]
+    fn the_queue_drops_asks_that_can_never_be_served() {
+        let mut queue = Queue::new();
+        assert!(queue.ask(ASKER_A, "minecraft:torch", 4));
+        assert!(queue.ask(ASKER_B, "minecraft:stick", 4));
+        assert!(queue.fail().is_some());
+        queue.retain(|ask| ask.item() == "minecraft:torch");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.head().map(Queued::requester), Some(ASKER_A));
+        assert!(queue.failed_for(ASKER_A, "minecraft:torch"));
+        queue.retain(|ask| ask.requester() != ASKER_A);
+        assert!(queue.is_empty());
+        assert!(
+            queue.failed().is_none(),
+            "the failure named an ask that is gone"
+        );
     }
 }

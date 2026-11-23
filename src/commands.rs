@@ -379,8 +379,20 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
     let result = state.pattern.as_ref().map_or("none".to_owned(), |pattern| {
         format!("{}:{}", pattern.result(), pattern.result_count())
     });
+    let asks: Vec<String> = state.queue.encode();
+    let asks = if asks.is_empty() {
+        "none".to_owned()
+    } else {
+        asks.join(";")
+    };
+    let served: Vec<String> = state.queue.encode_served();
+    let served = if served.is_empty() {
+        "none".to_owned()
+    } else {
+        served.join(";")
+    };
     format!(
-        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} request={} items={} stock={}",
+        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} queued={} asks={} served={} items={} stock={}",
         pos[0],
         pos[1],
         pos[2],
@@ -392,17 +404,20 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         cells,
         result,
         state.crafted,
-        state.request,
+        state.queue.len(),
+        asks,
+        served,
         stock.total(),
         stock_line(&stock),
     )
 }
 
-/// `/stepcrafter info <pos>` for a Step Requester: every filter entry, the crafter it asks and that
-/// crafter's stock of the entry's resource (upstream's `storageComponent.get(resource)`).
+/// `/stepcrafter info <pos>` for a Step Requester: every filter entry, the crafter it asks, that
+/// crafter's stock of the entry's resource (upstream's `storageComponent.get(resource)`) and the
+/// entry's own share of it.
 ///
-/// The single-entry fields (`item/min/max/batch/stored/phase/crafter/backoff`) describe the first
-/// entry, the shape 0.2.1–0.2.4 printed; `filters` and `entries` name the whole container.
+/// The single-entry fields (`item/min/max/batch/stored/served/queued/phase/crafter/backoff`)
+/// describe the first entry; `filters` and `entries` name the whole container.
 fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
     let Some(entity) = host.block_entity(level, pos) else {
         return NO_MACHINE.to_owned();
@@ -416,6 +431,8 @@ fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) 
     let max = first.map_or_else(|| "-".to_owned(), |view| view.max.to_string());
     let batch = first.map_or_else(|| "-".to_owned(), |view| view.batch.to_string());
     let stored = first.map_or(0, |view| view.stored);
+    let served = first.map_or(0, |view| view.served);
+    let queued = first.map_or(0, |view| view.queued);
     let phase = first.map_or("idle", |view| view.phase);
     let backoff = first.map_or(0, |view| view.backoff);
     let crafter = first
@@ -428,7 +445,7 @@ fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) 
         entries.join(";")
     };
     format!(
-        "stepcrafter {} {} {} kind=requester filters={} item={} min={} max={} batch={} stored={} phase={} crafter={} backoff={} requests={} entries={}",
+        "stepcrafter {} {} {} kind=requester filters={} item={} min={} max={} batch={} stored={} served={} queued={} phase={} crafter={} backoff={} requests={} entries={}",
         pos[0],
         pos[1],
         pos[2],
@@ -438,6 +455,8 @@ fn requester_readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) 
         max,
         batch,
         stored,
+        served,
+        queued,
         phase,
         crafter,
         backoff,

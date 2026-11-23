@@ -65,6 +65,10 @@
 #    guard refuses `min +` at 0..0), a carried stick repoints the cell while keeping its band, a
 #    command-added entry appears as a cell the remove button drops, and a requester nobody opened
 #    carries no entry — the screen and `/stepcrafter requester` are one saved container;
+#  - two requesters share one crafter: the ask is now a list in the crafter's compound, so the
+#    second is queued behind the first instead of being lost, each reads its own share of the stock
+#    (the first `stored=4 served=4`, the second `stored=0 queued=1`), and a restock serves the second
+#    its own four;
 #  - `/stepcrafter` needs an operator: a non-operator's `info` is refused.
 #
 # SELFTEST=1 flips the requester's headline assertion (`stored=8`), so the run must end `EXIT:1`;
@@ -76,7 +80,9 @@
 # SELFTEST=remainder flips the remainder assertion (today's defect: the buckets are destroyed);
 # SELFTEST=filters flips the multi-entry assertion (today's defect: one entry, so `filters=1`);
 # SELFTEST=screen flips the screen assertion (today's defect: the right click opens no screen, so
-# `ctl screen` reads `playing` and no entry can be made from a menu).
+# `ctl screen` reads `playing` and no entry can be made from a menu);
+# SELFTEST=queue flips the queued-ask assertion (today's defect: the ask is one `Int`, so a second
+# requester asking the same crafter is never queued and reads the first's torches as its own).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -689,7 +695,7 @@ case "$DONE" in
     *"Test passed"*) ;;
     *) fail "the requester still shows active=true once idle: $DONE" ;;
 esac
-expect 196 64 4 "stored=128 phase=idle"
+expect 196 64 4 "stored=128 served=128 queued=0 phase=idle"
 expect 197 64 4 "stored=128"
 FILLED_CRAFT=$(info 197 64 4)
 case "$FILLED_CRAFT" in
@@ -888,9 +894,10 @@ else
         *"filters=2"*) ;;
         *) fail "the requester did not keep both filter entries: $MULTI" ;;
     esac
-    # Both entries and their own stored counts, from the readout's per-entry list.
+    # Both entries, with their own bands, from the readout's per-entry list (the fields after the
+    # batch are the entry's stored count, share, queue flag, phase, crafter and timeout).
     case "$MULTI" in
-        *"entries=minecraft:torch|4|8|4|8|idle|221,64,0|0;minecraft:stick|8|16|8|16|idle|223,64,0|0"*) ;;
+        *"entries=minecraft:torch|4|8|4|"*"minecraft:stick|8|16|8|"*) ;;
         *) fail "the two entries were not both served by their own crafter: $MULTI" ;;
     esac
     case "$MULTI_TORCH" in
@@ -1435,6 +1442,110 @@ case "$SCREEN_OTHER" in
     *) fail "a requester nobody opened carries an entry: $SCREEN_OTHER" ;;
 esac
 
+echo "== queued asks: one crafter, two requesters, each served its own share =="
+# The 0.2.6 gap (notes.md §6): the ask was one `Int` in the crafter's compound, so a second
+# requester asking the same crafter was never queued - its ask was lost while the first's was
+# outstanding - and both read the same single inventory as their own. The ask is now a list of
+# (requester, item, amount) that the crafter serves in a fixed order and credits to the requester
+# whose step it was.
+for pos in 221 222 223; do
+    for z in 0 2 4; do
+        ctl command "execute in minecraft:the_end run setblock $pos 64 $z minecraft:air" >/dev/null
+    done
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run kill @e[type=item,x=219,y=63,z=-1,dx=6,dy=4,dz=7]" >/dev/null 2>&1 || true
+ctl wait 4
+ctl command "execute in minecraft:the_end run setblock 221 64 0 $BLOCK"
+ctl wait 6
+say "stepcrafter target 221 64 0 minecraft:torch"
+reply '^stepcrafter target 221 64 0 ' >/dev/null
+say "stepcrafter configure 221 64 0 0 0"
+reply '^stepcrafter configure 221 64 0 ' >/dev/null
+# Exactly one step's ingredients: 1 coal + 1 stick make 4 torches, and nothing more.
+load 221 64 0 minecraft:coal 1
+load 221 64 0 minecraft:stick 1
+QUEUE_NEW=$(info 221 64 0)
+echo "  one step's ingredients: $QUEUE_NEW"
+case "$QUEUE_NEW" in
+    *"stored=0"*"crafted=0"*"minecraft:coal:1"*"minecraft:stick:1"*) ;;
+    *) fail "the queue's crafter was not stocked with exactly one step: $QUEUE_NEW" ;;
+esac
+ctl command "execute in minecraft:the_end run setblock 222 64 0 $REQUESTER"
+ctl command "execute in minecraft:the_end run setblock 222 64 2 $REQUESTER"
+ctl wait 8
+say "stepcrafter requester 222 64 0 minecraft:torch 8 8 4"
+reply '^stepcrafter requester 222 64 0 ' >/dev/null
+say "stepcrafter requester 222 64 2 minecraft:torch 8 8 4"
+reply '^stepcrafter requester 222 64 2 ' >/dev/null
+ctl wait 40
+QUEUE_FIRST=$(info 222 64 0)
+QUEUE_SECOND=$(info 222 64 2)
+QUEUE_CRAFT=$(info 221 64 0)
+echo "  after 40 ticks, the first:  $QUEUE_FIRST"
+echo "  after 40 ticks, the second: $QUEUE_SECOND"
+echo "  after 40 ticks, the crafter: $QUEUE_CRAFT"
+# The first requester's four torches are its own; the second is queued behind it, still running,
+# and its own share is zero - not the first's torches under another name.
+case "$QUEUE_SECOND" in
+    *"stored=0 served=0 queued=1 phase=running"*) ;;
+    *) fail "the second requester is not queued behind the first with its own share of zero: $QUEUE_SECOND" ;;
+esac
+case "$QUEUE_FIRST" in
+    *"stored=4 served=4"*) ;;
+    *) fail "the first requester was not served its four torches: $QUEUE_FIRST" ;;
+esac
+case "$QUEUE_FIRST" in
+    *"crafter=221,64,0"*) ;;
+    *) fail "the first requester did not link the shared crafter: $QUEUE_FIRST" ;;
+esac
+case "$QUEUE_CRAFT" in
+    *"stored=4"*"crafted=4"*"queued=2"*) ;;
+    *) fail "the crafter did not hold both asks after serving the first: $QUEUE_CRAFT" ;;
+esac
+case "$QUEUE_CRAFT" in
+    *"asks=222,64,0|minecraft:torch|4;222,64,2|minecraft:torch|4"*) ;;
+    *) fail "the crafter's queue is not the two asks in their served order: $QUEUE_CRAFT" ;;
+esac
+case "$QUEUE_CRAFT" in
+    *"served=222,64,0|minecraft:torch|4"*) ;;
+    *) fail "the crafter did not credit the first step to the first requester: $QUEUE_CRAFT" ;;
+esac
+# A restock of two steps: the first's kept ask is served (it reaches its maximum of 8), then the
+# second's - whose own share of the stock becomes four, the number the ask named.
+load 221 64 0 minecraft:coal 2
+load 221 64 0 minecraft:stick 2
+ctl wait 40
+QUEUE_FIRST_SETTLED=$(info 222 64 0)
+QUEUE_SECOND_SETTLED=$(info 222 64 2)
+QUEUE_CRAFT_SETTLED=$(info 221 64 0)
+echo "  after the restock, the first:  $QUEUE_FIRST_SETTLED"
+echo "  after the restock, the second: $QUEUE_SECOND_SETTLED"
+echo "  after the restock, the crafter: $QUEUE_CRAFT_SETTLED"
+case "$QUEUE_FIRST_SETTLED" in
+    *"stored=8 served=8"*"phase=idle"*) ;;
+    *) fail "the first requester did not reach its maximum after the restock: $QUEUE_FIRST_SETTLED" ;;
+esac
+case "$QUEUE_SECOND_SETTLED" in
+    *"stored=4 served=4"*) ;;
+    *) fail "the second requester was not served its four torches after the restock: $QUEUE_SECOND_SETTLED" ;;
+esac
+case "$QUEUE_CRAFT_SETTLED" in
+    *"stored=12"*"crafted=12"*) ;;
+    *) fail "the crafter did not make three steps for the two askers: $QUEUE_CRAFT_SETTLED" ;;
+esac
+
+if [ "$SELFTEST" = queue ]; then
+    # Today's behaviour, deliberately asserted: with one `Int` for the ask, the second requester is
+    # never queued - it reads the first's torches as its own stock and its ask is lost. This package
+    # queues it and serves it its own four, so this inverted run has to end here, non-zero.
+    case "$QUEUE_SECOND_SETTLED" in
+        *"served=4"*) fail "SELFTEST=queue: the second requester was served its own four torches where today's single ask loses it, so the run must end non-zero: $QUEUE_SECOND_SETTLED" ;;
+        *) ;;
+    esac
+    fail "SELFTEST=queue: today's defect is not on this package"
+fi
+
 echo "== /stepcrafter needs an operator =="
 PLAYER=$(ctl state | jq -r '.player.name')
 [ -n "$PLAYER" ] || fail "cannot name the local player"
@@ -1449,4 +1560,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"

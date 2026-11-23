@@ -1,11 +1,11 @@
-# Package receipt — stepcrafter 0.2.6
+# Package receipt — stepcrafter 0.2.7
 
 | field | value |
 |---|---|
-| version | `0.2.6` |
+| version | `0.2.7` |
 | file | `stepcrafter.hmod` |
-| bytes | 78,612 |
-| sha256 | `6463ca1d05de67a3a2d6d890a76658b672e98aad82b655ff7b65479c4ea251b9` |
+| bytes | 84,810 |
+| sha256 | `968321fd7ef5c64b9825fbe4eb87a1b0c4910512cab89f1d5ebe27f225c24bbc` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |

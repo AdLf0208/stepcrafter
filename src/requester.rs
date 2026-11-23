@@ -5,12 +5,13 @@
 //! (`StepRequesterNetworkNode.doWork`). A Horizon add-on cannot join that network (see
 //! `ports/_shared/evidence/stepcrafter/parent-surface.md`), so this port roots the same rule on the
 //! machine that exists here: a **nearby Step Crafter**. Its stock is the storage the requester
-//! watches, and the ask is a `Request` count written into that crafter's saved compound — the pin's
-//! `/data merge block` write path ([`mod_api::BlockEntityRef::merge_data`]) — which the crafter's
-//! own tick spends one step at a time.
+//! watches, and the ask is one entry (`x,y,z|item|remaining`) merged into that crafter's saved
+//! `Requests` list — the pin's `/data merge block` write path
+//! ([`mod_api::BlockEntityRef::merge_data`]) — which the crafter's own tick serves one step at a time
+//! and credits to the asker (`Served`), so two requesters on one crafter are two asks, not one count.
 //!
-//! What crosses between the two blocks is world state only: one `Int` written into the other's
-//! compound, and reads of its `Target`, `Phase`, `Request` and item slots. No Rust call crosses a
+//! What crosses between the two blocks is world state only: a list written into the other's compound,
+//! and reads of its `Target`, `Phase`, `Requests`, `Served` and item slots. No Rust call crosses a
 //! port boundary, and neither block needs the other's crate.
 
 use mod_api::{
@@ -238,19 +239,21 @@ fn tick_entry(host: &mut dyn ServerHost, level: LevelRef, me: [i32; 3], entry: &
         }
     };
 
-    let stored = stock_count(&*host, crafter_entity, entry.filter().item());
-    let mut phase = entry.phase();
-    let mut backoff = entry.backoff();
-    // A crafter that refused the ask (its own phase says so, and it has nothing outstanding) is
-    // upstream's failed task: report it, and stop asking for its 20-tick timeout.
-    if phase == Phase::Crafting
-        && crafter.request == 0
-        && let Some(refusal) = runtime::refused(crafter.phase, stored, entry.filter())
-    {
-        phase = refusal;
-        backoff = runtime::FAILED_TASK_TIMEOUT_TICKS;
-    }
-    let decision = runtime::ask(stored, entry.filter(), phase, crafter.request, backoff);
+    let item = entry.filter().item().to_owned();
+    // The stock is the crafter's single inventory, but the entry's own `stored` is **its** share of
+    // it: what its asks produced, never another requester's torches (0.2.7).
+    let stock = stock_count(&*host, crafter_entity, &item);
+    let stored = crafter.queue.share(me, &item, stock);
+    let outstanding = crafter.queue.outstanding(me, &item);
+    // The crafter names the ask it could not serve; only that requester reports the refusal and
+    // times out — upstream's failed task belongs to the requester that started it.
+    let refused = crafter
+        .queue
+        .failed_for(me, &item)
+        .then_some(crafter.phase)
+        .filter(|phase| phase.is_refusal());
+    let (phase, backoff) = runtime::settle(entry.phase(), entry.backoff(), refused, outstanding);
+    let decision = runtime::ask(stored, entry.filter(), phase, outstanding, backoff);
 
     entry.set_link(Some(crafter_pos));
     entry.set_phase(phase);
@@ -271,14 +274,14 @@ fn tick_entry(host: &mut dyn ServerHost, level: LevelRef, me: [i32; 3], entry: &
         }
         Ask::Request { amount } => {
             entry.set_phase(Phase::Crafting);
-            ask_crafter(host, crafter_entity, amount);
+            ask_crafter(host, crafter_entity, me, &item, amount);
             true
         }
     }
 }
 
-/// One entry as the readout prints it: what it maintains, how much of it its crafter holds, and how
-/// its last tick went.
+/// One entry as the readout prints it: what it maintains, its own share of its crafter's stock, and
+/// how its last tick went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     /// The entry's resource.
@@ -289,9 +292,13 @@ pub struct View {
     pub max: u64,
     /// The entry's largest single ask.
     pub batch: u64,
-    /// How much of the resource the linked crafter holds.
+    /// The entry's own share of the item in the linked crafter: what its asks produced.
     pub stored: u64,
-    /// The entry's phase, `running` while it is asking.
+    /// How many items the linked crafter has served this entry, in all.
+    pub served: u64,
+    /// Whether this entry's ask is queued with the linked crafter (`1`) or not (`0`).
+    pub queued: u64,
+    /// The entry's phase, `running` while its ask is queued.
     pub phase: &'static str,
     /// The crafter this entry asks right now.
     pub crafter: Option<[i32; 3]>,
@@ -300,19 +307,22 @@ pub struct View {
 }
 
 impl View {
-    /// The entry as one readout field: `item|min|max|batch|stored|phase|crafter|backoff`.
+    /// The entry as one readout field:
+    /// `item|min|max|batch|stored|served|queued|phase|crafter|backoff`.
     #[must_use]
     pub fn encode(&self) -> String {
         let crafter = self
             .crafter
             .map_or_else(|| "none".to_owned(), |[x, y, z]| format!("{x},{y},{z}"));
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.item,
             self.min,
             self.max,
             self.batch,
             self.stored,
+            self.served,
+            self.queued,
             self.phase,
             crafter,
             self.backoff
@@ -320,8 +330,8 @@ impl View {
     }
 }
 
-/// Every configured entry as the readout needs it: its crafter and that crafter's stock of its
-/// resource (upstream's `storageComponent.get(resource)`), resolved once.
+/// Every configured entry as the readout needs it: its crafter, that crafter's stock of its resource
+/// (upstream's `storageComponent.get(resource)`) and this entry's own share of it, resolved once.
 #[must_use]
 pub fn views(host: &dyn Host, level: LevelRef, me: [i32; 3], nbt: &Compound) -> Vec<View> {
     read(nbt)
@@ -329,18 +339,27 @@ pub fn views(host: &dyn Host, level: LevelRef, me: [i32; 3], nbt: &Compound) -> 
         .iter()
         .map(|entry| {
             let filter = entry.filter();
-            let (crafter, stored) = match resolve(host, level, me, filter.item(), entry.link()) {
-                Found::Crafter { pos, entity, .. } => {
-                    (Some(pos), stock_count(host, entity, filter.item()))
-                }
-                Found::NoCrafter | Found::Unreadable => (None, 0),
-            };
+            let (crafter, stored, served, queued) =
+                match resolve(host, level, me, filter.item(), entry.link()) {
+                    Found::Crafter { pos, entity, state } => {
+                        let stock = stock_count(host, entity, filter.item());
+                        (
+                            Some(pos),
+                            state.queue.share(me, filter.item(), stock),
+                            state.queue.served_for(me, filter.item()),
+                            state.queue.outstanding(me, filter.item()),
+                        )
+                    }
+                    Found::NoCrafter | Found::Unreadable => (None, 0, 0, 0),
+                };
             View {
                 item: filter.item().to_owned(),
                 min: filter.band().min(),
                 max: filter.band().max(),
                 batch: filter.batch(),
                 stored,
+                served,
+                queued: u64::from(queued > 0),
                 phase: entry.phase_id(),
                 crafter,
                 backoff: entry.backoff(),
@@ -359,12 +378,39 @@ pub fn stock_count(host: &dyn Host, entity: BlockEntityRef, item: &str) -> u64 {
         .sum()
 }
 
-/// Put one ask into the crafter's saved compound: the `/data merge block` write path, which loads
-/// the merged compound into the block entity, so its own next tick reads the ask.
-fn ask_crafter(host: &mut dyn ServerHost, entity: BlockEntityRef, amount: u64) {
-    let mut data = Compound::new();
-    put(&mut data, machine::KEY_REQUEST, int_of(amount));
-    let _ = entity.merge_data(host, data);
+/// Put one ask into the crafter's queue: the `/data merge block` write path, which loads the merged
+/// compound into the block entity, so the crafter's own next tick serves it.
+///
+/// The ask is the queue's **list**, so a second requester's ask joins the first's instead of
+/// overwriting it (0.2.6's single `Request` `Int` was the last writer's). A requester holds one ask
+/// per item: re-asking merges into it.
+fn ask_crafter(
+    host: &mut dyn ServerHost,
+    entity: BlockEntityRef,
+    me: [i32; 3],
+    item: &str,
+    amount: u64,
+) {
+    let Some(data) = entity.data(&*host) else {
+        return;
+    };
+    let mut queue = machine::shared(&data).queue;
+    if !queue.ask(me, item, amount) {
+        return;
+    }
+    let mut patch = Compound::new();
+    put(
+        &mut patch,
+        machine::KEY_REQUESTS,
+        Tag::List(
+            queue
+                .encode()
+                .iter()
+                .map(|entry| Tag::String(entry.as_str().into()))
+                .collect(),
+        ),
+    );
+    let _ = entity.merge_data(host, patch);
 }
 
 /// One press on a requester's screen, on the server (`menu_button`): the item the player carries
@@ -411,11 +457,11 @@ pub fn extra_data(host: &dyn Host, level: LevelRef, pos: [i32; 3], menu: &str) -
 
 /// Where a requester's crafter is this tick.
 enum Found {
-    /// The crafter, its handle, and what the requester needs to know about it.
+    /// The crafter, its handle, and the part of its saved state a requester reads.
     Crafter {
         pos: [i32; 3],
         entity: BlockEntityRef,
-        state: Crafter,
+        state: machine::Shared,
     },
     /// No Step Crafter maintains the filter inside [`LINK_RADIUS`].
     NoCrafter,
@@ -424,26 +470,9 @@ enum Found {
     Unreadable,
 }
 
-/// The part of a crafter's saved state a requester reads: how many items it has been asked for and
-/// how its last step went. The pattern, the band and the stock are the crafter's own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Crafter {
-    request: u64,
-    phase: Phase,
-}
-
-impl From<machine::State> for Crafter {
-    fn from(state: machine::State) -> Self {
-        Self {
-            request: state.request,
-            phase: state.phase,
-        }
-    }
-}
-
 /// One position's answer to "is this the crafter my filter needs".
 enum Candidate {
-    Hit(BlockEntityRef, Crafter),
+    Hit(BlockEntityRef, machine::Shared),
     Unreadable,
     Miss,
 }
@@ -465,7 +494,7 @@ fn resolve(
             Candidate::Miss => {}
         }
     }
-    let mut best: Option<([i32; 3], BlockEntityRef, Crafter, i32)> = None;
+    let mut best: Option<([i32; 3], BlockEntityRef, machine::Shared, i32)> = None;
     let mut unreadable = false;
     for dx in -LINK_RADIUS..=LINK_RADIUS {
         for dy in -LINK_RADIUS..=LINK_RADIUS {
@@ -506,9 +535,9 @@ fn inspect(host: &dyn Host, level: LevelRef, pos: [i32; 3], item: &str) -> Candi
     let Some(data) = entity.data(host) else {
         return Candidate::Unreadable;
     };
-    let state = machine::read(&data);
+    let state = machine::shared(&data);
     if state.target.as_deref() == Some(item) {
-        Candidate::Hit(entity, Crafter::from(state))
+        Candidate::Hit(entity, state)
     } else {
         // A crafter that maintains something else cannot be asked for this item: the ask would
         // spend this requester's items on another pattern.

@@ -321,6 +321,77 @@ crafter could not step. The leg names `minecraft:oak_planks` and asserts the sto
 The screen shows the selected entry's three values live (data slots) and every entry's icon (the open
 payload, refreshed when the menu is reopened); a cell that is `count` is the next one a click fills.
 
+## 2h. The slice (version 0.2.7): queued asks — one crafter, several requesters, each its own share
+
+0.2.6's own gap line (§6) was *"the ask is one `Int` in the crafter's compound … A second requester
+asking the same crafter is not queued — the ask is a count, and the stock both requesters watch is the
+crafter's single inventory"*. That sentence named the limitation and the shared crafter it made
+silent; this slice replaces the count with the queue.
+
+### The artefact's task model, read before any code
+
+Upstream never writes a count into a machine either. `StepRequesterNetworkNode.doWork` calls
+`startTask(resource, batch)` on the network's autocrafting component, which creates a **task** in the
+network's crafting monitor (`StepTaskImpl`/`StepTaskContainer`, with their own `amount` and
+`craftedAmount`), and the monitor runs its tasks one at a time. Two requesters asking the same pattern
+therefore get **two tasks**; each task's progress is its own, and a task that cannot start (missing
+ingredients) answers empty — that *requester* records `NOT_ENOUGH_INGREDIENTS` and its 20-tick
+failed-task timeout, not the network's other tasks.
+
+The re-root keeps that shape in the crafter's saved compound, because the network's task queue is the
+one part of the autocrafting surface that is a plain list of (owner, resource, amount):
+
+| saved key | what it is |
+|---|---|
+| `Requests` | a `List` of `x,y,z\|item\|remaining` — one ask per (requester, item), the work the crafter owes |
+| `Served` | a `List` of `x,y,z\|item\|count` — what each requester's asks have produced, its **share** of the stock |
+| `Failed` | `x,y,z\|item` — the ask the crafter last could not serve (upstream's failed task, owned by its requester) |
+
+0.2.6's `Request` `Int` is dropped on the next write. It was **operational** state, not configuration:
+the asks in it are gone, and each requester sees its ask missing and re-asks on the next tick (unlike
+the 0.2.1–0.2.4 filter, which was configuration and is still read as one entry, §2f).
+
+### The rules
+
+- **One ask per (requester, item).** Re-asking merges into the same ask (a larger count raises it), so
+  upstream's `isAlreadyRunningTask` is still one guard, now per asker instead of per machine.
+- **The queue's order is its identity**: sorted by requester position, then item. Two requesters asking
+  in the same tick therefore cannot race for the head, and the same world always serves them in the
+  same order. The head is spent one step per tick, and the step's product is credited to **its**
+  requester (`Served`), never to whoever happens to be looking.
+- **A failed ask keeps its place.** When the machine cannot take the head's step it names that ask in
+  `Failed` and leaves it queued: the asks behind it are not lost with it. Only the named requester
+  reports the refusal (`phase=not-enough-ingredients` / `network-full`) and holds the 20-tick timeout;
+  its ask stays queued, so the restock serves it — the failed task is a timeout, not a dropped ask.
+  An ask that *can* never be served (another item because the machine was re-targeted, or a requester
+  that is no longer a block) is dropped, and a failure naming it is cleared with it.
+- **A requester's `stored` is its own share** of the linked crafter's stock: what its asks produced,
+  clamped to the stock that is there (`min(served, stock)`). With one requester it is the whole stock,
+  exactly as before; with two, the first reads its four torches and the second reads zero instead of
+  the first's torches under another name. `served` is the same number un-clamped (the cumulative
+  share), and `queued` is its outstanding ask.
+- **The machine writes only a state that moved.** A requester's ask is written into the crafter's
+  compound with `merge_data` during that requester's own tick; if the crafter re-wrote the queue it
+  read before the ask landed, the ask would vanish. It therefore writes when (and only when) its own
+  read state changed, and a lost ask is self-healing anyway (the asker sees it missing and re-asks).
+
+### What changed
+
+- **`runtime.rs`**: `Queued` (one ask), `FailedAsk` (whose ask failed), `Queue` (the asks + the served
+  counters + the failure) with `ask`/`outstanding`/`served_for`/`share`/`spend`/`fail`/`retain` and its
+  saved forms; `Phase::is_refusal`; `settle` — the entry's phase before `ask` (the refusal while the
+  crafter names this entry's ask, and the resumption of a run whose ask was served). `refused` (the
+  0.2.1 heuristic "the crafter's phase says so and nothing is outstanding") is gone: the machine now
+  names the ask, so the requester no longer has to infer it from a shared count.
+- **`machine.rs`**: `State.queue` replaces `State.request`; `Shared` (`target`, `phase`, `queue`) is
+  the part another block reads; the tick prunes unservable asks, serves the head, credits it, names a
+  refusal, and writes only on change; the readout prints `queued=`, `asks=` and `served=`.
+- **`requester.rs`**: `stored` = its share, plus `served`/`queued`; `settle` in place of `refused`;
+  `ask_crafter` reads the crafter's queue and merges its ask into the `Requests` list.
+- **`commands.rs`**: the requester's line gains `served=`/`queued=` (and the per-entry list gains
+  `served|queued`); the machine's line prints the queue and its credits.
+- **No new requester configuration**, so no world migrates: its filter container is untouched.
+
 ## 2d. The slice (version 0.2.3): crafting remainders
 
 0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
@@ -529,6 +600,44 @@ The game half's red is `SELFTEST=screen` (§4): it asserts today's behaviour —
 screen (`ctl screen` says `playing`) and no entry can be made from a menu — and ends non-zero on this
 package. The route itself has its own measurement log, `probe-menu.log` (`notes.md` §2g trap 1).
 
+Green at 0.2.7 (the queued-ask slice): **73 tests** (`sdk-test.log`, `Compiling stepcrafter v0.2.7`).
+Its red transcript is `red-unit-queue.log`: `Queued`/`Queue`/`FailedAsk`/`settle` existed as stubs
+(`ask` answering `false`, `outstanding`/`served_for`/`share` answering `0`, `spend`/`fail` answering
+nothing, `settle` returning its input) while the eight new tests demanded the queue, so all eight
+failed for exactly that reason:
+
+```
+---- runtime::tests::a_second_requester_is_queued_beside_the_first stdout ----
+
+thread 'runtime::tests::a_second_requester_is_queued_beside_the_first' (337174) panicked at src/runtime.rs:2788:9:
+the first ask is queued
+
+---- runtime::tests::a_refusal_settles_the_entry_and_a_served_ask_resumes_it stdout ----
+
+thread 'runtime::tests::a_refusal_settles_the_entry_and_a_served_ask_resumes_it' (337161) panicked at src/runtime.rs:2946:9:
+assertion `left == right` failed: the failed task times out
+  left: (Crafting, 0)
+ right: (NotEnoughIngredients, 20)
+
+---- runtime::tests::a_requester_holds_one_ask_per_resource stdout ----
+
+thread 'runtime::tests::a_requester_holds_one_ask_per_resource' (337170) panicked at src/runtime.rs:2860:9:
+assertion failed: queue.ask(ASKER_A, "minecraft:torch", 4)
+
+test result: FAILED. 64 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+The one test the slice retired, `a_crafter_that_refused_is_the_requesters_failed_task`, is replaced by
+`a_refusal_settles_the_entry_and_a_served_ask_resumes_it`: the machine names the refused ask now, so the
+requester no longer infers a refusal from a shared count.
+
+The game half's red is `e2e-red-queue-0.2.6.log`: the **previous** package (0.2.6, its export kept
+before the rebuild) run with this leg reads the second requester at
+`stored=4 phase=not-enough-ingredients` — the first's torches under its own name, `requests=3` of
+asking-and-being-refused, and no queue anywhere — so the leg's own assertion
+(`stored=0 served=0 queued=1 phase=running`) fails on it. That is the defect stated as a run, not as a
+reading. `SELFTEST=queue` then asserts the fixed behaviour and ends non-zero (§4).
+
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
 `decide_finishes_at_the_maximum`), the step (`a_step_consumes_every_cell_and_makes_the_result`,
@@ -559,14 +668,15 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — ten run logs plus the build log, all `--strict` green
-(`logs=10 ok=10 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — twelve run logs plus the build log, all `--strict` green
+(`logs=12 ok=12 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
 | `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package, plus an in-run control leg on the same Nightly built without it |
 | `e2e-control.log` | `FAIL` + `EXIT:1` | the same script with `GAME` = the Nightly **without** the package: `setblock stepcrafter:step_crafter` leaves air |
 | `e2e-red-components-0.2.3.log` | `FAIL` + `EXIT:1` | the **previous** package (0.2.3) run with 0.2.4's leg: `/stepcrafter step` answers `result=crafted` beside the named stack and leaves `torch:60` — the silent loss, reproduced |
+| `e2e-red-queue-0.2.6.log` | `FAIL` + `EXIT:1` | the **previous** package (0.2.6) run with 0.2.7's leg: the second requester reads `stored=4 phase=not-enough-ingredients` — the first's torches as its own, and no queue anywhere — so the leg's `stored=0 served=0 queued=1 phase=running` fails on it |
 | `e2e-selftest.log` | `FAIL` + `EXIT:1` | `SELFTEST=1` inverts the **requester's** headline assertion (`stored=8`) and the run ends non-zero; `SELFTEST=crafter` inverts the machine's (`stored=16`) instead |
 | `e2e-selftest-capacity.log` | `FAIL` + `EXIT:1` | `SELFTEST=capacity` inverts the **no-room** assertion: “nothing fit, so nothing was served” (`crafted=0`) ends the run non-zero |
 | `e2e-selftest-components-room.log` | `FAIL` + `EXIT:1` | `SELFTEST=components-room` inverts the **component-room** assertion: the named stack counted no room and the step was refused (`phase=network-full crafted=0`) ends the run non-zero |
@@ -574,7 +684,8 @@ entity, and was removed. Both are recorded under §6.
 | `e2e-selftest-remainder.log` | `FAIL` + `EXIT:1` | `SELFTEST=remainder` inverts the **remainder** assertion: the defect “the step consumes the buckets and leaves none” ends the run non-zero |
 | `e2e-selftest-filters.log` | `FAIL` + `EXIT:1` | `SELFTEST=filters` inverts the **multi-entry** assertion: today's defect is one entry (`filters=1`), so the run ends non-zero on the package that keeps `filters=2` |
 | `e2e-selftest-screen.log` | `FAIL` + `EXIT:1` | `SELFTEST=screen` inverts the **screen** assertion: today's defect is a right click that opens no screen (`playing`) and a menu that can make no entry, so the run ends non-zero on the package that opens it |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.6: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-queue.log` | `FAIL` + `EXIT:1` | `SELFTEST=queue` inverts the **queued-ask** assertion: today's defect is one `Int`, so the second requester's ask is lost and it reads the first's torches; this package serves it its own four (`served=4`), so the run ends non-zero |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.7: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 | `screen-requester.png` | screenshot | the filter screen on a requester at `223 64 0`: the title, the 9 × 5 cells with the torch's icon, `min 4`, `max 8`, `batch 4` and the remove button |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
@@ -612,8 +723,9 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     with the same 4 + 4 and configured the same way, at `stored=0 crafted=0` — the ask is the only
     difference between the two, so the assertion above can fail;
 13. the crafter's own refusal reaches it: with the sticks drained the requester reads
-    `phase=not-enough-ingredients backoff=13` and the crafter `crafted=0`; the restock resumes both
-    (`stored=8`, `crafted=8`);
+    `phase=not-enough-ingredients queued=1` — the machine names the ask it could not serve, only its
+    asker reports the refusal, and the ask keeps its place — and the crafter `crafted=0`; the restock
+    serves the queued ask and resumes both (`stored=8`, `crafted=8`);
 14. a 32-step run (filter `4 128 4`, 32 + 32 loaded) reads `phase=running` while it works,
     `active=true` on the requester, then `active=false` and `stored=128` / `crafted=128` at rest;
 15. **the review's room defect (0.2.2)**: a crafter at 216 with `target minecraft:torch`, band `0..0`
@@ -655,7 +767,8 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     `requester add`, reading `filters=1` then `filters=2`); the torch crafter at `221 64 0` is stocked
     with 4 coal + 4 sticks and the stick crafter at `223 64 0` with 8 `minecraft:oak_planks`. After 80
     ticks the requester reads `filters=2` and
-    `entries=minecraft:torch|4|8|4|8|idle|221,64,0|0;minecraft:stick|8|16|8|16|idle|223,64,0|0`,
+    `entries=minecraft:torch|4|8|4|8|8|0|idle|221,64,0|0;minecraft:stick|8|16|8|16|16|0|idle|223,64,0|0`
+    (`item|min|max|batch|stored|served|queued|phase|crafter|backoff` per entry),
     with `crafted=8` on 221 and `crafted=16` on 223 — each entry served by the crafter that maintains
     its item. The **differential**: a second requester at `222 64 4` with only the torch entry (the
     0.2.1–0.2.4 spelling) beside its own fresh pair reads `filters=1`, leaves the torch crafter at
@@ -677,16 +790,26 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     requester at `223 64 4`, never opened, reads `filters=0 item=none`. The screenshot
     `screen-requester.png` is the open screen. `SELFTEST=screen` asserts today's `screen: playing` /
     `filters=0` and ends the run non-zero.
+24. **queued asks (0.2.7)**: one crafter at `221 64 0` (`target minecraft:torch`, band `0..0`, **1 coal
+    + 1 stick** = exactly one step) and two requesters, `222 64 0` and `222 64 2`, both filtered
+    `minecraft:torch 8 8 4`. After 40 ticks the first reads `stored=4 served=4 queued=1`, the second
+    `stored=0 served=0 queued=1 phase=running`, and the crafter `stored=4 crafted=4 queued=2
+    asks=222,64,0|minecraft:torch|4;222,64,2|minecraft:torch|4 served=222,64,0|minecraft:torch|4`: the
+    first ask was served and credited to its own asker, the second is queued behind it and has its own
+    share of zero. A restock of two steps then serves the first's kept ask (it reaches its maximum:
+    `stored=8 served=8 phase=idle`) and the second's (`stored=4 served=4`), with the crafter at
+    `stored=12 crafted=12`. `SELFTEST=queue` asserts the fixed behaviour and ends the run non-zero; the
+    previous package run with this leg is `e2e-red-queue-0.2.6.log`.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **78,612 B** |
-| sha256 | `6463ca1d05de67a3a2d6d890a76658b672e98aad82b655ff7b65479c4ea251b9` |
-| entries | 39 (`274,262 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.6` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **84,810 B** |
+| sha256 | `968321fd7ef5c64b9825fbe4eb87a1b0c4910512cab89f1d5ebe27f225c24bbc` |
+| entries | 39 (`302,942 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.7` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -749,12 +872,11 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   and the numbers in the data slots, which are a view and not saved. A resource set *from* the screen
   shows its icon when the menu is reopened (the payload is sent when the menu opens); the numbers
   update at every press.
-- **A stale sentence in the crate's module summary.** `src/lib.rs`'s module doc still lists "the
-  requester … and the GUIs" among the families blocked on the parent's surface. That sentence
-  predates 0.2.1 (which ported the requester) and this slice's screen; §1, §2g and `screen.rs`'s own
-  module doc are the authority. Correcting it changes the packed source and so needs its own build
-  and leg re-run, which is left for the next touch of `lib.rs` rather than done after the evidence
-  below was recorded.
+- ~~**A stale sentence in the crate's module summary.**~~ **Closed in 0.2.7** (§2h): `src/lib.rs`'s
+  module doc listed the requester and the GUIs among the families blocked on the parent's surface,
+  and `machine`/`requester`'s summaries still described the ask as one `Int`. They now name the
+  requester, its screen and the ask queue, and this slice's build and legs are the ones recorded
+  below.
 - **A panel taller than the game's 240-pixel GUI is unreachable** (§2g trap 3): the requester's is
   176 × 238, which fits. A future row must come out of the layout, not be added below it.
 - **The machine's stock menu and the requester's screen both open from the mod's own click handler**
@@ -763,10 +885,25 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 - **Each entry links its own crafter.** A Step Crafter maintains one target, so two entries with
   different resources cannot link the same crafter; a re-targeted crafter drops the entry's saved link
   and the next tick rescans (the §2b rule), entry by entry.
-- **The ask is one `Int` in the crafter's compound** (`Request`, the pin's `/data merge block` write
-  path), spent at one step per tick. A second requester asking the same crafter is not queued — the
-  ask is a count, and the stock both requesters watch is the crafter's single inventory; the readout
-  names the crafter each one linked, so a shared crafter is visible rather than silent.
+- **The asks are a list in the crafter's compound** (`Requests`, one `x,y,z|item|remaining` per
+  (requester, item); 0.2.6's single `Request` `Int` is dropped on the next write, and its asker
+  re-asks), served head first, one step per tick. The queue's order is fixed — requester position,
+  then item — so two askers that write in the same tick cannot race for the head. A requester holds
+  **one** ask per resource (re-asking raises its count), which is upstream's `isAlreadyRunningTask`
+  per asker instead of per machine.
+- **A share is a share.** `Served` (`x,y,z|item|count`) credits a step's product to the ask it served,
+  and a requester's `stored` is `min(its served, the stock that is there)`. With one requester that is
+  the whole stock; with two, each reads its own torches. The stock itself is still the crafter's one
+  27-slot inventory (no network), so a player emptying it lowers every share with it.
+- **A refusal names one ask.** The machine records the ask it could not serve in `Failed` and keeps it
+  queued; only that asker reports `not-enough-ingredients`/`network-full` and holds the 20-tick
+  timeout, and the restock serves the kept ask. An ask that can never be served is dropped: another
+  item (the machine was re-targeted) or a requester block that is no longer there (a requester whose
+  chunk is merely unloaded keeps its place). A machine with no pattern leaves its asks waiting rather
+  than refusing them — an unconfigured machine is not a failed task.
+- **A requester can lose its credit by moving.** `Served` lives in the crafter's compound, because the
+  crafter is what crafts; a re-linked requester reads its share of the crafter it now asks (0 for a
+  crafter that never served it), not a lifetime total.
 - **Upstream's `FINISHED` status is not saved as a phase**: reaching `max` returns the requester to
   `idle`, which is the state a player reads. `running` is upstream's `CRAFTING`; `not-enough-ingredients`
   and `network-full` are the crafter's refusals, reported with the stock unchanged.
@@ -798,10 +935,12 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | taking the resource out | `network.extract(resource, count)` | `/stepcrafter take` hands over the **stored stacks themselves**, split to the count asked for: names, enchantments and damage stay on them |
 | the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick_entry` |
 | several filter entries, each with its own status and failed-task timeout | the `rf` container (45 `ResourceMinMaxAmount`) and the node's per-index `runningTasks`/`failedTaskTimeouts` | `runtime::Filters`/`Entry` (add-or-replace by resource, 45 cap, saved list), one `tick_entry` per entry; the readout's `filters=N entries=…` |
-| "a task is already running" | `isAlreadyRunningTask` on the task id map | the outstanding `Request` count in the crafter's compound |
+| "a task is already running" | `isAlreadyRunningTask` on the task id map | the ask this requester already holds for that resource (`Queue::outstanding`) — other askers' asks are theirs |
+| a task that cannot start | `startTask` answers empty: that requester's `NOT_ENOUGH_INGREDIENTS` + 20 ticks | the machine names the ask in `Failed` and keeps it queued; only its asker reports the refusal and backs off, the restock serves it |
+| the queued tasks' progress | `StepTaskImpl`/`StepTaskContainer` (`amount`, `craftedAmount`) per task | `Queue`'s head ask + `Served` per (requester, item) |
 | a failed task (20-tick timeout) | `failedTaskTimeouts`, `FAILED_TASK_TIMEOUT_TICKS` | `runtime::refused` + `State::backoff` (`FAILED_TASK_TIMEOUT_TICKS = 20`) |
-| the store the requester watches | `StorageNetworkComponent.get(resource)` | the linked crafter's own 27 slots (`requester::stock_count`) |
-| `startTask(resource, batch)` | the autocrafting component | one `Request` `Int` written into the crafter's compound (`merge_data`) |
+| the store the requester watches | `StorageNetworkComponent.get(resource)` | the linked crafter's own 27 slots (`requester::stock_count`), of which the requester's `stored` is its own share (`Queue::share`) |
+| `startTask(resource, batch)` | the autocrafting component creates a task in the crafting monitor | one ask (`x,y,z\|item\|remaining`) merged into the crafter's `Requests` list (`merge_data`); the step's product is credited to it in `Served` |
 | the requester's status per filter slot | `ResourceStatus` again | `Phase`, printed as `idle` / `running` / `not-enough-ingredients` / `network-full` |
 | the requester's `active` | the network node's property | true while it is asking |
 
@@ -815,10 +954,10 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `refused` — no `mod_api` types |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `settle`, and the crafter's `Queued`/`FailedAsk`/`Queue` (the ask list, its credits and its failed ask, with their saved forms) — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
-| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, a requester's `Request`), the 27-slot inventory as a stock, the tick, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
-| `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, the ask, per-entry tick and the readout's views, the selected cell, the menu's data slots and open payload, and `press` (the server half of a screen press) |
+| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, the ask `Queue` with its `Served` credits and `Failed` ask), the 27-slot inventory as a stock, `Shared` (the part a requester reads), the tick that prunes, serves and credits the head ask, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
+| `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, its ask merged into that crafter's queue, the per-entry tick (`settle` → `ask`) and the readout's views (its own `stored`/`served`/`queued`), the selected cell, the menu's data slots and open payload, and `press` (the server half of a screen press) |
 | `src/screen.rs` | the filter screen: the 176 × 238 layout, `cell_at`/`button_at` hit tests and the drawing (cells, icons, the selected entry's values, the buttons) |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
 | `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
@@ -855,7 +994,8 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |
 | **the interop: the requester asks a nearby Step Crafter** | **tested** in game — the pair reaches `stored=8` / `crafted=8` with 2 coal and 2 sticks consumed, and the *same world with the requester removed* leaves an identically configured machine at `stored=0 crafted=0` |
 | **several filter entries, each served by the crafter that maintains its item** | **tested** — `a_second_filter_entry_is_kept_beside_the_first`, `a_filter_entry_is_replaced_by_its_own_resource`, `a_requester_carries_at_most_the_containers_45_entries`, `a_removed_entry_leaves_the_others`, `a_filter_entry_round_trips_through_its_saved_form`, `the_filter_container_round_trips_through_its_saved_form`, `a_legacy_single_filter_compound_still_reads_as_one_entry`; in game one requester with a torch entry and a stick entry reads `filters=2` with both entries and their stored counts, `crafted=8` on the torch crafter and `crafted=16` on the stick crafter, while the same world with only the torch entry leaves the stick crafter at `crafted=0`; `SELFTEST=filters` ends non-zero |
-| the refusal path across the two blocks | **tested** in game — the crafter with no sticks answers `not-enough-ingredients`, the requester shows `phase=not-enough-ingredients backoff=13`, the restock resumes both to `stored=8 crafted=8` |
+| the refusal path across the two blocks | **tested** in game — the crafter with no sticks answers `not-enough-ingredients`, the requester whose ask it names shows `phase=not-enough-ingredients queued=1` (the ask keeps its place), the restock serves it and resumes both to `stored=8 crafted=8` |
+| **queued asks: two requesters on one crafter, each its own share** | **tested** — `a_second_requester_is_queued_beside_the_first`, `the_queue_serves_in_a_fixed_order_whatever_order_it_was_written`, `a_step_is_credited_to_the_ask_it_served`, `a_requester_holds_one_ask_per_resource`, `a_failed_ask_keeps_its_place_and_names_its_requester`, `the_queue_round_trips_through_its_saved_form`, `a_refusal_settles_the_entry_and_a_served_ask_resumes_it`, `the_queue_drops_asks_that_can_never_be_served`, with the machine's `the_shared_read_is_the_queue_and_the_phase` and `a_legacy_single_ask_is_not_a_queued_ask`; in game: after 40 ticks the first reads `stored=4 served=4`, the second `stored=0 served=0 queued=1 phase=running`, the crafter `queued=2 asks=222,64,0\|minecraft:torch\|4;222,64,2\|minecraft:torch\|4`; a restock of two steps serves both (`served=8` / `served=4`, `crafted=12`); `SELFTEST=queue` inverts it and ends non-zero, and the 0.2.6 export fails the same leg (`e2e-red-queue-0.2.6.log`) |
 | the requester's own loot | **tested** in game — a survival break with a pickaxe drops `stepcrafter:step_requester:1` |
 | **the requester's filter screen** (open, cells, values, remove) | **tested** — `a_press_round_trips_through_its_button_id`, `a_click_on_an_empty_cell_with_a_carried_item_adds_the_entry`, `a_click_on_a_filled_cell_selects_it`, `a_click_with_another_item_repoints_the_entry_and_keeps_its_band`, `a_click_that_would_give_two_entries_one_resource_is_refused`, `a_step_keeps_the_band_valid`, `a_step_never_goes_below_zero_and_a_zero_batch_stays_disabled`, `a_batch_step_enables_an_entry`, `a_remove_press_drops_the_selected_entry_and_keeps_the_others`, `a_cell_beyond_the_next_free_one_changes_nothing`, `a_step_on_an_empty_requester_changes_nothing`, `the_data_slots_are_the_selected_entry`, `the_screen_payload_lists_every_entrys_resource`, `the_editor_and_the_command_are_one_container`, `the_grid_is_nine_by_five_and_the_cells_do_not_overlap`, `the_buttons_are_the_presses_the_server_applies`, `the_panel_holds_its_rows_and_the_inventory` (compile-time), and `the_menu_declares_the_slots_the_screen_publishes`; in game the screen opens on a right click, a carried torch makes entry 0, the buttons set `min=4 max=8 batch=4`, a carried stick repoints the cell, the command's entry is a cell the remove button drops, and an unopened requester has none; `SELFTEST=screen` ends non-zero |
 | the screen's panel and its origin | **tested** in game — the panel's top is 36 above the 166-high chest panel's (the declared 238), its left is the centred 176, and `slot-0` (the hotbar's first) is where the layout puts it |
