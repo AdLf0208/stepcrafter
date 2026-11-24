@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-game check for Step Crafter (the SDK package, 0.2.8).
+# In-game check for Step Crafter (the SDK package, 0.2.9).
 #
 # This package is a native `.hmod`: the launcher compiles it into the game
 # (`ports/tools/launcher-game.sh build stepcrafter`), and the resulting binary carries the block,
@@ -70,6 +70,10 @@
 #    makes `/stepcrafter info` read `target=minecraft:torch cells=2 result=minecraft:torch:4`, the
 #    drawn `max +` x16 and `min +` x8 set the band to `min=8 max=16`, a `min +` that would invert
 #    the band at `8..8` is refused, and a machine nobody opened reads `target=none min=- max=-`;
+#  - the machine's several patterns (0.2.9): two cells pressed on its panel make two saved slots,
+#    each with its own band, and both fill out of the shared stock (`targets=2`, torch 8..16 and
+#    stick 16..32, four coal and sixteen planks consumed), while the same spot with only the first
+#    cell pressed reads `targets=1` with one entry — the second cell is the only difference;
 #  - two requesters share one crafter: the ask is now a list in the crafter's compound, so the
 #    second is queued behind the first instead of being lost, each reads its own share of the stock
 #    (the first `stored=4 served=4`, the second `stored=0 queued=1`), and a restock serves the second
@@ -89,7 +93,9 @@
 # SELFTEST=queue flips the queued-ask assertion (today's defect: the ask is one `Int`, so a second
 # requester asking the same crafter is never queued and reads the first's torches as its own);
 # SELFTEST=crafterscreen flips the machine-panel assertion (today's defect: the panel has no target
-# cell, so the carried torch clicked on it changes nothing and the target stays `none`).
+# cell, so the carried torch clicked on it changes nothing and the target stays `none`);
+# SELFTEST=patterns flips the several-patterns assertion (today's defect: one target for the whole
+# machine, `targets=1`, even after both cells were pressed).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -1583,6 +1589,117 @@ case "$SCREEN_OTHER_MACHINE" in
     *) fail "a machine nobody opened is configured: $SCREEN_OTHER_MACHINE" ;;
 esac
 
+echo "== the machine's several patterns: two targets, each with its own band =="
+# 0.2.9: the machine carries a saved list of pattern slots (upstream's 45-slot container), each with
+# its own target, band, status and count. Two cells pressed on its panel make two entries; the tick
+# walks them in slot order and each fills its own band out of the shared inventory.
+press_target_cell_1() { press 35 85; } # the second cell's centre: x = 8 + 18 + 9, y = 76 + 9
+# Clear every crafter and requester in reach: a requester left by an earlier phase would otherwise
+# link this fresh machine and ask it for sticks, skewing the per-slot counts this leg asserts.
+for x in 220 221 222 223 224 225 226; do
+    for z in 0 1 2 3 4; do
+        ctl command "execute in minecraft:the_end run setblock $x 64 $z minecraft:air" >/dev/null
+    done
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run kill @e[type=item,x=224,y=63,z=-1,dx=4,dy=4,dz=7]" >/dev/null 2>&1 || true
+ctl wait 4
+ctl command "execute in minecraft:the_end run setblock 225 64 0 $BLOCK" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 225 64 4 $BLOCK" >/dev/null
+ctl wait 8
+
+# The first cell takes a carried torch; the second takes a carried stick. Both are drawn cells of
+# the same panel, so the row is the only way the second target exists.
+ctl give minecraft:torch 1 >/dev/null
+ctl wait 4
+open_machine 225 64 0
+TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
+[ -n "$TORCH_SLOT" ] || fail "the torch is not in the open panel: $(ctl screen | jq -c '.slots')"
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+press_target_cell
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+ctl give minecraft:stick 1 >/dev/null
+ctl wait 4
+STICK_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:stick")][0].slot // ""')
+[ -n "$STICK_SLOT" ] || fail "the stick is not in the open panel: $(ctl screen | jq -c '.slots')"
+ctl click-slot "$STICK_SLOT" >/dev/null
+ctl wait 3
+press_target_cell_1
+ctl click-slot "$STICK_SLOT" >/dev/null
+ctl wait 3
+ctl close >/dev/null
+ctl wait 6
+TWO_TARGETS=$(info 225 64 0)
+echo "  two cells pressed: $TWO_TARGETS"
+case "$TWO_TARGETS" in
+    *"targets=2"*) ;;
+    *) fail "the two cells did not make two target slots: $TWO_TARGETS" ;;
+esac
+case "$TWO_TARGETS" in
+    *"entries=minecraft:torch|"*"minecraft:stick|"*) ;;
+    *) fail "the second cell did not add a stick entry: $TWO_TARGETS" ;;
+esac
+
+if [ "$SELFTEST" = patterns ]; then
+    # Today's defect, deliberately asserted: one target for the whole machine. This package keeps
+    # two slots, so the inverted run has to end here, non-zero.
+    case "$TWO_TARGETS" in
+        *"targets=1"*) ;;
+        *) fail "SELFTEST=patterns: the machine kept two target slots (targets=2) where today's defect keeps one (targets=1), so the run must end non-zero: $TWO_TARGETS" ;;
+    esac
+    fail "SELFTEST=patterns: today's defect is not on this package"
+fi
+
+# Each slot's band is retuned by item; the other slot's band and pattern stay as they were.
+say "stepcrafter configure-item 225 64 0 minecraft:torch 8 16"
+reply '^stepcrafter configure-item 225 64 0 ' >/dev/null
+say "stepcrafter configure-item 225 64 0 minecraft:stick 16 32"
+reply '^stepcrafter configure-item 225 64 0 ' >/dev/null
+load 225 64 0 minecraft:coal 8
+load 225 64 0 minecraft:stick 8
+load 225 64 0 minecraft:oak_planks 16
+ctl wait 80
+MULTI=$(info 225 64 0)
+echo "  after 80 ticks, the two slots: $MULTI"
+case "$MULTI" in
+    *"entries=minecraft:torch|8|16|idle|16|16;minecraft:stick|16|32|idle|28|32"*) ;;
+    *) fail "the two slots did not each fill their own band: $MULTI" ;;
+esac
+case "$MULTI" in
+    *"minecraft:coal:4"*"minecraft:torch:16"*) ;;
+    *) fail "the shared stock was not consumed per entry (4 coal for the torches, the planks for the sticks): $MULTI" ;;
+esac
+
+# The differential: the same spot with only the first cell pressed has one entry, and nothing ever
+# maintains sticks — the second cell is the only difference between the two machines.
+ctl give minecraft:torch 1 >/dev/null
+ctl wait 4
+open_machine 225 64 4
+TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
+[ -n "$TORCH_SLOT" ] || fail "the torch is not in the differential panel: $(ctl screen | jq -c '.slots')"
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+press_target_cell
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+ctl close >/dev/null
+ctl wait 6
+say "stepcrafter configure 225 64 4 8 16"
+reply '^stepcrafter configure 225 64 4 ' >/dev/null
+load 225 64 4 minecraft:coal 8
+load 225 64 4 minecraft:stick 8
+ctl wait 80
+ONE_TARGET=$(info 225 64 4)
+echo "  the machine with only the first cell pressed: $ONE_TARGET"
+case "$ONE_TARGET" in
+    *"targets=1"*"entries=minecraft:torch|8|16|idle|16|16"*) ;;
+    *) fail "the differential machine did not keep exactly one torch slot: $ONE_TARGET" ;;
+esac
+ONE_ENTRIES=$(sed -n 's/.* entries=\([^ ]*\).*/\1/p' <<<"$ONE_TARGET")
+[ -z "${ONE_ENTRIES//[^;]/}" ] || fail "the differential machine has more than one entry: $ONE_ENTRIES"
+
 echo "== queued asks: one crafter, two requesters, each served its own share =="
 # The 0.2.6 gap (notes.md §6): the ask was one `Int` in the crafter's compound, so a second
 # requester asking the same crafter was never queued - its ask was lost while the first's was
@@ -1701,4 +1818,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x208 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x208 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the machine's two target cells made two saved slots that each filled their own band out of the shared stock (torch 8..16, stick 16..32, four coal and sixteen planks consumed) with per-entry targets=2 entries=..., while the same spot with only the first cell pressed kept one slot, and the command needs an operator"

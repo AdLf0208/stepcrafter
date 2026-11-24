@@ -25,7 +25,7 @@ use mod_api::{
 use crate::machine;
 use crate::pattern;
 use crate::requester;
-use crate::runtime::{Band, Filter, Phase};
+use crate::runtime::{Band, Filter, Phase, TargetEntry};
 
 /// `/stepcrafter` needs the game-master level `/data get block` needs: it reads and writes another
 /// position's block entity.
@@ -45,6 +45,10 @@ pub fn declare(commands: &mut Vec<Command>) {
     ));
     commands.push(Command::op(
         "stepcrafter configure <pos:block_pos> <min:integer> <max:integer>",
+        OPERATOR_LEVEL,
+    ));
+    commands.push(Command::op(
+        "stepcrafter configure-item <pos:block_pos> <item:id> <min:integer> <max:integer>",
         OPERATOR_LEVEL,
     ));
     commands.push(Command::op(
@@ -105,6 +109,21 @@ pub fn run(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> bool {
                 return true;
             };
             let line = configure(host, pos, min, max);
+            say(host, &line);
+        }
+        "configure-item" => {
+            let (Some(item), Some(min), Some(max)) = (
+                id(invocation, "item"),
+                integer(invocation, "min"),
+                integer(invocation, "max"),
+            ) else {
+                say(
+                    host,
+                    "Usage: /stepcrafter configure-item <x> <y> <z> <item> <min> <max>",
+                );
+                return true;
+            };
+            let line = configure_item(host, pos, &item, min, max);
             say(host, &line);
         }
         "requester" => {
@@ -193,16 +212,22 @@ fn set_target(host: &mut dyn ServerHost, pos: [i32; 3], item: &str) -> String {
         return NO_MACHINE.to_owned();
     };
     let mut state = machine::read(&nbt);
-    state.target = Some(pattern.result().to_owned());
-    state.pattern = Some(pattern.clone());
-    // A new target restarts the run: its band is the operator's to set again.
+    // Each target gets its own slot, with no band until configured (as upstream's fresh pattern
+    // slot has no min/max) and its own derived pattern.
+    let slot = TargetEntry::new(pattern.result().to_owned(), None, 1, pattern.clone())
+        .expect("a resolved pattern's result is an item id");
+    let index = match state.targets.set(slot) {
+        Ok(index) => index,
+        Err(full) => return format!("stepcrafter: {full}"),
+    };
+    state.selected = index;
     state.phase = Phase::Idle;
     machine::write(&mut nbt, &state);
     if !matches!(entity.replace_data(host, nbt), Ok(true)) {
         return "The Step Crafter could not be written.".to_owned();
     }
     format!(
-        "stepcrafter target {} {} {} target={} cells={} result={}:{} remainders={}",
+        "stepcrafter target {} {} {} target={} cells={} result={}:{} remainders={} targets={}",
         pos[0],
         pos[1],
         pos[2],
@@ -210,7 +235,8 @@ fn set_target(host: &mut dyn ServerHost, pos: [i32; 3], item: &str) -> String {
         pattern.cells().len(),
         pattern.result(),
         pattern.result_count(),
-        remainder_line(&pattern)
+        remainder_line(&pattern),
+        state.targets.len()
     )
 }
 
@@ -246,19 +272,72 @@ fn configure(host: &mut dyn ServerHost, pos: [i32; 3], min: i32, max: i32) -> St
         return NO_MACHINE.to_owned();
     };
     let mut state = machine::read(&nbt);
-    state.band = Some(band);
+    let Some(item) = state.selected_entry().map(|entry| entry.item().to_owned()) else {
+        return "stepcrafter: set a target before configuring its band".to_owned();
+    };
+    let _ = state.targets.retune(&item, band);
     state.phase = Phase::Idle;
     machine::write(&mut nbt, &state);
     if !matches!(entity.replace_data(host, nbt), Ok(true)) {
         return "The Step Crafter could not be written.".to_owned();
     }
     format!(
-        "stepcrafter configure {} {} {} min={} max={}",
+        "stepcrafter configure {} {} {} min={} max={} targets={}",
         pos[0],
         pos[1],
         pos[2],
         band.min(),
-        band.max()
+        band.max(),
+        state.targets.len()
+    )
+}
+
+/// `/stepcrafter configure-item <pos> <item> <min> <max>`: retune one named slot's band, leaving
+/// the other slots and their patterns alone. This is the per-pattern min/max upstream edits in its
+/// pattern-slot screen.
+fn configure_item(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    item: &str,
+    min: i32,
+    max: i32,
+) -> String {
+    let Some(level) = host.level(host.dimension()) else {
+        return NO_MACHINE.to_owned();
+    };
+    if !is_machine(&*host, level, pos) {
+        return not_a_crafter(&*host, level, pos);
+    }
+    let (Ok(min), Ok(max)) = (u64::try_from(min), u64::try_from(max)) else {
+        return "stepcrafter: min and max are amounts, not negative numbers".to_owned();
+    };
+    let Some(band) = Band::new(min, max) else {
+        return format!("stepcrafter: min {min} is above max {max}");
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return NO_MACHINE.to_owned();
+    };
+    let Some(mut nbt) = entity.data(&*host) else {
+        return NO_MACHINE.to_owned();
+    };
+    let mut state = machine::read(&nbt);
+    if !state.targets.retune(item, band) {
+        return format!("stepcrafter: no pattern slot maintains {item}");
+    }
+    state.phase = Phase::Idle;
+    machine::write(&mut nbt, &state);
+    if !matches!(entity.replace_data(host, nbt), Ok(true)) {
+        return "The Step Crafter could not be written.".to_owned();
+    }
+    format!(
+        "stepcrafter configure-item {} {} {} item={} min={} max={} targets={}",
+        pos[0],
+        pos[1],
+        pos[2],
+        item,
+        band.min(),
+        band.max(),
+        state.targets.len()
     )
 }
 
@@ -368,17 +447,41 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
     let state = machine::read(&nbt);
     let items = slots_of(&*host, entity);
     let stock = machine::stock_of(&*host, &items);
-    let target = state.target.as_deref().unwrap_or("none");
-    let (min, max) = state.band.map_or(("-".to_owned(), "-".to_owned()), |band| {
-        (band.min().to_string(), band.max().to_string())
-    });
-    let cells = state
-        .pattern
-        .as_ref()
-        .map_or(0, |pattern| pattern.cells().len());
-    let result = state.pattern.as_ref().map_or("none".to_owned(), |pattern| {
+    let target = state.target().unwrap_or("none");
+    let (min, max) = state
+        .band()
+        .map_or(("-".to_owned(), "-".to_owned()), |band| {
+            (band.min().to_string(), band.max().to_string())
+        });
+    let cells = state.pattern().map_or(0, |pattern| pattern.cells().len());
+    let result = state.pattern().map_or("none".to_owned(), |pattern| {
         format!("{}:{}", pattern.result(), pattern.result_count())
     });
+    let targets: Vec<String> = state
+        .targets
+        .iter()
+        .map(|entry| {
+            let (min, max) = entry
+                .band()
+                .map_or(("-".to_owned(), "-".to_owned()), |band| {
+                    (band.min().to_string(), band.max().to_string())
+                });
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                entry.item(),
+                min,
+                max,
+                entry.phase().id(),
+                entry.crafted(),
+                stock.count(entry.item())
+            )
+        })
+        .collect();
+    let targets_line = if targets.is_empty() {
+        "none".to_owned()
+    } else {
+        targets.join(";")
+    };
     let asks: Vec<String> = state.queue.encode();
     let asks = if asks.is_empty() {
         "none".to_owned()
@@ -392,7 +495,7 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         served.join(";")
     };
     format!(
-        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} queued={} asks={} served={} items={} stock={}",
+        "stepcrafter {} {} {} target={} min={} max={} stored={} phase={} cells={} result={} crafted={} queued={} asks={} served={} items={} stock={} targets={} entries={}",
         pos[0],
         pos[1],
         pos[2],
@@ -409,6 +512,8 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         served,
         stock.total(),
         stock_line(&stock),
+        state.targets.len(),
+        targets_line,
     )
 }
 

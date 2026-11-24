@@ -1784,8 +1784,9 @@ pub fn extra_items(data: &[u8]) -> Vec<String> {
 /// One press on the machine's configuration screen, as [`MachineEditor::apply`] takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachinePress {
-    /// The target cell: take the carried item as the machine's maintained item.
-    Target,
+    /// One of the panel's target cells: the carried item sets that entry's target, an empty hand
+    /// focuses the cell the band's buttons edit. Upstream has one pattern slot per cell.
+    Cell(u8),
     /// The band's minimum, down one.
     MinDown,
     /// The band's minimum, up one.
@@ -1796,19 +1797,21 @@ pub enum MachinePress {
     MaxUp,
 }
 
-/// The target cell's menu button id; the value buttons follow it.
+/// The first target cell's menu button id; the panel draws up to 45 cells from here.
 pub const TARGET_BUTTON: i32 = 300;
+/// The band buttons follow the cells', after a gap so no cell id collides with a value button.
+pub const MACHINE_MIN_DOWN_BUTTON: i32 = 400;
 
 impl MachinePress {
     /// The press a menu button id stands for; `None` for a button the screen does not draw.
     #[must_use]
     pub fn of(button: i32) -> Option<Self> {
         match button {
-            TARGET_BUTTON => Some(Self::Target),
-            310 => Some(Self::MinDown),
-            311 => Some(Self::MinUp),
-            312 => Some(Self::MaxDown),
-            313 => Some(Self::MaxUp),
+            TARGET_BUTTON..=340 => Some(Self::Cell((button - TARGET_BUTTON) as u8)),
+            MACHINE_MIN_DOWN_BUTTON => Some(Self::MinDown),
+            401 => Some(Self::MinUp),
+            402 => Some(Self::MaxDown),
+            403 => Some(Self::MaxUp),
             _ => None,
         }
     }
@@ -1817,48 +1820,327 @@ impl MachinePress {
     #[must_use]
     pub fn button(self) -> i32 {
         match self {
-            Self::Target => TARGET_BUTTON,
-            Self::MinDown => 310,
-            Self::MinUp => 311,
-            Self::MaxDown => 312,
-            Self::MaxUp => 313,
+            Self::Cell(index) => TARGET_BUTTON + i32::from(index),
+            Self::MinDown => MACHINE_MIN_DOWN_BUTTON,
+            Self::MinUp => 401,
+            Self::MaxDown => 402,
+            Self::MaxUp => 403,
         }
     }
 }
 
-/// The machine's screen over its saved target and band: the one cell the pattern is set from and
-/// the four buttons that step the band. The screen and `/stepcrafter target|configure` edit the
-/// same saved compound.
+/// One configured pattern slot: upstream's `ResourceMinMaxAmount` (resource, min, max, batch,
+/// status) plus this port's derived recipe and the count this slot has crafted.
+///
+/// Upstream keeps the recipe in an RS pattern item in the slot; this port derives it from the
+/// item's own `minecraft:crafting` recipe at configuration and saves it beside the band. The
+/// status is upstream's `ResourceStatus`, narrowed to the three states this machine can reach.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MachineEditor {
-    target: Option<String>,
+pub struct TargetEntry {
+    item: String,
+    /// The maintenance band, absent until the slot is configured — a fresh pattern slot maintains
+    /// nothing, exactly as 0.2.8's machine had no band until `/stepcrafter configure`.
     band: Option<Band>,
+    batch: u64,
+    phase: Phase,
+    pattern: Pattern,
+    crafted: u64,
 }
 
-impl MachineEditor {
-    /// The screen over a machine's saved target and band.
+impl TargetEntry {
+    /// A slot maintaining `item`, with `batch` as upstream's per-slot batch size and the recipe the
+    /// item resolves to. `band` is `None` until the slot is configured.
     #[must_use]
-    pub fn new(target: Option<String>, band: Option<Band>) -> Self {
-        Self { target, band }
+    pub fn new(item: String, band: Option<Band>, batch: u64, pattern: Pattern) -> Option<Self> {
+        is_item_id(&item).then_some(Self {
+            item,
+            band,
+            batch,
+            phase: Phase::Idle,
+            pattern,
+            crafted: 0,
+        })
     }
 
-    /// The item the machine maintains.
+    /// The item this slot maintains.
     #[must_use]
-    pub fn target(&self) -> Option<&str> {
-        self.target.as_deref()
+    pub fn item(&self) -> &str {
+        &self.item
     }
 
-    /// The maintenance band the buttons edit.
+    /// This slot's maintenance band, absent until it is configured.
     #[must_use]
     pub fn band(&self) -> Option<Band> {
         self.band
+    }
+
+    /// Upstream's per-slot batch size (carried for parity; this machine steps one item at a time).
+    #[must_use]
+    pub fn batch(&self) -> u64 {
+        self.batch
+    }
+
+    /// Where this slot's last step left it.
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Record where this slot's last step left it.
+    pub fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+    }
+
+    /// The step pattern resolved from the item's recipe.
+    #[must_use]
+    pub fn pattern(&self) -> &Pattern {
+        &self.pattern
+    }
+
+    /// How many items this slot has crafted.
+    #[must_use]
+    pub fn crafted(&self) -> u64 {
+        self.crafted
+    }
+
+    /// Credit one step's product to this slot.
+    pub fn add_crafted(&mut self, count: u64) {
+        self.crafted = self.crafted.saturating_add(count);
+    }
+
+    /// Repoint this slot to another item, keeping its band and batch but resetting its status and
+    /// counter; the caller re-resolves the new item's recipe (the screen and the command both do).
+    pub fn set_item(&mut self, item: String) {
+        self.item = item;
+        self.phase = Phase::Idle;
+        self.crafted = 0;
+    }
+
+    /// Replace the derived recipe, e.g. after a cell was repointed to another item.
+    pub fn set_pattern(&mut self, pattern: Pattern) {
+        self.pattern = pattern;
+    }
+
+    /// Retune this slot's band without losing its pattern, status or counter.
+    pub fn retune(&mut self, band: Band) {
+        self.band = Some(band);
+    }
+
+    /// The saved form. `|` separates fields, `;` cells, `,` cell candidates, `#` remainders and
+    /// `=` a consumed item from its leftover; none of these occurs in an item id.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let cells = self.pattern.encode().join(";");
+        let remainders = self.pattern.encode_remainders().join("#");
+        let (min, max) = self.band.map_or(("-".to_owned(), "-".to_owned()), |band| {
+            (band.min().to_string(), band.max().to_string())
+        });
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.item,
+            min,
+            max,
+            self.batch,
+            self.phase.id(),
+            self.crafted,
+            self.pattern.result_count(),
+            cells,
+            remainders,
+        )
+    }
+
+    /// Read one saved slot; anything malformed is refused rather than guessed at.
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('|').collect();
+        let [
+            item,
+            min,
+            max,
+            batch,
+            phase,
+            crafted,
+            result_count,
+            cells,
+            remainders,
+        ] = parts.as_slice()
+        else {
+            return None;
+        };
+        let band = if *min == "-" && *max == "-" {
+            None
+        } else {
+            Some(Band::new(min.parse().ok()?, max.parse().ok()?)?)
+        };
+        let cells: Vec<String> = cells.split(';').map(str::to_owned).collect();
+        let remainders: Vec<String> = remainders
+            .split('#')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let pattern =
+            Pattern::decode(&cells, &remainders, item, result_count.parse::<u32>().ok()?)?;
+        Some(Self {
+            item: (*item).to_owned(),
+            band,
+            batch: batch.parse().ok()?,
+            phase: Phase::of(phase),
+            pattern,
+            crafted: crafted.parse().ok()?,
+        })
+    }
+}
+
+/// Upstream's 45-slot pattern container (`StepCrafterBlockEntity.PATTERNS`), one entry per
+/// maintained resource. A resource names one slot: setting a second band for one item repoints the
+/// slot instead of taking another, exactly as the requester's filter container does.
+pub const MAX_TARGET_ENTRIES: usize = 45;
+
+/// The pattern container is full: all 45 slots name a resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetsFull;
+
+impl std::fmt::Display for TargetsFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "all {MAX_TARGET_ENTRIES} pattern slots are taken")
+    }
+}
+
+impl std::error::Error for TargetsFull {}
+
+/// The machine's configured pattern slots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Targets {
+    entries: Vec<TargetEntry>,
+}
+
+impl Targets {
+    /// An empty container.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `entry`, or replace the one already maintaining its item; a 46th distinct item is
+    /// refused. Answers the slot index the entry now occupies.
+    pub fn set(&mut self, entry: TargetEntry) -> Result<usize, TargetsFull> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|other| other.item == entry.item)
+        {
+            self.entries[index] = entry;
+            return Ok(index);
+        }
+        if self.entries.len() >= MAX_TARGET_ENTRIES {
+            return Err(TargetsFull);
+        }
+        self.entries.push(entry);
+        Ok(self.entries.len() - 1)
+    }
+
+    /// Retune one slot's band by item; false when no slot maintains it.
+    pub fn retune(&mut self, item: &str, band: Band) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.item == item) else {
+            return false;
+        };
+        entry.retune(band);
+        true
+    }
+
+    /// Drop the slot maintaining `item`, keeping the others in order.
+    pub fn remove(&mut self, item: &str) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.item == item) else {
+            return false;
+        };
+        self.entries.remove(index);
+        true
+    }
+
+    /// How many slots are configured.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no slot is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The slot at `index`, if there is one.
+    #[must_use]
+    pub fn entry(&self, index: usize) -> Option<&TargetEntry> {
+        self.entries.get(index)
+    }
+
+    /// The slot at `index`, if there is one.
+    #[must_use]
+    pub fn entry_mut(&mut self, index: usize) -> Option<&mut TargetEntry> {
+        self.entries.get_mut(index)
+    }
+
+    /// All configured slots, in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = &TargetEntry> {
+        self.entries.iter()
+    }
+
+    /// All configured slots, in slot order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut TargetEntry> {
+        self.entries.iter_mut()
+    }
+
+    /// The saved form, one string per slot.
+    #[must_use]
+    pub fn encode(&self) -> Vec<String> {
+        self.entries.iter().map(TargetEntry::encode).collect()
+    }
+
+    /// Read the saved form; a malformed slot is skipped rather than guessed at.
+    #[must_use]
+    pub fn decode(texts: &[String]) -> Self {
+        Self {
+            entries: texts
+                .iter()
+                .filter_map(|text| TargetEntry::decode(text))
+                .collect(),
+        }
+    }
+}
+
+/// The machine's screen over its saved pattern slots: one row of cells, the selected one's band
+/// stepped by the four buttons. The screen and `/stepcrafter target|configure` edit one container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineEditor {
+    targets: Targets,
+    selected: usize,
+}
+
+impl MachineEditor {
+    /// The screen over a machine's saved slots and its focused cell.
+    #[must_use]
+    pub fn new(targets: Targets, selected: usize) -> Self {
+        Self { targets, selected }
+    }
+
+    /// The slots the editor edits.
+    #[must_use]
+    pub fn targets(&self) -> &Targets {
+        &self.targets
+    }
+
+    /// The focused cell, whose band the value buttons step.
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
     }
 
     /// Apply one press, with the item the player carries (`None` for an empty hand). Answers
     /// whether the configuration changed.
     pub fn apply(&mut self, press: MachinePress, carried: Option<&str>) -> bool {
         match press {
-            MachinePress::Target => self.take_target(carried),
+            MachinePress::Cell(index) => self.cell(usize::from(index), carried),
             MachinePress::MinDown => self.step(MachineField::Min, false),
             MachinePress::MinUp => self.step(MachineField::Min, true),
             MachinePress::MaxDown => self.step(MachineField::Max, false),
@@ -1866,25 +2148,49 @@ impl MachineEditor {
         }
     }
 
-    /// The target cell: the carried item becomes the machine's target (the command resolves the
-    /// same item's recipe into the pattern). An empty hand leaves the target as it was — a click
-    /// must not silently unconfigure the machine — and clicking the item it already maintains is no
-    /// change, so the run is not restarted for nothing.
-    fn take_target(&mut self, carried: Option<&str>) -> bool {
-        let Some(item) = carried.filter(|item| is_item_id(item)) else {
-            return false;
-        };
-        if self.target.as_deref() == Some(item) {
+    /// A cell click focuses that slot; with a carried item it sets (or repoints) the slot's target.
+    /// An empty hand never unconfigures a machine, and the next free cell creates a new slot.
+    fn cell(&mut self, index: usize, carried: Option<&str>) -> bool {
+        if index >= MAX_TARGET_ENTRIES {
             return false;
         }
-        self.target = Some(item.to_owned());
-        true
+        let next_free = self.targets.len();
+        let changed = if let Some(item) = carried.filter(|item| is_item_id(item)) {
+            match self.targets.entry_mut(index) {
+                Some(entry) if entry.item() != item => {
+                    entry.set_item(item.to_owned());
+                    true
+                }
+                Some(_) => false,
+                None if index == next_free => {
+                    // A new cell has a target but no band yet — the tick holds until one is set.
+                    let Some(pattern) =
+                        Pattern::new(vec![vec![item.to_owned()]], item.to_owned(), 1)
+                    else {
+                        return false;
+                    };
+                    let Some(entry) = TargetEntry::new(item.to_owned(), None, 1, pattern) else {
+                        return false;
+                    };
+                    self.targets.set(entry).is_ok()
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        self.selected = index;
+        changed
     }
 
-    /// One value button: the band stays valid (`min <= max`), no amount is negative and a screen
-    /// edit caps at [`SCREEN_MAX`] — the requester's screen's own rules.
+    /// One value button steps the focused slot's band, keeping `min <= max`, never negative and
+    /// capping a screen edit at [`SCREEN_MAX`].
     fn step(&mut self, field: MachineField, up: bool) -> bool {
-        let (min, max) = self.band.map_or((0, 0), |band| (band.min(), band.max()));
+        let Some(entry) = self.targets.entry_mut(self.selected) else {
+            return false;
+        };
+        // A fresh slot has no band: the first `max +` creates one from 0..0, as 0.2.8's editor did.
+        let (min, max) = entry.band().map_or((0, 0), |band| (band.min(), band.max()));
         let (min, max) = match field {
             MachineField::Min if up && min < max => (min + 1, max),
             MachineField::Min if !up && min > 0 => (min - 1, max),
@@ -1895,14 +2201,14 @@ impl MachineEditor {
         let Some(band) = Band::new(min, max) else {
             return false;
         };
-        self.band = Some(band);
+        entry.retune(band);
         true
     }
 
     /// The configuration as the machine saves it.
     #[must_use]
-    pub fn into_parts(self) -> (Option<String>, Option<Band>) {
-        (self.target, self.band)
+    pub fn into_parts(self) -> (Targets, usize) {
+        (self.targets, self.selected)
     }
 }
 
@@ -1913,8 +2219,8 @@ enum MachineField {
     Max,
 }
 
-/// The machine's menu data slots: its band's minimum and maximum, which the screen draws. A
-/// machine with no band shows zeroes; the command's readout still prints `min=- max=-`.
+/// The machine's menu data slots: the focused slot's band minimum and maximum, which the screen
+/// draws. A slot with no band shows zeroes; the command's readout still prints `min=- max=-`.
 #[must_use]
 pub fn machine_data_slots(band: Option<Band>) -> [i32; 2] {
     band.map_or([0, 0], |band| {
@@ -1922,20 +2228,38 @@ pub fn machine_data_slots(band: Option<Band>) -> [i32; 2] {
     })
 }
 
-/// The target cell's open payload: the maintained item's id, or nothing.
+/// The target cells' open payload: the focused cell's index, then one item id per drawn cell (empty
+/// for an unset cell). The band travels in the menu's data slots; the saved compound is the truth.
 #[must_use]
-pub fn machine_extra_data(target: Option<&str>) -> String {
-    target
-        .filter(|target| is_item_id(target))
-        .unwrap_or("")
-        .to_owned()
+pub fn machine_extra_data(targets: &Targets, selected: usize) -> String {
+    let mut lines = vec![selected.to_string()];
+    lines.extend((0..MAX_TARGET_ENTRIES).map(|index| {
+        targets
+            .entry(index)
+            .map_or_else(String::new, |entry| entry.item().to_owned())
+    }));
+    lines.join("\n")
 }
 
-/// The item id a target cell's payload names, if it names one.
+/// The cells' item ids and focused index a target payload names.
+#[must_use]
+pub fn machine_extra_items(data: &[u8]) -> (usize, Vec<String>) {
+    let text = std::str::from_utf8(data).unwrap_or("");
+    // `split`, not `lines`: the last cells are empty and a trailing empty field must still count.
+    let mut fields = text.split('\n');
+    let selected = fields
+        .next()
+        .and_then(|line| line.parse().ok())
+        .unwrap_or(0);
+    let items = fields.map(str::to_owned).collect();
+    (selected, items)
+}
+
+/// The first target cell's item id, for the open payload a one-cell client understands.
 #[must_use]
 pub fn machine_extra_item(data: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(data).ok()?.trim();
-    is_item_id(text).then(|| text.to_owned())
+    let (_, items) = machine_extra_items(data);
+    items.into_iter().find(|item| !item.is_empty())
 }
 
 #[cfg(test)]
@@ -3196,40 +3520,60 @@ mod tests {
         );
     }
 
+    /// One saved target slot in tests, with a trivial self-recipe: the band is what these editor
+    /// tests step, and the pattern only has to be a real one for the saved form to round-trip.
+    fn target(item: &str, band: Band) -> TargetEntry {
+        let pattern = Pattern::new(vec![vec![item.to_owned()]], item.to_owned(), 1)
+            .expect("a one-cell test pattern");
+        TargetEntry::new(item.to_owned(), Some(band), 1, pattern).expect("a test target")
+    }
+
+    fn editor_with(entries: &[(&str, Band)]) -> MachineEditor {
+        let mut targets = Targets::new();
+        for (item, band) in entries {
+            assert!(targets.set(target(item, *band)).is_ok());
+        }
+        MachineEditor::new(targets, 0)
+    }
+
     /// Every press the machine's panel draws round-trips through its menu button id, and a button
     /// it does not draw is no press.
     #[test]
     fn a_machine_press_round_trips_through_its_button_id() {
         for (button, press) in [
-            (300, MachinePress::Target),
-            (310, MachinePress::MinDown),
-            (311, MachinePress::MinUp),
-            (312, MachinePress::MaxDown),
-            (313, MachinePress::MaxUp),
+            (300, MachinePress::Cell(0)),
+            (301, MachinePress::Cell(1)),
+            (400, MachinePress::MinDown),
+            (401, MachinePress::MinUp),
+            (402, MachinePress::MaxDown),
+            (403, MachinePress::MaxUp),
         ] {
             assert_eq!(MachinePress::of(button), Some(press));
             assert_eq!(press.button(), button);
         }
-        assert_eq!(MachinePress::of(301), None);
-        assert_eq!(MachinePress::of(314), None);
+        assert_eq!(MachinePress::of(341), None);
+        assert_eq!(MachinePress::of(399), None);
     }
 
     /// The target cell takes the carried item; an empty hand leaves the target as it was, so a
     /// click on the cell cannot silently unconfigure the machine.
     #[test]
     fn the_target_cell_takes_the_carried_item() {
-        let mut editor = MachineEditor::new(None, None);
+        let mut editor = editor_with(&[]);
         assert!(
-            editor.apply(MachinePress::Target, Some("minecraft:torch")),
+            editor.apply(MachinePress::Cell(0), Some("minecraft:torch")),
             "a carried torch must make the machine's target"
         );
-        assert_eq!(editor.target(), Some("minecraft:torch"));
+        assert_eq!(
+            editor.targets().entry(0).map(TargetEntry::item),
+            Some("minecraft:torch")
+        );
         assert!(
-            !editor.apply(MachinePress::Target, None),
+            !editor.apply(MachinePress::Cell(0), None),
             "an empty hand changes nothing"
         );
         assert_eq!(
-            editor.target(),
+            editor.targets().entry(0).map(TargetEntry::item),
             Some("minecraft:torch"),
             "the cell keeps its target when nothing is carried"
         );
@@ -3239,17 +3583,20 @@ mod tests {
     /// screen would otherwise restart the run for nothing.
     #[test]
     fn the_target_cell_with_the_same_item_changes_nothing() {
-        let mut editor = MachineEditor::new(Some("minecraft:torch".to_owned()), None);
-        assert!(!editor.apply(MachinePress::Target, Some("minecraft:torch")));
-        assert!(editor.apply(MachinePress::Target, Some("minecraft:stick")));
-        assert_eq!(editor.target(), Some("minecraft:stick"));
+        let mut editor = editor_with(&[("minecraft:torch", band(0, 0))]);
+        assert!(!editor.apply(MachinePress::Cell(0), Some("minecraft:torch")));
+        assert!(editor.apply(MachinePress::Cell(0), Some("minecraft:stick")));
+        assert_eq!(
+            editor.targets().entry(0).map(TargetEntry::item),
+            Some("minecraft:stick")
+        );
     }
 
     /// The four buttons step the band: `max` first lifts from nothing, `min` follows it, and a
     /// step that would invert the band (`min` past `max`) is refused, so `8..8` stays `8..8`.
     #[test]
     fn the_value_buttons_step_the_band_and_refuse_an_inversion() {
-        let mut editor = MachineEditor::new(None, None);
+        let mut editor = editor_with(&[("minecraft:torch", band(0, 0))]);
         assert!(
             !editor.apply(MachinePress::MinUp, None),
             "min cannot pass a maximum of zero"
@@ -3257,21 +3604,31 @@ mod tests {
         for _ in 0..16 {
             assert!(editor.apply(MachinePress::MaxUp, None));
         }
-        assert_eq!(editor.band(), Some(band(0, 16)));
+        assert_eq!(
+            editor.targets().entry(0).and_then(TargetEntry::band),
+            Some(band(0, 16))
+        );
         for _ in 0..8 {
             assert!(editor.apply(MachinePress::MinUp, None));
         }
-        assert_eq!(editor.band(), Some(band(8, 16)), "the brief's band");
+        assert_eq!(
+            editor.targets().entry(0).and_then(TargetEntry::band),
+            Some(band(8, 16)),
+            "the brief's band"
+        );
         for _ in 0..8 {
             assert!(editor.apply(MachinePress::MaxDown, None));
         }
-        assert_eq!(editor.band(), Some(band(8, 8)));
+        assert_eq!(
+            editor.targets().entry(0).and_then(TargetEntry::band),
+            Some(band(8, 8))
+        );
         assert!(
             !editor.apply(MachinePress::MinUp, None),
             "min + at 8..8 would invert the band"
         );
         assert_eq!(
-            editor.band(),
+            editor.targets().entry(0).and_then(TargetEntry::band),
             Some(band(8, 8)),
             "the refused step changed nothing"
         );
@@ -3279,28 +3636,41 @@ mod tests {
             !editor.apply(MachinePress::MaxDown, None),
             "max - at 8..8 would invert the band"
         );
-        assert_eq!(editor.band(), Some(band(8, 8)));
+        assert_eq!(
+            editor.targets().entry(0).and_then(TargetEntry::band),
+            Some(band(8, 8))
+        );
     }
 
     /// A value never goes below zero and a screen edit caps at the same maximum the requester's
     /// screen uses; the band it makes is always a `Band` the rules accept.
     #[test]
     fn a_machine_value_never_goes_below_zero_and_caps_at_the_screens_maximum() {
-        let mut editor = MachineEditor::new(None, Some(band(0, 0)));
+        let mut editor = editor_with(&[("minecraft:torch", band(0, 0))]);
         assert!(!editor.apply(MachinePress::MinDown, None));
         assert!(!editor.apply(MachinePress::MaxDown, None));
         for _ in 0..(SCREEN_MAX + 2) {
             editor.apply(MachinePress::MaxUp, None);
         }
-        assert_eq!(editor.band().map(|band| band.max()), Some(SCREEN_MAX));
-        let mut floor = MachineEditor::new(None, Some(band(0, 2)));
+        assert_eq!(
+            editor
+                .targets()
+                .entry(0)
+                .and_then(TargetEntry::band)
+                .map(|band| band.max()),
+            Some(SCREEN_MAX)
+        );
+        let mut floor = editor_with(&[("minecraft:torch", band(0, 2))]);
         assert!(floor.apply(MachinePress::MinUp, None));
         assert!(floor.apply(MachinePress::MinDown, None));
         assert!(
             !floor.apply(MachinePress::MinDown, None),
             "a minimum stops at zero"
         );
-        assert_eq!(floor.band(), Some(band(0, 2)));
+        assert_eq!(
+            floor.targets().entry(0).and_then(TargetEntry::band),
+            Some(band(0, 2))
+        );
     }
 
     /// The panel's numbers are the band's two amounts, clamped to the wire: a menu data slot is
@@ -3322,24 +3692,134 @@ mod tests {
         );
     }
 
-    /// The target cell's payload is its item id, and a malformed payload draws no icon rather than
-    /// guessing one.
+    /// The cells' payload is the focused index then one item id per cell, so a malformed payload
+    /// draws no icon rather than guessing one.
     #[test]
     fn the_target_cells_payload_is_its_item_id() {
+        let mut targets = Targets::new();
+        assert!(targets.set(target("minecraft:torch", band(0, 0))).is_ok());
+        assert!(targets.set(target("minecraft:stick", band(4, 8))).is_ok());
+        let payload = machine_extra_data(&targets, 1);
+        let (selected, items) = machine_extra_items(payload.as_bytes());
+        assert_eq!(selected, 1);
+        assert_eq!(items.first().map(String::as_str), Some("minecraft:torch"));
+        assert_eq!(items.get(1).map(String::as_str), Some("minecraft:stick"));
+        assert_eq!(items.len(), MAX_TARGET_ENTRIES);
         assert_eq!(
-            machine_extra_data(Some("minecraft:torch")),
-            "minecraft:torch"
+            machine_extra_item(payload.as_bytes()).as_deref(),
+            Some("minecraft:torch")
         );
-        assert_eq!(machine_extra_data(None), "");
-        assert_eq!(
-            machine_extra_item(b"minecraft:torch"),
-            Some("minecraft:torch".to_owned())
-        );
+        let (empty_selected, empty) = machine_extra_items(b"");
+        assert_eq!(empty_selected, 0);
+        assert!(empty.iter().all(String::is_empty));
         assert_eq!(machine_extra_item(b""), None);
-        assert_eq!(machine_extra_item(b"not an id"), None);
+    }
+
+    /// The machine keeps a second target beside the first, each with its own band: this is the
+    /// slice's rule, and a machine that can hold only one target fails it.
+    #[test]
+    fn a_second_target_slot_keeps_its_own_band_beside_the_first() {
+        let mut editor = editor_with(&[]);
+        assert!(editor.apply(MachinePress::Cell(0), Some("minecraft:torch")));
+        for _ in 0..8 {
+            assert!(editor.apply(MachinePress::MaxUp, None));
+        }
+        for _ in 0..8 {
+            assert!(editor.apply(MachinePress::MinUp, None));
+        }
+        assert!(editor.apply(MachinePress::Cell(1), Some("minecraft:stick")));
+        assert_eq!(editor.selected(), 1);
+        for _ in 0..32 {
+            assert!(editor.apply(MachinePress::MaxUp, None));
+        }
+        for _ in 0..16 {
+            assert!(editor.apply(MachinePress::MinUp, None));
+        }
+        let (targets, _) = editor.into_parts();
         assert_eq!(
-            machine_extra_item(b"minecraft:torch\nminecraft:stick"),
-            None
+            targets.len(),
+            2,
+            "two pattern slots, as upstream's 45-slot container"
+        );
+        assert_eq!(
+            targets.entry(0).map(|entry| (entry.item(), entry.band())),
+            Some(("minecraft:torch", Some(band(8, 8))))
+        );
+        assert_eq!(
+            targets.entry(1).map(|entry| (entry.item(), entry.band())),
+            Some(("minecraft:stick", Some(band(16, 32))))
+        );
+    }
+
+    /// Both slots, their bands, their patterns and their counters survive the saved list; a machine
+    /// that saved only one target loses the second on reload.
+    #[test]
+    fn the_two_targets_round_trip_through_the_saved_list() {
+        let mut targets = Targets::new();
+        let mut torch = target("minecraft:torch", band(8, 16));
+        torch.add_crafted(16);
+        torch.set_phase(Phase::Crafting);
+        assert!(targets.set(torch).is_ok());
+        assert!(targets.set(target("minecraft:stick", band(16, 32))).is_ok());
+        let saved = targets.encode();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(Targets::decode(&saved), targets);
+        assert_eq!(targets.entry(0).map(TargetEntry::crafted), Some(16));
+        assert_eq!(
+            targets.entry(0).map(TargetEntry::phase),
+            Some(Phase::Crafting)
+        );
+    }
+
+    /// The container is upstream's 45 slots: a 46th distinct resource is refused, and a repeated
+    /// resource repoints its slot rather than taking another.
+    #[test]
+    fn a_46th_distinct_target_is_refused() {
+        let mut targets = Targets::new();
+        for index in 0..MAX_TARGET_ENTRIES {
+            let item = format!("minecraft:test_{index}");
+            let pattern =
+                Pattern::new(vec![vec![item.clone()]], item.clone(), 1).expect("a test pattern");
+            assert!(
+                targets
+                    .set(
+                        TargetEntry::new(item, Some(band(0, 0)), 1, pattern)
+                            .expect("a test target")
+                    )
+                    .is_ok()
+            );
+        }
+        let extra = target("minecraft:one_too_many", band(0, 0));
+        assert_eq!(targets.set(extra), Err(TargetsFull));
+        assert!(targets.retune("minecraft:test_0", band(2, 4)));
+        assert_eq!(
+            targets.entry(0).and_then(TargetEntry::band),
+            Some(band(2, 4))
+        );
+    }
+
+    /// Repointing the focused cell leaves the other slot's target and band alone.
+    #[test]
+    fn repointing_one_cell_leaves_the_other_target_untouched() {
+        let mut editor = editor_with(&[
+            ("minecraft:torch", band(8, 16)),
+            ("minecraft:stick", band(16, 32)),
+        ]);
+        assert!(editor.apply(MachinePress::Cell(1), Some("minecraft:coal")));
+        assert_eq!(
+            editor
+                .targets()
+                .entry(0)
+                .map(|entry| (entry.item(), entry.band())),
+            Some(("minecraft:torch", Some(band(8, 16))))
+        );
+        assert_eq!(
+            editor.targets().entry(1).map(TargetEntry::item),
+            Some("minecraft:coal")
+        );
+        assert_eq!(
+            editor.targets().entry(1).and_then(TargetEntry::band),
+            Some(band(16, 32))
         );
     }
 }

@@ -216,10 +216,23 @@ pub const MACHINE_HEIGHT: f32 = MACHINE_INVENTORY_Y + 82.0;
 const STOCK_X: f32 = 8.0;
 const STOCK_Y: f32 = 18.0;
 const STOCK_COLUMNS: usize = 9;
-/// The target cell under the stock grid: the drawn cell a carried item configures the machine
-/// from, beside the stock's rows.
+/// The row of target cells under the stock grid: one drawn cell per pattern slot, the first at the
+/// old single-target cell's place so a click there still sets the machine's first target. Upstream
+/// draws a whole grid of pattern slots; the panel shows the first row and the command sets the rest.
 const TARGET_CELL: [f32; 4] = [8.0, 76.0, 18.0, 18.0];
-/// The band's row under the target cell: `min`'s group then `max`'s, each a label, `-`, its number
+/// How many target cells the panel draws.
+const TARGET_CELLS: usize = 9;
+
+/// The `index`th target cell's bounds, left to right.
+#[must_use]
+fn target_cell(index: usize) -> Option<[f32; 4]> {
+    (index < TARGET_CELLS).then(|| {
+        let [x, y, w, h] = TARGET_CELL;
+        [x + index as f32 * w, y, w, h]
+    })
+}
+
+/// The band's row under the target cells: `min`'s group then `max`'s, each a label, `-`, its number
 /// and `+`.
 const MACHINE_VALUE_Y: f32 = 98.0;
 const MACHINE_MIN_GROUP: [f32; 4] = [8.0, 30.0, 44.0, 66.0];
@@ -231,6 +244,7 @@ const MACHINE_MAX_GROUP: [f32; 4] = [88.0, 110.0, 124.0, 146.0];
 const _: () = {
     assert!(STOCK_Y + CELL * (crate::machine::SLOTS / STOCK_COLUMNS) as f32 <= TARGET_CELL[1]);
     assert!(TARGET_CELL[1] + TARGET_CELL[3] <= MACHINE_VALUE_Y);
+    assert!(TARGET_CELL[0] + TARGET_CELLS as f32 * TARGET_CELL[2] <= MACHINE_WIDTH);
     assert!(MACHINE_VALUE_Y + BUTTON <= MACHINE_INVENTORY_Y - 16.0);
     assert!(MACHINE_INVENTORY_Y + 82.0 <= MACHINE_HEIGHT + 0.01);
     assert!(MACHINE_HEIGHT <= 240.0);
@@ -263,8 +277,12 @@ pub fn machine_layout() -> Screen {
 /// nothing of the screen's.
 #[must_use]
 pub fn machine_button_at(at: [f32; 2]) -> Option<i32> {
-    if inside(TARGET_CELL, at) {
-        return Some(MachinePress::Target.button());
+    for index in 0..TARGET_CELLS {
+        if let Some(cell) = target_cell(index)
+            && inside(cell, at)
+        {
+            return Some(MachinePress::Cell(index as u8).button());
+        }
     }
     let minus = |group: [f32; 4]| [group[1], MACHINE_VALUE_Y, BUTTON, BUTTON];
     let plus = |group: [f32; 4]| [group[3], MACHINE_VALUE_Y, BUTTON, BUTTON];
@@ -293,20 +311,29 @@ const TARGET_LABEL: [f32; 2] = [30.0, 81.0];
 /// coordinate must add `event.origin`.
 pub fn machine_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
     let [ox, oy] = event.origin;
-    let target = host
+    let (selected, targets) = host
         .screen_extra_data()
-        .and_then(|data| runtime::machine_extra_item(&data));
+        .map(|data| runtime::machine_extra_items(&data))
+        .unwrap_or((0, Vec::new()));
     let draw = &mut *event.draw;
 
-    let [x, y, w, h] = TARGET_CELL;
-    let rect = [ox + x, oy + y, w, h];
-    draw.fill(rect, SLOT);
-    draw.fill([rect[0], rect[1], rect[2], 1.0], SLOT_EDGE);
-    draw.fill([rect[0], rect[1], 1.0, rect[3]], SLOT_EDGE);
-    draw.fill([rect[0] + rect[2] - 1.0, rect[1], 1.0, rect[3]], SLOT_EDGE);
-    draw.fill([rect[0], rect[1] + rect[3] - 1.0, rect[2], 1.0], SLOT_EDGE);
-    if let Some(key) = target.as_deref().and_then(|item| item_key(host, item)) {
-        draw.item(key, [rect[0] + 1.0, rect[1] + 1.0], 16.0);
+    for index in 0..TARGET_CELLS {
+        let Some([x, y, w, h]) = target_cell(index) else {
+            break;
+        };
+        let rect = [ox + x, oy + y, w, h];
+        draw.fill(rect, SLOT);
+        // The focused cell gets a brighter frame so a player can see which band the buttons step.
+        let edge = if index == selected { TEXT } else { SLOT_EDGE };
+        draw.fill([rect[0], rect[1], rect[2], 1.0], edge);
+        draw.fill([rect[0], rect[1], 1.0, rect[3]], edge);
+        draw.fill([rect[0] + rect[2] - 1.0, rect[1], 1.0, rect[3]], edge);
+        draw.fill([rect[0], rect[1] + rect[3] - 1.0, rect[2], 1.0], edge);
+        if let Some(item) = targets.get(index).filter(|item| !item.is_empty())
+            && let Some(key) = item_key(host, item)
+        {
+            draw.item(key, [rect[0] + 1.0, rect[1] + 1.0], 16.0);
+        }
     }
     draw.text(
         "target",
@@ -452,7 +479,14 @@ mod tests {
         let minus = |group: [f32; 4]| [group[1], MACHINE_VALUE_Y, BUTTON, BUTTON];
         let plus = |group: [f32; 4]| [group[3], MACHINE_VALUE_Y, BUTTON, BUTTON];
         for (rect, press) in [
-            (TARGET_CELL, MachinePress::Target),
+            (
+                target_cell(0).expect("the first cell"),
+                MachinePress::Cell(0),
+            ),
+            (
+                target_cell(1).expect("the second cell"),
+                MachinePress::Cell(1),
+            ),
             (minus(MACHINE_MIN_GROUP), MachinePress::MinDown),
             (plus(MACHINE_MIN_GROUP), MachinePress::MinUp),
             (minus(MACHINE_MAX_GROUP), MachinePress::MaxDown),

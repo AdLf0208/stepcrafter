@@ -15,7 +15,7 @@ saved band and a tick — the machines shape, no entities, renderers or dimensio
 **Licence rank 0** (MIT, read from the jar's `META-INF/neoforge.mods.toml`; upstream's
 `LICENSE.txt` travels inside the package as `LICENSE`). Publishable under MIT with this source.
 
-**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices`
+**Skills gate:** `Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-review,rust-port`
 
 ---
 
@@ -450,6 +450,53 @@ are the data slots, which are a view — the saved compound is the truth.
 
 
 
+## 2j. The slice (version 0.2.9): the machine's several patterns
+
+0.2.8's own gap line (§6) named the last mechanical deviation from upstream's machine: *"The machine's
+panel edits one band, as its command does … upstream draws a min/max editor per pattern slot and this
+machine has one target, so one band is the faithful shape."* §1's row is the same gap: *"its pattern
+system (a Refined Storage pattern item per slot, min/max/batch per slot) | ported differently: the
+pattern is the target item's own `minecraft:crafting` recipe … the band is `/stepcrafter configure`"*.
+This slice carries the 45-slot list.
+
+### The artefact's per-slot fields, read before any code
+
+`javap -p -constants` on `stepcrafter-neoforge-1.21.1-0.1.10.jar` (evidence:
+`ports/_shared/evidence/stepcrafter/jar-pattern-slots.txt`):
+
+| artefact | what it settles |
+|---|---|
+| `StepCrafterBlockEntity` | `PATTERNS = 45`, `UPGRADES = 8`, saved tag `TAG_PATTERNS = "patterns"` |
+| `PatternResourceContainerImpl.slots` | a `ResourceMinMaxAmount[]`, saved with `createTag`/`fromTag` as a list |
+| `ResourceMinMaxAmount` (record) | `resource`, `minAmount` (long), `maxAmount` (long), `batchSize` (long), `status` ∈ `FINISHED/CRAFTING/NOT_ENOUGH_INGREDIENTS/NETWORK_FULL/EXTERNAL_CONTAINER_FULL` |
+| `PatternResourceSlot` | `getMinAmount/getMaxAmount/getBatchSize/getStatus` |
+
+So the per-slot fields are **resource, min, max, batch, status** — the same `ResourceMinMaxAmount`
+upstream's requester's 45 `rf` slots use, which this port already carries as `runtime::Filter`/
+`Entry`/`Filters` (§2f). The recipe itself lives in an RS pattern item upstream; this port derives it
+from the item's own `minecraft:crafting` recipe through the pin (§6), so **no parent pattern surface is
+missing** — the list is carryable at this pin. The 8 upgrade slots remain
+`blocked(no-parent-addon-surface)` (the RS `UpgradeContainer`).
+
+### What changed
+
+- **`runtime.rs`**: `TargetEntry` (item, band, batch, phase, derived pattern, crafted) and `Targets`
+  (the 45-slot container, add-or-replace by resource, saved as one `item|min|max|batch|phase|crafted|
+  rc|cells|remainders` string per slot); `MachinePress::Cell(0..44)` (buttons 300..340, band buttons
+  moved to 400..403) and `MachineEditor` over the slots plus a focused cell; `machine_extra_data`
+  publishes the focused index and all 45 cells' item ids.
+- **`machine.rs`**: `State.targets` is the truth (the old single-target keys migrate into one slot on
+  read and are mirrored from the focused slot on write, so existing worlds and requester links keep
+  working); the tick walks the slots in order and spends one step on the first that needs it, with the
+  machine's `active` and phase the aggregate of its slots; asks are served by the slot that maintains
+  the asked item; `Shared.targets` lets a requester link any of them.
+- **`commands.rs`**: `target` adds or repoints a slot (reply `targets=N`); `configure-item <pos>
+  <item> <min> <max>` retunes one named slot; the legacy `configure` retunes the focused/first slot;
+  `info` appends `targets=N entries=item|min|max|phase|crafted|stored;…` beside its legacy fields.
+- **`screen.rs`**: the 0.2.8 panel's single target cell becomes a row of 9 drawn cells at the same
+  first position; a carried item on a cell makes or repoints that slot, an empty hand focuses it and
+  the four band buttons step the focused slot. The panel stays 176 × 208 and cell 0 keeps its pixels.
+
 ## 2d. The slice (version 0.2.3): crafting remainders
 
 0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
@@ -726,6 +773,32 @@ The game half's red is `SELFTEST=crafterscreen` (§4): it asserts today's behavi
 target cell, so the carried torch clicked where the cell now is changes nothing and the machine still
 reads `target=none` — and ends non-zero on this package.
 
+Green at 0.2.9 (the several-patterns slice): **89 tests** (`sdk-test.log`, `Compiling stepcrafter v0.2.9`).
+Its red transcript is `red-unit-patterns.log`: `Targets::set` was stubbed to the old one-target
+behaviour (a new target cleared the last), so seven tests failed for exactly that defect:
+
+```
+---- machine::tests::the_two_targets_round_trip_through_the_saved_compound stdout ----
+assertion `left == right` failed: both pattern slots survive
+  left: 1
+ right: 2
+
+---- runtime::tests::a_46th_distinct_target_is_refused stdout ----
+assertion `left == right` failed
+  left: Ok(0)
+ right: Err(TargetsFull)
+
+---- runtime::tests::repointing_one_cell_leaves_the_other_target_untouched stdout ----
+assertion `left == right` failed
+  left: Some(("minecraft:coal", Band { min: 0, max: 0 }))
+ right: Some(("minecraft:torch", Band { min: 8, max: 16 }))
+
+test result: FAILED. 82 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The game half's red is `SELFTEST=patterns` (§4): it asserts today's one-target reply (`targets=1`)
+after both cells were pressed, so the run ends non-zero on the package that keeps two slots.
+
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
 `decide_finishes_at_the_maximum`), the step (`a_step_consumes_every_cell_and_makes_the_result`,
@@ -756,8 +829,8 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — thirteen run logs plus the build log, all `--strict` green
-(`logs=13 ok=13 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — fifteen run logs plus the build log, all `--strict` green
+(`logs=15 ok=15 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
@@ -774,6 +847,7 @@ entity, and was removed. Both are recorded under §6.
 | `e2e-selftest-screen.log` | `FAIL` + `EXIT:1` | `SELFTEST=screen` inverts the **screen** assertion: today's defect is a right click that opens no screen (`playing`) and a menu that can make no entry, so the run ends non-zero on the package that opens it |
 | `e2e-selftest-queue.log` | `FAIL` + `EXIT:1` | `SELFTEST=queue` inverts the **queued-ask** assertion: today's defect is one `Int`, so the second requester's ask is lost and it reads the first's torches; this package serves it its own four (`served=4`), so the run ends non-zero |
 | `e2e-selftest-crafterscreen.log` | `FAIL` + `EXIT:1` | `SELFTEST=crafterscreen` inverts the **machine-panel** assertion: today's defect is a panel with no target cell, so the carried torch clicked on it changes nothing (`target=none`); this package sets the target, so the run ends non-zero |
+| `e2e-selftest-patterns.log` | `FAIL` + `EXIT:1` | `SELFTEST=patterns` inverts the **several-patterns** assertion: today's defect is one target for the whole machine (`targets=1`) after both cells were pressed; this package keeps two slots, so the run ends non-zero |
 | `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.8: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 | `screen-requester.png` | screenshot | the filter screen on a requester at `223 64 0`: the title, the 9 × 5 cells with the torch's icon, `min 4`, `max 8`, `batch 4` and the remove button |
 | `screen-crafter.png` | screenshot | the machine's panel on `225 64 0`: the 27 stock slots, the target cell with the torch's icon, `min 8`, `max 8` and the four value buttons |
@@ -900,16 +974,28 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     `target=none min=- max=-` — the screen press is the only difference between the two. The
     screenshot `screen-crafter.png` is the open panel. `SELFTEST=crafterscreen` asserts today's
     no-cell behaviour (`target=none`) and ends the run non-zero.
+26. **the machine's several patterns (0.2.9)**: a fresh machine at `225 64 0` has its first cell
+    pressed with a carried torch and its second with a carried stick — the row is the only way the
+    second target exists — and reads `targets=2 entries=minecraft:torch|…|…;minecraft:stick|…|…`.
+    `configure-item` retunes the two slots to `8..16` and `16..32`; with 8 coal, 8 sticks and 16 oak
+    planks loaded, after 80 ticks the readout is
+    `entries=minecraft:torch|8|16|idle|16|16;minecraft:stick|16|32|idle|28|32` with
+    `minecraft:coal:4` left (the eight sticks stocked by the harness are not crafted: four were
+    spent on torches, then seven stick steps from fourteen planks made the other 28) — each slot
+    filled its own band out of the shared inventory. The **differential**: the same spot with
+    only the first cell pressed reads `targets=1`, exactly one `entries=` field and no stick slot;
+    the second cell is the only difference. `SELFTEST=patterns` asserts today's `targets=1` reply and
+    ends the run non-zero.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **90,176 B** |
-| sha256 | `60f93e175ec3122f602058f5bdd851f90438cb2a57683d1bb902727878b17010` |
-| entries | 40 (`327,932 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.8` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **96,434 B** |
+| sha256 | `08d5c4773800c0b68f9fb29f599691451bb770455ac2b4e6a59db5c0defba411` |
+| entries | 40 (`360,083 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.9` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -962,13 +1048,16 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   edits. The **8 upgrade slots stay unported** (the RS `UpgradeContainer`), which is this screen's
   one missing column. Batch 0 disables an entry exactly as upstream skips it. A compound written by
   0.2.1–0.2.4 reads as one entry and is migrated to the container on the next write.
-- **The machine's panel edits one band, as its command does.** The target cell takes the carried item
-  (the same item is no change; an empty hand leaves the target, so a misclick cannot unconfigure the
-  machine), and a target the carried item cannot express — no `minecraft:crafting` recipe — leaves the
-  machine as it was, exactly as `/stepcrafter target` refuses it. The four buttons step the band by
-  one; upstream draws a min/max editor per pattern slot and this machine has one target, so one band
-  is the faithful shape. The cell's icon is the menu's open payload, so a target set from the panel
-  shows its icon when the panel is reopened; the number row updates at every press.
+- ~~**The machine's panel edits one band, as its command does.**~~ **Closed in 0.2.9** (§2j): the
+  machine now carries up to 45 pattern slots, each with its own target, band, batch, status and
+  counter. The panel draws the first nine cells in a row (the command reaches the rest); a carried
+  item on a cell makes or repoints that slot's target, an empty hand focuses it, and the four buttons
+  step the focused slot's band. A target the carried item cannot express — no `minecraft:crafting`
+  recipe — leaves the slot as it was, exactly as `/stepcrafter target` refuses it. The tick walks the
+  slots in order and spends one step per tick on the first that needs it (upstream's step budget is
+  shared across its slots too), so a slot whose stock stays below its band can hold up a later one;
+  that is upstream's slot order, not a new rule. The cells' icons are the menu's open payload, so a
+  target set from the panel shows its icon when the panel is reopened.
 - **The screen edits one entry's values at a time.** The 45 cells are drawn (a resource, a band and a
   batch are not an item stack, and a container slot cannot hold them); clicking a cell focuses it and
   a click with a carried item makes or repoints its entry there, as upstream's ghost filter slot does.
@@ -1039,6 +1128,7 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 
 | behaviour | upstream | this port |
 |---|---|---|
+| the 45 pattern slots, each with resource/min/max/batch/status | `StepCrafterBlockEntity.PATTERNS = 45`, `PatternResourceContainerImpl.slots` of `ResourceMinMaxAmount` | `runtime::TargetEntry`/`Targets` (saved list, one slot per resource); recipe derived from the item's `minecraft:crafting` recipe, batch carried for parity |
 | the band rule (start below min, fill to max, hold at max) | `StepCrafterNetworkNode.doWork`, three guards | `runtime::decide`, `runtime::plan` |
 | one step = resolve every cell, take, insert | `StepCraftingAlgorithm.prepareCraft/extractResolvedInputs/insertIntoNetwork` | `runtime::craft` (candidate resolution, reservation by counting), `machine::apply_craft` |
 | what the ingredients leave | `getRemainingItems` on the pattern's recipe | `Pattern.remainders` (per candidate, from `Host::item_crafting_remainder` at configuration), carried in `Outcome::Craft`, inserted beside the result under the same room rule |
@@ -1074,9 +1164,9 @@ a deviation, not as an upstream defect.
 
 | file | what it is |
 |---|---|
-| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, and the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `settle`, and the crafter's `Queued`/`FailedAsk`/`Queue` (the ask list, its credits and its failed ask, with their saved forms) — no `mod_api` types |
+| `src/runtime.rs` | the pure rules: `Band`, `Phase`, `Step`, `decide`, `Stock`, `Slots`/`Slot` (per-slot room, per-item empty-slot room), `Pattern` (cells, remainders, saved form), `plan`, `step_now`, `craft`, `apply`, the machine's `TargetEntry`/`Targets` (the 45-slot pattern container) and `MachineEditor`, the requester's `Filter`, `Entry`, `Filters` (the 45-entry container), `Ask`, `ask`, `settle`, and the crafter's `Queued`/`FailedAsk`/`Queue` (the ask list, its credits and its failed ask, with their saved forms) — no `mod_api` types |
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
-| `src/machine.rs` | the crafter's block entity: saved compound (pattern, remainders, band, phase, the ask `Queue` with its `Served` credits and `Failed` ask), the 27-slot inventory as a stock, `Shared` (the part a requester reads), the tick that prunes, serves and credits the head ask, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
+| `src/machine.rs` | the crafter's block entity: saved compound (the `Targets` list of 45 pattern slots with their bands/phases/patterns/counters, plus the ask `Queue` with its `Served` credits and `Failed` ask), the 27-slot inventory as a stock, `Shared` (every maintained item, the part a requester reads), the tick that walks the slots and prunes/serves/credits the head ask, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
 | `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, its ask merged into that crafter's queue, the per-entry tick (`settle` → `ask`) and the readout's views (its own `stored`/`served`/`queued`), the selected cell, the menu's data slots and open payload, and `press` (the server half of a screen press) |
 | `src/screen.rs` | the two panels: the requester's 176 × 238 filter screen and the machine's 176 × 208 configuration panel (`machine_layout`/`machine_button_at`/`machine_draw`), with their hit tests and drawing |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
@@ -1121,6 +1211,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the screen's panel and its origin | **tested** in game — the panel's top is 36 above the 166-high chest panel's (the declared 238), its left is the centred 176, and `slot-0` (the hotbar's first) is where the layout puts it |
 | the machine's stock slots and its own panel | **tested** in game — a right click opens `container` with the **27** stock slots at 300..326 on the package's own menu type, the panel's top read back as the centred 208 (**tested** — `the_machines_stock_slots_are_its_containers_twenty_seven`, `the_machines_cell_and_buttons_are_the_presses_the_server_applies`, `the_machines_menu_declares_the_slots_the_screen_publishes`) |
 | **the machine's own configuration screen** (target cell, band buttons, inversion guard) | **tested** — `the_target_cell_takes_the_carried_item`, `the_target_cell_with_the_same_item_changes_nothing`, `the_value_buttons_step_the_band_and_refuse_an_inversion`, `a_machine_value_never_goes_below_zero_and_caps_at_the_screens_maximum`, `the_machines_data_slots_are_its_band`, `the_target_cells_payload_is_its_item_id`, `a_machine_press_round_trips_through_its_button_id`; in game a carried torch on the cell reads `target=minecraft:torch cells=2 result=minecraft:torch:4`, `max +` ×16 and `min +` ×8 read `min=8 max=16`, `max -` ×8 then a `min +` stays `min=8 max=8`, and the machine nobody opened reads `target=none min=- max=-`; `SELFTEST=crafterscreen` inverts it and ends non-zero |
+| **the machine's several patterns (45 slots with resource/min/max/batch/status)** | **tested** — `a_second_target_slot_keeps_its_own_band_beside_the_first`, `the_two_targets_round_trip_through_the_saved_list`, `a_46th_distinct_target_is_refused`, `repointing_one_cell_leaves_the_other_target_untouched`, `the_two_targets_round_trip_through_the_saved_compound`, `a_legacy_single_target_compound_still_reads_as_one_slot`, `the_shared_read_is_the_queue_and_the_phase`, `the_target_cells_payload_is_its_item_id`; in game two cells pressed on one panel make `targets=2` with both entries, each fills its own band out of the shared stock (torch `8..16`, stick `16..32`, four coal and sixteen planks consumed), and the same spot with only the first cell pressed reads `targets=1` with one entry; `SELFTEST=patterns` asserts today's one-target reply and ends non-zero. The 45 **upgrade** slots of upstream's container are a separate RS surface and stay `blocked(no-parent-addon-surface)` |
 | the 8 upgrade slots | `blocked(no-parent-addon-surface)` — the RS `UpgradeContainer`, which the parent port does not ship |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
 | the slot upgrade, the FE buffer, the GUI, `direction`, advancements, JEI/EMI | **not ported** — upgrades/energy/GUI are the RS harness; `direction` is cosmetic here |

@@ -20,7 +20,9 @@ use mod_api::{
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
-use crate::runtime::{self, Band, Outcome, Pattern, Phase, Queue, Slot, Slots, Stock};
+use crate::runtime::{
+    self, Band, Outcome, Pattern, Phase, Queue, Slot, Slots, Stock, TargetEntry, Targets,
+};
 
 /// The block entity type this mod declares, and the `id` its carried data is tagged with.
 pub const TYPE: &str = "step_crafter";
@@ -31,6 +33,11 @@ pub const BLOCK: &str = "stepcrafter:step_crafter";
 pub const MENU: &str = "stepcrafter:step_crafter_config";
 /// The machine's inventory: upstream's stock is the network, this port's is its own slots.
 pub const SLOTS: usize = 27;
+/// The 45-slot pattern container, one `item|min|max|batch|phase|crafted|rc|cells|remainders` string
+/// per maintained resource — upstream's `TAG_PATTERNS` list of `ResourceMinMaxAmount` slots.
+const KEY_TARGETS: &str = "Targets";
+/// The cell the machine's panel last focused; the band buttons step this slot.
+const KEY_SELECTED: &str = "Selected";
 const KEY_TARGET: &str = "Target";
 const KEY_MIN: &str = "Min";
 const KEY_MAX: &str = "Max";
@@ -90,16 +97,15 @@ fn container() -> ModContainer {
 // The saved configuration
 // ---------------------------------------------------------------------------
 
-/// What one machine is configured to do.
+/// What one machine is configured to do: up to 45 pattern slots, each with its own target, band,
+/// pattern and status, plus the ask queue this machine serves for nearby requesters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    /// The item kept in stock (the pattern's own result).
-    pub target: Option<String>,
-    /// The maintenance band, absent until `/stepcrafter configure`.
-    pub band: Option<Band>,
-    /// The step pattern, absent until `/stepcrafter target`.
-    pub pattern: Option<Pattern>,
-    /// Where the last step left the machine.
+    /// The pattern slots — upstream's 45-slot pattern container, the truth of the configuration.
+    pub targets: Targets,
+    /// The cell the panel last focused (the band buttons edit this slot).
+    pub selected: usize,
+    /// Where the last step left the machine as a whole.
     pub phase: Phase,
     /// The asks requesters have left here, in the order this machine serves them.
     pub queue: Queue,
@@ -108,22 +114,59 @@ pub struct State {
 }
 
 impl State {
-    /// Whether the machine has both a pattern and a band.
+    /// Whether at least one pattern slot is configured.
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        self.pattern.is_some() && self.band.is_some()
+        !self.targets.is_empty()
+    }
+
+    /// The focused slot, or the first when no cell was focused.
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&TargetEntry> {
+        self.targets
+            .entry(self.selected)
+            .or_else(|| self.targets.entry(0))
+    }
+
+    /// The focused slot, or the first when no cell was focused.
+    pub fn selected_entry_mut(&mut self) -> Option<&mut TargetEntry> {
+        let index = self.targets.entry(self.selected).map_or_else(
+            || (!self.targets.is_empty()).then_some(0),
+            |_| Some(self.selected),
+        );
+        index.and_then(|index| self.targets.entry_mut(index))
+    }
+
+    /// The item the focused slot maintains (the legacy single-target view).
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.selected_entry().map(TargetEntry::item)
+    }
+
+    /// The focused slot's band (the legacy single-band view).
+    #[must_use]
+    pub fn band(&self) -> Option<Band> {
+        self.selected_entry().and_then(TargetEntry::band)
+    }
+
+    /// The focused slot's pattern (the legacy single-pattern view).
+    #[must_use]
+    pub fn pattern(&self) -> Option<&Pattern> {
+        self.selected_entry().map(TargetEntry::pattern)
     }
 }
 
-/// The part of a machine's saved state another block reads: what it maintains, where its last step
-/// left it, and the asks it holds (with each requester's share and its last failed ask).
+/// The part of a machine's saved state another block reads: what it maintains (every pattern slot),
+/// where its last step left it, and the asks it holds.
 ///
-/// A Step Requester reads this every tick and writes the ask list back; the pattern, the band and the
-/// stock stay the machine's own.
+/// A Step Requester reads this every tick and writes the ask list back; the patterns, the bands and
+/// the stock stay the machine's own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Shared {
-    /// The item the machine keeps in stock.
+    /// The first slot's item, kept for the 0.2.1–0.2.8 link and readout.
     pub target: Option<String>,
+    /// Every item this machine maintains, for a requester's link scan.
+    pub targets: Vec<String>,
     /// Where the machine's last step left it.
     pub phase: Phase,
     /// The asks it holds.
@@ -133,8 +176,16 @@ pub struct Shared {
 /// Read the shared part of a block entity's saved compound.
 #[must_use]
 pub fn shared(nbt: &Compound) -> Shared {
+    let targets = Targets::decode(&list(nbt, KEY_TARGETS).unwrap_or_default());
     Shared {
-        target: string(nbt, KEY_TARGET),
+        target: targets
+            .entry(0)
+            .map(|entry| entry.item().to_owned())
+            .or_else(|| string(nbt, KEY_TARGET)),
+        targets: targets
+            .iter()
+            .map(|entry| entry.item().to_owned())
+            .collect(),
         phase: string(nbt, KEY_PHASE)
             .as_deref()
             .map_or(Phase::Idle, Phase::of),
@@ -147,30 +198,37 @@ pub fn shared(nbt: &Compound) -> Shared {
 }
 
 /// Read the configuration out of a block entity's saved compound; an empty or foreign compound
-/// reads as an unconfigured machine.
+/// reads as an unconfigured machine. A 0.2.0–0.2.8 compound's single target becomes one slot.
 #[must_use]
 pub fn read(nbt: &Compound) -> State {
     let shared = shared(nbt);
-    let band = match (int(nbt, KEY_MIN), int(nbt, KEY_MAX)) {
-        (Some(min), Some(max)) => u64::try_from(min)
-            .ok()
-            .zip(u64::try_from(max).ok())
-            .and_then(|(min, max)| Band::new(min, max)),
-        _ => None,
-    };
-    let result_count = int(nbt, KEY_RESULT_COUNT).and_then(|count| u32::try_from(count).ok());
-    let cells = list(nbt, KEY_CELLS);
-    let remainders = list(nbt, KEY_REMAINDERS).unwrap_or_default();
-    let pattern = match (shared.target.as_deref(), result_count) {
-        (Some(target), Some(count)) => {
-            cells.and_then(|cells| Pattern::decode(&cells, &remainders, target, count))
+    let mut targets = Targets::decode(&list(nbt, KEY_TARGETS).unwrap_or_default());
+    if targets.is_empty() {
+        let band = match (int(nbt, KEY_MIN), int(nbt, KEY_MAX)) {
+            (Some(min), Some(max)) => u64::try_from(min)
+                .ok()
+                .zip(u64::try_from(max).ok())
+                .and_then(|(min, max)| Band::new(min, max)),
+            _ => None,
+        };
+        let result_count = int(nbt, KEY_RESULT_COUNT).and_then(|count| u32::try_from(count).ok());
+        let cells = list(nbt, KEY_CELLS);
+        let remainders = list(nbt, KEY_REMAINDERS).unwrap_or_default();
+        if let (Some(target), Some(count), Some(cells)) =
+            (shared.target.as_deref(), result_count, cells)
+            && let Some(pattern) = Pattern::decode(&cells, &remainders, target, count)
+            && let Some(entry) = TargetEntry::new(target.to_owned(), band, 1, pattern)
+        {
+            let _ = targets.set(entry);
         }
-        _ => None,
-    };
+    }
+    let selected = int(nbt, KEY_SELECTED)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+        .min(targets.len().saturating_sub(1));
     State {
-        target: shared.target,
-        band,
-        pattern,
+        targets,
+        selected,
         phase: shared.phase,
         queue: shared.queue,
         crafted: amount(nbt, KEY_CRAFTED),
@@ -179,34 +237,50 @@ pub fn read(nbt: &Compound) -> State {
 
 /// Write the configuration back; an unconfigured machine keeps no pattern keys at all.
 pub fn write(nbt: &mut Compound, state: &State) {
-    match &state.target {
-        Some(target) => put(nbt, KEY_TARGET, Tag::String(target.as_str().into())),
-        None => drop_key(nbt, KEY_TARGET),
+    let encoded = state.targets.encode();
+    if encoded.is_empty() {
+        drop_key(nbt, KEY_TARGETS);
+    } else {
+        put(
+            nbt,
+            KEY_TARGETS,
+            Tag::List(
+                encoded
+                    .iter()
+                    .map(|entry| Tag::String(entry.as_str().into()))
+                    .collect(),
+            ),
+        );
     }
-    match state.band {
-        Some(band) => {
-            put(nbt, KEY_MIN, int_of(band.min()));
-            put(nbt, KEY_MAX, int_of(band.max()));
-        }
-        None => {
-            drop_key(nbt, KEY_MIN);
-            drop_key(nbt, KEY_MAX);
-        }
-    }
-    match &state.pattern {
-        Some(pattern) => {
+    put(nbt, KEY_SELECTED, int_of(state.selected as u64));
+    // The focused slot is mirrored into the legacy single-target keys so a requester's `shared`
+    // read and the 0.2.1–0.2.8 tooling see the same configuration. The list above is the truth.
+    match state.selected_entry() {
+        Some(entry) => {
+            put(nbt, KEY_TARGET, Tag::String(entry.item().into()));
+            match entry.band() {
+                Some(band) => {
+                    put(nbt, KEY_MIN, int_of(band.min()));
+                    put(nbt, KEY_MAX, int_of(band.max()));
+                }
+                None => {
+                    drop_key(nbt, KEY_MIN);
+                    drop_key(nbt, KEY_MAX);
+                }
+            }
             put(
                 nbt,
                 KEY_CELLS,
                 Tag::List(
-                    pattern
+                    entry
+                        .pattern()
                         .encode()
                         .iter()
                         .map(|cell| Tag::String(cell.as_str().into()))
                         .collect(),
                 ),
             );
-            let remainders = pattern.encode_remainders();
+            let remainders = entry.pattern().encode_remainders();
             if remainders.is_empty() {
                 drop_key(nbt, KEY_REMAINDERS);
             } else {
@@ -224,10 +298,13 @@ pub fn write(nbt: &mut Compound, state: &State) {
             put(
                 nbt,
                 KEY_RESULT_COUNT,
-                Tag::Int(i32::try_from(pattern.result_count()).unwrap_or(1)),
+                Tag::Int(i32::try_from(entry.pattern().result_count()).unwrap_or(1)),
             );
         }
         None => {
+            drop_key(nbt, KEY_TARGET);
+            drop_key(nbt, KEY_MIN);
+            drop_key(nbt, KEY_MAX);
             drop_key(nbt, KEY_CELLS);
             drop_key(nbt, KEY_REMAINDERS);
             drop_key(nbt, KEY_RESULT_COUNT);
@@ -449,27 +526,30 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         event.entity.items.resize(SLOTS, None);
     }
     let mut state = read(&event.entity.nbt);
-    // The screen's numbers are the menu's data slots, a view and not saved: publish the band every
-    // tick, so a reopened menu and its buttons agree with the compound the command writes.
-    event.entity.data = runtime::machine_data_slots(state.band).to_vec();
+    // The screen's numbers are the menu's data slots, a view and not saved: publish the focused
+    // slot's band every tick, so a reopened menu and its buttons agree with the compound commands
+    // write.
+    event.entity.data = runtime::machine_data_slots(state.band()).to_vec();
     let before = state.clone();
 
-    // An ask that can never be served is dropped before anything is spent on it: one for another
-    // item (a re-targeted machine), or one whose requester is gone (a broken block). A requester
-    // whose chunk is out this tick is not "gone" — its ask waits.
+    // An ask that can never be served is dropped before anything is spent on it: one for an item
+    // no slot maintains (a re-targeted machine), or one whose requester is gone (a broken block).
+    // A requester whose chunk is out this tick is not "gone" — its ask waits.
     if let Some(level) = host.level(host.dimension()) {
-        let target = state.target.clone();
+        let maintained: Vec<String> = state
+            .targets
+            .iter()
+            .map(|entry| entry.item().to_owned())
+            .collect();
         state.queue.retain(|ask| {
-            Some(ask.item()) == target.as_deref()
+            maintained.iter().any(|item| item == ask.item())
                 && requester_present(&*host, level, ask.requester())
         });
     }
 
-    // A Step Requester's ask outranks this machine's own band for the tick it is served: the band
-    // is this machine's timing rule, an ask is somebody else's, and either way one tick is one step
-    // (`STEPS_PER_TICK`). The step itself is the same one `/stepcrafter step` takes — the ask
-    // bypasses the band, not the pattern. The head ask is served first; the asks behind it keep
-    // their place.
+    // A Step Requester's ask outranks this machine's own bands for the tick it is served: a band is
+    // this machine's timing rule, an ask is somebody else's, and either way one tick is one step
+    // (`STEPS_PER_TICK`). The head ask is served with the slot that maintains its item.
     if !state.queue.is_empty() {
         serve_request(host, event, &mut state);
         // Write only a state that moved: a requester that wrote an ask later in this same tick
@@ -481,49 +561,75 @@ pub fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         return;
     }
 
-    let Some(band) = state.band else {
-        if state != before {
-            write(&mut event.entity.nbt, &state);
-        }
-        sync_active(host, pos, false);
-        return;
-    };
-
+    // Upstream walks every configured pattern slot in turn while its step budget lasts. This port
+    // keeps that order and spends one step this tick on the first slot that needs one; a slot whose
+    // stock is inside its band holds, letting the next slot use the step.
     let mut changed = state != before;
     for _ in 0..runtime::STEPS_PER_TICK {
-        let slots = slots_with_rooms(&*host, &event.entity.items, state.pattern.as_ref());
-        let outcome = runtime::plan(&slots, band, state.phase, state.pattern.as_ref());
-        match &outcome {
-            Outcome::Hold => break,
-            Outcome::Finished => {
-                state.phase = Phase::Idle;
-                changed = true;
-                break;
-            }
-            Outcome::Craft { result_count, .. } => {
-                if apply_craft(host, &mut event.entity.items, &outcome) {
-                    state.crafted = state.crafted.saturating_add(u64::from(*result_count));
-                    state.phase = Phase::Crafting;
-                } else {
-                    // The real merge rule had no room the room model counted: refuse the step
-                    // instead of consuming its ingredients and losing the result.
-                    state.phase = Phase::NetworkFull;
+        let mut stepped = false;
+        for entry in state.targets.iter_mut() {
+            // A slot with no band is configured but idle: upstream's pattern slot with no min/max
+            // does nothing until an operator sets the maintenance range.
+            let Some(band) = entry.band() else {
+                continue;
+            };
+            let outcome = {
+                let slots = slots_with_rooms(&*host, &event.entity.items, Some(entry.pattern()));
+                runtime::plan(&slots, band, entry.phase(), Some(entry.pattern()))
+            };
+            match &outcome {
+                Outcome::Hold => continue,
+                Outcome::Finished => {
+                    entry.set_phase(Phase::Idle);
+                    changed = true;
+                    break;
                 }
-                changed = true;
+                Outcome::Craft { result_count, .. } => {
+                    if apply_craft(host, &mut event.entity.items, &outcome) {
+                        entry.add_crafted(u64::from(*result_count));
+                        state.crafted = state.crafted.saturating_add(u64::from(*result_count));
+                        entry.set_phase(Phase::Crafting);
+                    } else {
+                        // The real merge rule had no room the room model counted: refuse the step
+                        // instead of consuming its ingredients and losing the result.
+                        entry.set_phase(Phase::NetworkFull);
+                    }
+                    changed = true;
+                    stepped = true;
+                    break;
+                }
+                Outcome::NotEnoughIngredients { .. } => {
+                    entry.set_phase(Phase::NotEnoughIngredients);
+                    changed = true;
+                    break;
+                }
+                Outcome::NetworkFull { .. } => {
+                    entry.set_phase(Phase::NetworkFull);
+                    changed = true;
+                    break;
+                }
             }
-            Outcome::NotEnoughIngredients { .. } => {
-                state.phase = Phase::NotEnoughIngredients;
-                changed = true;
-                break;
-            }
-            Outcome::NetworkFull { .. } => {
-                state.phase = Phase::NetworkFull;
-                changed = true;
-                break;
-            }
-        };
+        }
+        if !stepped {
+            break;
+        }
     }
 
+    // The machine's own phase is the aggregate of its slots: crafting when any is, the refusal a
+    // slot last met otherwise, idle when they are all inside their bands.
+    state.phase = if state
+        .targets
+        .iter()
+        .any(|entry| entry.phase().is_crafting())
+    {
+        Phase::Crafting
+    } else {
+        state
+            .targets
+            .iter()
+            .find(|entry| entry.phase().is_refusal())
+            .map_or(Phase::Idle, TargetEntry::phase)
+    };
     if changed {
         write(&mut event.entity.nbt, &state);
     }
@@ -552,28 +658,50 @@ fn serve_request(
     event: &mut BlockEntityTickEvent<'_>,
     state: &mut State,
 ) {
-    let slots = slots_with_rooms(&*host, &event.entity.items, state.pattern.as_ref());
-    let outcome = runtime::step_now(&slots, state.pattern.as_ref());
+    let Some(item) = state.queue.head().map(|head| head.item().to_owned()) else {
+        return;
+    };
+    let Some(index) = state.targets.iter().position(|entry| entry.item() == item) else {
+        // No slot maintains the head's item any more: the ask waits for reconfiguration.
+        return;
+    };
+    let outcome = {
+        let entry = state
+            .targets
+            .entry_mut(index)
+            .expect("the head's item has a slot");
+        let slots = slots_with_rooms(&*host, &event.entity.items, Some(entry.pattern()));
+        runtime::step_now(&slots, Some(entry.pattern()))
+    };
+    let entry = state
+        .targets
+        .entry_mut(index)
+        .expect("the head's item has a slot");
     match &outcome {
         Outcome::Craft { result_count, .. } => {
             if apply_craft(host, &mut event.entity.items, &outcome) {
+                entry.add_crafted(u64::from(*result_count));
                 state.crafted = state.crafted.saturating_add(u64::from(*result_count));
                 state.queue.spend(u64::from(*result_count));
+                entry.set_phase(Phase::Crafting);
                 state.phase = Phase::Crafting;
             } else {
+                entry.set_phase(Phase::NetworkFull);
                 state.phase = Phase::NetworkFull;
                 state.queue.fail();
             }
         }
         Outcome::NotEnoughIngredients { .. } => {
+            entry.set_phase(Phase::NotEnoughIngredients);
             state.phase = Phase::NotEnoughIngredients;
             state.queue.fail();
         }
         Outcome::NetworkFull { .. } => {
+            entry.set_phase(Phase::NetworkFull);
             state.phase = Phase::NetworkFull;
             state.queue.fail();
         }
-        // No pattern, nothing to serve: the ask waits for the machine to be configured.
+        // Nothing to serve: the ask waits for the machine to be configured.
         Outcome::Hold | Outcome::Finished => {}
     }
 }
@@ -595,18 +723,28 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
         .map(|slot| entity.item_slot(&*host, slot as u32).ok().flatten())
         .collect();
     let mut state = read(&nbt);
-    let Some(_band) = state.band else {
+    if !state.is_configured() {
         return "unconfigured".to_owned();
+    }
+    let outcome = {
+        let pattern = state.pattern();
+        let slots = slots_with_rooms(&*host, &items, pattern);
+        runtime::step_now(&slots, pattern)
     };
-    let slots = slots_with_rooms(&*host, &items, state.pattern.as_ref());
-    let outcome = runtime::step_now(&slots, state.pattern.as_ref());
     let result = match &outcome {
         Outcome::Craft { result_count, .. } => {
             if apply_craft(host, &mut items, &outcome) {
+                if let Some(entry) = state.selected_entry_mut() {
+                    entry.add_crafted(u64::from(*result_count));
+                    entry.set_phase(Phase::Crafting);
+                }
                 state.crafted = state.crafted.saturating_add(u64::from(*result_count));
                 state.phase = Phase::Crafting;
                 "crafted"
             } else {
+                if let Some(entry) = state.selected_entry_mut() {
+                    entry.set_phase(Phase::NetworkFull);
+                }
                 state.phase = Phase::NetworkFull;
                 "network-full"
             }
@@ -615,10 +753,16 @@ pub fn step_once(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
         Outcome::Hold => return "held".to_owned(),
         Outcome::Finished => return "finished".to_owned(),
         Outcome::NotEnoughIngredients { .. } => {
+            if let Some(entry) = state.selected_entry_mut() {
+                entry.set_phase(Phase::NotEnoughIngredients);
+            }
             state.phase = Phase::NotEnoughIngredients;
             "not-enough-ingredients"
         }
         Outcome::NetworkFull { .. } => {
+            if let Some(entry) = state.selected_entry_mut() {
+                entry.set_phase(Phase::NetworkFull);
+            }
             state.phase = Phase::NetworkFull;
             "network-full"
         }
@@ -708,30 +852,36 @@ pub fn press(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
         let host: &dyn Host = &*host;
         event.carried.as_ref().map(|stack| stack.item().id(host))
     };
+    // A carried item on a target cell must have a step to take: a pattern the machine could never
+    // craft is no configuration, exactly as `/stepcrafter target` refuses an item with no
+    // `minecraft:crafting` recipe. Resolve before touching the saved container.
+    let resolved = match (press, carried.as_deref()) {
+        (runtime::MachinePress::Cell(_), Some(item)) => {
+            match crate::pattern::resolve(&*host, item) {
+                Ok(pattern) => Some(pattern),
+                Err(_) => return,
+            }
+        }
+        _ => None,
+    };
     let mut state = read(&event.entity.nbt);
-    let mut editor = runtime::MachineEditor::new(state.target.clone(), state.band);
+    let mut editor = runtime::MachineEditor::new(state.targets.clone(), state.selected);
     if !editor.apply(press, carried.as_deref()) {
         return;
     }
-    let (target, band) = editor.into_parts();
-    if target != state.target {
-        let Some(item) = target.as_deref() else {
-            return;
-        };
-        // The carried item must have a step to take: a pattern the machine could never craft is no
-        // configuration, exactly as the command refuses an item with no `minecraft:crafting` recipe.
-        let Ok(pattern) = crate::pattern::resolve(&*host, item) else {
-            return;
-        };
-        state.target = Some(pattern.result().to_owned());
-        state.pattern = Some(pattern);
+    let (targets, selected) = editor.into_parts();
+    state.targets = targets;
+    state.selected = selected;
+    // The editor put a provisional recipe in a newly created slot; replace it with the resolved one
+    // so a repointed cell keeps the band but maintains the item the player actually clicked.
+    if let (Some(pattern), Some(entry)) = (resolved, state.targets.entry_mut(selected)) {
+        entry.set_pattern(pattern);
     }
-    state.band = band;
     state.phase = Phase::Idle;
     write(&mut event.entity.nbt, &state);
     // Publish at once rather than waiting for the next tick: the client redraws the number the
     // player just stepped.
-    event.entity.data = runtime::machine_data_slots(state.band).to_vec();
+    event.entity.data = runtime::machine_data_slots(state.band()).to_vec();
 }
 
 /// The machine's screen open payload (`menu_extra_data`): the target's item id, so the client draws
@@ -744,7 +894,8 @@ pub fn extra_data(host: &dyn Host, level: LevelRef, pos: [i32; 3], menu: &str) -
     }
     let entity = host.block_entity(level, pos)?;
     let data = entity.data(host)?;
-    Some(runtime::machine_extra_data(read(&data).target.as_deref()).into_bytes())
+    let state = read(&data);
+    Some(runtime::machine_extra_data(&state.targets, state.selected).into_bytes())
 }
 
 /// A player's right click on one of this package's two blocks opens its menu.
@@ -819,27 +970,49 @@ mod tests {
     use super::*;
 
     /// The saved compound is the machine's configuration: the readout and the tick both read it
+    /// One saved slot with a one-cell pattern; the band is what these compound tests check.
+    fn slot(item: &str, band: Band) -> TargetEntry {
+        let pattern =
+            Pattern::new(vec![vec![item.to_owned()]], item.to_owned(), 1).expect("a test pattern");
+        TargetEntry::new(item.to_owned(), Some(band), 1, pattern).expect("a test slot")
+    }
+
     /// back, so a write that does not round-trip loses the pattern or the band.
     #[test]
     fn the_state_round_trips_through_the_saved_compound() {
         let mut nbt = Compound::new();
+        let pattern = Pattern::new(
+            vec![
+                vec!["minecraft:coal".to_owned(), "minecraft:charcoal".to_owned()],
+                vec!["minecraft:stick".to_owned()],
+            ],
+            "minecraft:torch".to_owned(),
+            4,
+        )
+        .map(|pattern| {
+            pattern.with_remainders(std::collections::BTreeMap::from([(
+                "minecraft:coal".to_owned(),
+                ("minecraft:coal".to_owned(), 1),
+            )]))
+        })
+        .expect("a test pattern");
+        let mut targets = Targets::new();
+        assert!(
+            targets
+                .set(
+                    TargetEntry::new(
+                        "minecraft:torch".to_owned(),
+                        Some(Band::new(8, 16).expect("a band")),
+                        1,
+                        pattern,
+                    )
+                    .expect("a test slot")
+                )
+                .is_ok()
+        );
         let state = State {
-            target: Some("minecraft:torch".to_owned()),
-            band: Band::new(8, 16),
-            pattern: Pattern::new(
-                vec![
-                    vec!["minecraft:coal".to_owned(), "minecraft:charcoal".to_owned()],
-                    vec!["minecraft:stick".to_owned()],
-                ],
-                "minecraft:torch".to_owned(),
-                4,
-            )
-            .map(|pattern| {
-                pattern.with_remainders(std::collections::BTreeMap::from([(
-                    "minecraft:coal".to_owned(),
-                    ("minecraft:coal".to_owned(), 1),
-                )]))
-            }),
+            targets,
+            selected: 0,
             phase: Phase::Crafting,
             queue: {
                 let mut queue = Queue::new();
@@ -871,8 +1044,7 @@ mod tests {
         );
         let saved = read(&nbt);
         let left = saved
-            .pattern
-            .as_ref()
+            .pattern()
             .and_then(|pattern| pattern.remainder_of("minecraft:coal"));
         assert_eq!(
             left,
@@ -881,13 +1053,90 @@ mod tests {
         );
     }
 
-    /// The shared read is what a Step Requester sees: the target, the phase and the queue — no
-    /// pattern, no band, no stock.
+    /// The two slots and their different bands survive the same compound; a machine that saves only
+    /// its first target loses the second on reload.
+    #[test]
+    fn the_two_targets_round_trip_through_the_saved_compound() {
+        let mut nbt = Compound::new();
+        let mut targets = Targets::new();
+        assert!(
+            targets
+                .set(slot("minecraft:torch", Band::new(8, 16).expect("a band")))
+                .is_ok()
+        );
+        assert!(
+            targets
+                .set(slot("minecraft:stick", Band::new(16, 32).expect("a band")))
+                .is_ok()
+        );
+        let state = State {
+            targets,
+            selected: 1,
+            phase: Phase::Idle,
+            queue: Queue::new(),
+            crafted: 8,
+        };
+        write(&mut nbt, &state);
+        let saved = read(&nbt);
+        assert_eq!(saved.targets.len(), 2, "both pattern slots survive");
+        assert_eq!(
+            saved.targets.entry(0).and_then(TargetEntry::band),
+            Some(Band::new(8, 16).expect("a band"))
+        );
+        assert_eq!(
+            saved.targets.entry(1).and_then(TargetEntry::band),
+            Some(Band::new(16, 32).expect("a band"))
+        );
+        assert_eq!(saved.selected, 1, "the focused cell survives");
+        assert_eq!(saved, state);
+    }
+
+    /// A 0.2.0–0.2.8 compound with one target and a band reads as one slot, so an existing world is
+    /// configured as it was.
+    #[test]
+    fn a_legacy_single_target_compound_still_reads_as_one_slot() {
+        let mut nbt = Compound::new();
+        put(&mut nbt, KEY_TARGET, Tag::String("minecraft:torch".into()));
+        put(&mut nbt, KEY_MIN, int_of(8));
+        put(&mut nbt, KEY_MAX, int_of(16));
+        put(
+            &mut nbt,
+            KEY_CELLS,
+            Tag::List(vec![
+                Tag::String("minecraft:coal,minecraft:charcoal".into()),
+                Tag::String("minecraft:stick".into()),
+            ]),
+        );
+        put(&mut nbt, KEY_RESULT_COUNT, Tag::Int(4));
+        let state = read(&nbt);
+        assert_eq!(state.targets.len(), 1);
+        assert_eq!(state.target(), Some("minecraft:torch"));
+        assert_eq!(state.band(), Some(Band::new(8, 16).expect("a band")));
+        assert_eq!(
+            state.pattern().map(|pattern| pattern.result_count()),
+            Some(4)
+        );
+    }
+
+    /// The shared read is what a Step Requester sees: every maintained item, the phase and the
+    /// queue — no pattern, no band, no stock.
     #[test]
     fn the_shared_read_is_the_queue_and_the_phase() {
         let mut nbt = Compound::new();
+        let mut targets = Targets::new();
+        assert!(
+            targets
+                .set(slot("minecraft:torch", Band::new(0, 0).expect("a band")))
+                .is_ok()
+        );
+        assert!(
+            targets
+                .set(slot("minecraft:stick", Band::new(0, 0).expect("a band")))
+                .is_ok()
+        );
         let mut state = State {
-            target: Some("minecraft:torch".to_owned()),
+            targets,
+            selected: 0,
             phase: Phase::NotEnoughIngredients,
             ..State::default()
         };
@@ -896,6 +1145,7 @@ mod tests {
         write(&mut nbt, &state);
         let shared = shared(&nbt);
         assert_eq!(shared.target.as_deref(), Some("minecraft:torch"));
+        assert_eq!(shared.targets, vec!["minecraft:torch", "minecraft:stick"]);
         assert_eq!(shared.phase, Phase::NotEnoughIngredients);
         assert_eq!(shared.queue.outstanding([222, 64, 0], "minecraft:torch"), 4);
         assert!(shared.queue.failed_for([222, 64, 0], "minecraft:torch"));

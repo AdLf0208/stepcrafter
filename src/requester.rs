@@ -536,7 +536,7 @@ fn inspect(host: &dyn Host, level: LevelRef, pos: [i32; 3], item: &str) -> Candi
         return Candidate::Unreadable;
     };
     let state = machine::shared(&data);
-    if state.target.as_deref() == Some(item) {
+    if state.targets.iter().any(|target| target == item) {
         Candidate::Hit(entity, state)
     } else {
         // A crafter that maintains something else cannot be asked for this item: the ask would
