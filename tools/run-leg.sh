@@ -15,8 +15,10 @@ case "$mode" in
     # fail at the first block check, not merely run the in-script control and then PASS on the
     # modded game.
     CONTROL) game=$CONTROL_GAME; extra=(CONTROL_GAME=) ;;
-    "") ;;
-    *) extra=(SELFTEST="$mode") ;;
+    # The control has its own log (run-leg.sh control CONTROL). Launching two games in one leg is
+    # flaky while other agents' e2e jobs load the box, so the main leg runs one game only.
+    "") extra=(CONTROL_GAME=) ;;
+    *) extra=(CONTROL_GAME= SELFTEST="$mode") ;;
 esac
 sock=$E2E_TMP/stepcrafter-$name.sock
 ports/tools/build-slot.sh run --job W1-stepcrafter--$name --port ports/stepcrafter --step e2e -- \

@@ -58,7 +58,7 @@ with 5 base recipes, 51 colouring recipes, 51 loot tables, 3 item tags, 1 block 
 | the 51 colouring recipes + the three colour tags | `not ported` — they recolour the managers/monitor, which are blocked |
 | FE buffer (`energyUsage` per machine, `SimpleNetworkNode`) | `not ported` — energy is the RS network's; this machine's stock is its inventory |
 | GUI (screens, side-button widgets, the preview screen, slots with min/max editors) | **ported for the requester (0.2.6)** and the **machine (0.2.8)**: the requester's 45 filter cells, the selected entry's min/max/batch and the buttons that step them (§2g); the machine's own panel with its 27 stock slots, a target cell and the band's `min`/`max` buttons (§2i). The managers'/monitor's GUIs stay `blocked(no-parent-addon-surface)` |
-| `active` state, `direction` state | `active` ported; `direction` **not ported** (the model is a cube; no facing behaviour in this slice) |
+| `active` state, `direction` state | both ported: `active` (0.2.0) and the six-value `direction` with the jar's per-face rotations and upstream's `FACE_CLICKED` placement rule (0.2.11, §2l) |
 | advancements, JEI/EMI plugins, config (`energyUsage`, `speedMultiplier`, defaults) | `not ported` — client/optional surface; defaults are documented where the port needs a number |
 
 ## 2. The slice: what it is (version 0.2.0)
@@ -539,6 +539,50 @@ ends at `LAST_TARGET_BUTTON = TARGET_BUTTON + MAX_TARGET_ENTRIES as i32 - 1 = 34
   cell 44 with a carried torch, and asserts `targets=45` plus a 45th `entries=` field from the parsed
   `/stepcrafter info` reply. `SELFTEST=grid45` asserts today's no-45th-slot reply and ends `EXIT:1`.
 
+## 2l. The slice (version 0.2.11): the block's `direction` state
+
+0.2.10's gap line (§6) was *"`direction` state, the colours, the managers, the monitor and their
+GUIs, the slot upgrade, the FE buffer — see §1's table, each with its reason"*, and §1's row named
+the last unported state: *"`active` ported; `direction` not ported (the model is a cube; no facing
+behaviour in this slice)"*. This slice carries the `direction` state on the existing block and item.
+It is a block-state/model + placement change only: no new block, item, renderer, entity, saved key
+or parent surface, so it stays inside the **machines** tier.
+
+### The artefact, read before any code
+
+- The ATM10 jar's `assets/stepcrafter/blockstates/step_crafter.json` has **12 variants**,
+  `active=false|true` × `direction=down|up|north|south|west|east`, each model rotated per face
+  (north x=90; south x=90 y=180; west x=90 y=270; east x=90 y=90; down x=180; up unrotated).
+  `step_requester` has only the two `active` variants — no `direction`.
+- Upstream `StepCrafterBlock.java` at the port's analysis commit
+  `963cd494187ea762b4d78cecd55a45f3cb479812` overrides `getDirectionType()` to return
+  `DefaultDirectionType.FACE_CLICKED`. RS's `AbstractDirectionalBlock` therefore sets `direction`
+  from the **clicked face** (`context.getClickedFace()`), a six-value `Direction` — not the placer's
+  yaw and not its opposite (unlike the mini portal's horizontal `facing`, `allthetweaks` §2).
+
+### What changed
+
+- **Content**: the block declaration gains the `direction` enum state property
+  (`down, up, north, south, west, east`, default `north`) beside the unchanged `active` boolean;
+  the blockstates asset carries the jar's 12 variants with those rotations (the port's own model
+  names, a cube with its three textures and a vanilla bottom). The item model is unchanged.
+- **`runtime.rs`**: the pure `FACES` list and `direction_for_face`, which answers the clicked face
+  as the state value (or `None` for an unknown face) — no `mod_api` types, with two unit tests.
+- **`machine.rs`**: `face_name` maps the pin's `Direction` to the blockstate spelling, and
+  `state_for_placement` answers only for our block (`level.state_block`) with
+  `level.state_with_property(state, "direction", face)`. `declare` attaches the Part to the block
+  with `r.block_part`.
+- **`lib.rs`**: a **dedicated** `StepCrafterPlacement` block Part implements `state_for_placement`;
+  `StepCrafter` stays the block-entity Part. The first draft attached one type to both, which the
+  launcher refused at load (`… is attached to stepcrafter:step_crafter twice, by stepcrafter and
+  stepcrafter`) — caught by the game-build probe before delivery, then fixed and rebuilt from
+  scratch. `sync_active` still writes only the `active` property, so the 45-cell panel and the
+  `active` state cannot be disturbed by this slice.
+
+Default `direction` is `north` (the first horizontal face); a placed block takes the clicked face.
+`setblock` without a direction keeps the default. An unknown face never produces an answer, so the
+engine's own placement runs for every other block.
+
 ## 2d. The slice (version 0.2.3): crafting remainders
 
 0.2.2's own next-slice line (§10) was *"crafting remainders are not produced (a bucket recipe leaves
@@ -868,6 +912,26 @@ The game half's red is `SELFTEST=grid45` (§4): it asserts today's nine-cell rep
 after cell 44's pixel is pressed — and ends `EXIT:1` on the package that makes the 45th. The
 differential machine is planted with the same 44 slots but never opened, so it stays at 44.
 
+Green at 0.2.11 (the direction slice): **96 tests** (`sdk-test.log`, `Compiling stepcrafter v0.2.11`).
+Its red transcript is `red-unit-direction.log`: `direction_for_face` was a stub answering `None`,
+so the six-face test failed for exactly that reason:
+
+```
+---- runtime::tests::a_clicked_face_becomes_the_blocks_direction stdout ----
+
+thread 'runtime::tests::a_clicked_face_becomes_the_blocks_direction' panicked at src/runtime.rs:3888:13:
+assertion `left == right` failed: face down
+  left: None
+ right: Some("down")
+
+test result: FAILED. 95 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The game half's red is `SELFTEST=direction` (§4): it asserts the old no-direction reply — an
+`execute if block …[direction=north]` predicate cannot pass — and ends `EXIT:1` on the package
+that gives the block its state. The differential is vanilla stone (the same predicate names no
+such state) and the south-vs-north pair of real placements.
+
 **Harness flakes (recorded, not port verdicts):** with three game legs sharing the box, two legs
 (`components-room`, `queue`) got an empty `ctl messages` reply (`jq: Cannot iterate over null`) and
 failed at an earlier assertion. Both were re-run alone and ended at their intended `SELFTEST`
@@ -904,12 +968,12 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — sixteen run logs plus the build log, all `--strict` green
-(`logs=16 ok=16 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — seventeen run logs plus the build log, all `--strict` green
+(`logs=17 ok=17 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
-| `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package, plus an in-run control leg on the same Nightly built without it |
+| `e2e-launcher.log` | `PASS` + `EXIT:0` | the scenario below, on the game the launcher built with the package (the control is its own log, `e2e-control.log`) |
 | `e2e-control.log` | `FAIL` + `EXIT:1` | the same script with `GAME` = the Nightly **without** the package: `setblock stepcrafter:step_crafter` leaves air |
 | `e2e-red-components-0.2.3.log` | `FAIL` + `EXIT:1` | the **previous** package (0.2.3) run with 0.2.4's leg: `/stepcrafter step` answers `result=crafted` beside the named stack and leaves `torch:60` — the silent loss, reproduced |
 | `e2e-red-queue-0.2.6.log` | `FAIL` + `EXIT:1` | the **previous** package (0.2.6) run with 0.2.7's leg: the second requester reads `stored=4 phase=not-enough-ingredients` — the first's torches as its own, and no queue anywhere — so the leg's `stored=0 served=0 queued=1 phase=running` fails on it |
@@ -923,8 +987,9 @@ entity, and was removed. Both are recorded under §6.
 | `e2e-selftest-queue.log` | `FAIL` + `EXIT:1` | `SELFTEST=queue` inverts the **queued-ask** assertion: today's defect is one `Int`, so the second requester's ask is lost and it reads the first's torches; this package serves it its own four (`served=4`), so the run ends non-zero |
 | `e2e-selftest-crafterscreen.log` | `FAIL` + `EXIT:1` | `SELFTEST=crafterscreen` inverts the **machine-panel** assertion: today's defect is a panel with no target cell, so the carried torch clicked on it changes nothing (`target=none`); this package sets the target, so the run ends non-zero |
 | `e2e-selftest-patterns.log` | `FAIL` + `EXIT:1` | `SELFTEST=patterns` inverts the **several-patterns** assertion: today's defect is one target for the whole machine (`targets=1`) after both cells were pressed; this package keeps two slots, so the run ends non-zero |
-| `e2e-selftest-grid45.log` | `FAIL` + `EXIT:1` | `SELFTEST=grid45` inverts the **full-grid** assertion: today's nine-cell panel cannot press cell 44, so the saved container stays at 44 slots; this package makes the 45th, so the run ends non-zero |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.10: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-grid45.log` | `FAIL` + `EXIT:1` | `SELFTEST=grid45` inverts the **full-grid** assertion: today's nine-cell panel cannot press cell 44, so the saved container stays at 44 slots; this package makes the 45th, so the run ends non-zero |
+| `e2e-selftest-direction.log` | `FAIL` + `EXIT:1` | `SELFTEST=direction` inverts the placement assertion: today's defect has no `direction` state, so the `execute if block …[direction=north]` predicate cannot pass; this package's north placement passes it, so the run ends non-zero |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.11: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 | `screen-requester.png` | screenshot | the filter screen on a requester at `223 64 0`: the title, the 9 × 5 cells with the torch's icon, `min 4`, `max 8`, `batch 4` and the remove button |
 | `screen-crafter.png` | screenshot | the machine's panel on `225 64 0`: the 27 stock slots, the target cell with the torch's icon, `min 8`, `max 8` and the four value buttons |
 | `screen-grid45.png` | screenshot | the 176 × 238 machine panel with all 45 pattern cells; cell 44 (bottom right) carries the torch added by the press (evidence only — the parsed reply is the assertion) |
@@ -1063,7 +1128,16 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     only the first cell pressed reads `targets=1`, exactly one `entries=` field and no stick slot;
     the second cell is the only difference. `SELFTEST=patterns` asserts today's `targets=1` reply and
     ends the run non-zero.
-27. **the full 45-cell pattern grid (0.2.10)**: two machines at `225 64 0` and `225 64 4` are planted
+27. **the `direction` state (0.2.11)**: a floating support at `200 66 0` is approached from the
+    north (player `200.5 64 -3.5`, `ctl look-at-block 200 66 0 north`); `ctl place 200 66 -1`
+    makes a machine whose `execute if block 200 66 -1 stepcrafter:step_crafter[direction=north]`
+    answers `Test passed`. The same support approached from the south places at `200 66 1`, whose
+    `[direction=south]` passes while its `[direction=north]` fails — the clicked face, not the
+    placer's yaw. A vanilla stone at `202 66 0` named with `[direction=north]` passes neither
+    predicate (no such state). `SELFTEST=direction` asserts the old no-state reply and ends
+    `EXIT:1`. The parsed `Test passed` / `Test failed` reply is the assertion; a shared-box empty
+    `ctl messages` read is retried, never taken as a pass.
+28. **the full 45-cell pattern grid (0.2.10)**: two machines at `225 64 0` and `225 64 4` are planted
     with the same 44 saved pattern slots (`targets=44`, 44 `entries=` fields). The panel's origin is
     read back from the game as the centred **238**-high one. A carried torch pressed on **cell 44**
     at its computed pixel (local `[135,118]`; grid bounds [128,143) × [111,126)) makes
@@ -1077,12 +1151,12 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **97,388 B** |
-| sha256 | `9bb9770bb572b52118df5fd9c80f68096d34b555adb66976c29298e8096c0760` |
-| entries | 40 (`364,768 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.10` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **99,600 B** |
+| sha256 | `31a87f798a6282663c0b4b74c6fa2c5241f12cd5a1308d93e21acc16559de377` |
+| entries | 40 (`373,984 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.11` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
-| pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
+| pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha `31a87f79…`) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
 | gate | `python3 ports/tools/verify-sdk-package.py stepcrafter` → **1/1** (`verify-sdk-package.log`; also `package matches the tree`) |
 
@@ -1117,9 +1191,11 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   item's own remainder (a custom recipe class) is therefore not expressed; vanilla crafting recipes,
   which is what this pattern resolves, are. A remainder with no room refuses the step rather than
   dropping the leftover on the floor.
-- **`direction` state, the colours, the managers, the monitor and their GUIs, the slot upgrade, the
-  FE buffer** — see §1's table, each with its reason. Both blocks' own panels are ported (0.2.6,
-  0.2.8).
+- ~~**`direction` state.**~~ **Closed in 0.2.11** (§2l): the six-value state, the jar's per-face
+  model rotations and the `FACE_CLICKED` placement rule are carried; a placed machine reads only
+  the face it was placed against. The colours, the managers, the monitor and their GUIs, the slot
+  upgrade and the FE buffer remain `blocked(no-parent-addon-surface)` or `not ported` — see §1's
+  table, each with its reason. Both blocks' own panels are ported (0.2.6, 0.2.8).
 - **The requester's reach is 4 blocks, not the network's.** Upstream's requester asks the network's
   autocrafting component from anywhere on the network; this one asks the **nearest** Step Crafter
   inside a 9×9×9 cube whose `Target` is its filtered item (`LINK_RADIUS = 4`, saved and re-validated
@@ -1260,7 +1336,7 @@ a deviation, not as an upstream defect.
 | `src/lib.rs` | the one `impl Hooks` and the two `Part`s the game ticks |
 | `tools/e2e.sh`, `tools/craft_check.py` | the in-game leg of §4 |
 | `LICENSE` | upstream's MIT text (`starforcraft/Step-Crafter`) |
-| `assets/`, `data/` | the carried content: two blocks (states `active`), their models/textures, loot, recipes, tag, lang, creative tab |
+| `assets/`, `data/` | the carried content: two blocks (`step_crafter` states `active` + six-value `direction`, `step_requester` state `active`), their models/textures, loot, recipes, tag, lang, creative tab |
 
 Textures are upstream's own (MIT) — `step_crafter/{top,side_active,side_inactive}.png` and
 `step_requester/{active,inactive}.png`, byte-copied from the jar; the crafter's two models are
@@ -1286,6 +1362,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the slots' room for the result (per-slot limits, post-consumption) | **tested** — `a_result_that_fits_no_slot_…`, `a_slot_holding_the_result_offers_only_its_own_free_room`, `consuming_the_last_item_of_a_slot_frees_that_slot_for_the_result`, `an_empty_slot_offers_each_inserted_item_its_own_room`; in game the 1,724-item machine (`items=1724` of 1,728) refuses |
 | the room for a **plain** insert beside a stack with components | **tested** — `a_named_stack_of_the_result_is_no_room_for_a_plain_step` (room 0, `NetworkFull`), `a_plain_result_is_a_new_stack_beside_a_named_one` (the named stack stays 60, the result is its own plain stack); in game the 60-named-torch machine refuses with `phase=network-full crafted=0` and the stock unchanged, while the plain-stack twin merges its four torches (`stock=coal:1599,stick:63,torch:64`); `SELFTEST=components-room` inverts the fixed behaviour and the 0.2.3 package's `result=crafted` is `e2e-red-components-0.2.3.log` |
 | the `active` states (both) | **tested** in game — `execute if block …[active=true]` → `Test passed` while filling, `[active=false]` once idle, on the machine and on the requester |
+| **the `direction` state (the clicked face, 0.2.11)** | **tested** — unit `a_clicked_face_becomes_the_blocks_direction` (all six faces) and `an_unknown_face_is_not_a_direction`; in game a machine placed on a support's north face passes `execute if block …[direction=north]` (`Test passed`), one placed on its south face passes `[direction=south]` and fails `[direction=north]`, while vanilla stone named with `[direction=north]` passes neither; `SELFTEST=direction` asserts the old no-state reply and ends non-zero |
 | loot, stock spill, `mineable/pickaxe` | **tested** in game — survival breaks with a pickaxe drop `stepcrafter:step_crafter:1` + `minecraft:torch:8` and `stepcrafter:step_requester:1`; a bare hand drops no block |
 | the requester's rule: ask below `min`, batch to `max`, never twice at once, 20-tick backoff after a refusal | **tested** — `a_requester_asks_below_its_minimum` / `a_requester_keeps_asking_above_the_minimum_until_the_maximum` / `a_requester_finishes_at_the_maximum` / `a_batch_caps_each_request` / `a_request_is_not_repeated_while_one_is_outstanding` / `a_failed_task_backs_off_before_asking_again` / `a_zero_batch_filter_is_disabled` / `a_crafter_that_refused_is_the_requesters_failed_task`; in game the 4..8 run asked twice (`requests=2`) and stopped at `stored=8`, and the 4..128 run read `phase=running` at `stored=44` |
 | **the interop: the requester asks a nearby Step Crafter** | **tested** in game — the pair reaches `stored=8` / `crafted=8` with 2 coal and 2 sticks consumed, and the *same world with the requester removed* leaves an identically configured machine at `stored=0 crafted=0` |

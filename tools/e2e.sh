@@ -78,6 +78,10 @@
 #    cell 44 of the 9 x 5 panel makes the 45th (`targets=45`, a 45th `entries=` field at index 44),
 #    while a machine planted identically but never opened stays at 44 — the press is the only
 #    difference; `SELFTEST=grid45` asserts today's nine-cell panel (no 45th slot) and ends non-zero;
+#  - the direction state (0.2.11): a machine placed against a support's north face reads
+#    `direction=north` from a real `execute if block …[direction=north]` predicate, one placed
+#    against the south face reads `direction=south` (and fails the north predicate), while vanilla
+#    stone has no such state — upstream's `DefaultDirectionType.FACE_CLICKED`, the clicked face;
 #  - two requesters share one crafter: the ask is now a list in the crafter's compound, so the
 #    second is queued behind the first instead of being lost, each reads its own share of the stock
 #    (the first `stored=4 served=4`, the second `stored=0 queued=1`), and a restock serves the second
@@ -102,6 +106,8 @@
 # machine, `targets=1`, even after both cells were pressed).
 # SELFTEST=grid45 flips the full-grid assertion (today's defect: the panel draws only nine cells, so
 # cell 44 cannot be pressed and the 45th saved slot never appears).
+# SELFTEST=direction flips the placement assertion (today's defect: the block has no `direction`
+# state, so the `execute if block …[direction=north]` predicate cannot pass).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -165,19 +171,32 @@ trap cleanup EXIT
 launch() { # launch [WORLD] [GAME]
     local world=${1:-$WORLD}
     local game=${2:-$GAME}
-    rm -f "$SOCK"
+    local attempt
     cd "$SCRATCH"
-    "$CTL" --socket "$SOCK" --timeout 180 launch --game "$game" --world "$world" --seed 20261105 \
-        --creative --offscreen --wait --resources "$RES" >/dev/null
-    ctl wait-ready 120
-    ctl wait 40
+    # Three game processes sharing a loaded box can delay a launch past `--wait`; retry the
+    # launch (never the assertion) and surface the launcher's own error on each try.
+    for attempt in 1 2 3; do
+        rm -f "$SOCK"
+        "$CTL" --socket "$SOCK" --timeout 180 launch --game "$game" --world "$world" --seed 20261105 \
+            --creative --offscreen --wait --resources "$RES" || \
+            echo "  launch attempt $attempt returned non-zero for $world" >&2
+        if ctl wait-ready 120 >/dev/null 2>&1; then
+            ctl wait 40 >/dev/null
+            return 0
+        fi
+        echo "  launch attempt $attempt did not become ready; retrying" >&2
+        ctl quit >/dev/null 2>&1 || true
+        sleep 3
+    done
+    echo "  launch failed for $world after 3 attempts" >&2
+    return 1
 }
 
 # A stone floor and a clear volume in The End, so the arena is deterministic.
 arena() {
     ctl command "execute in minecraft:the_end run tp @s 200.5 64 3.5"
     local loaded=false
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 240); do
         ctl wait 5
         if [ "$(ctl block 200 63 0 | jq -r '.loaded // false')" = true ]; then
             loaded=true
@@ -1818,6 +1837,102 @@ GRID45_OTHER_ENTRIES=$(sed -n 's/.* entries=\([^ ]*\).*/\1/p' <<<"$GRID45_OTHER"
 [ "$(awk -F';' '{print NF}' <<<"$GRID45_OTHER_ENTRIES")" = 44 ] \
     || fail "the unopened machine does not have exactly 44 entries: $GRID45_OTHER_ENTRIES"
 
+echo "== the direction state: a placed machine takes the face it was placed against =="
+# Upstream's `StepCrafterBlock.getDirectionType()` is `DefaultDirectionType.FACE_CLICKED`: the
+# placed state's `direction` is the face the player clicked (down/up/north/south/west/east), not
+# the placer's yaw and not its opposite. The support floats at y=66 so a horizontal face, not the
+# floor, is what a placement click lands on. A state predicate is parsed from chat, never from the
+# absence of an error, and the vanilla stone and the north/south pair are the differentials.
+state_pred() { # X Y Z <block[property=value]> -> "Test passed" | "Test failed" | ""
+    ctl command "execute if block $1 $2 $3 $4" >/dev/null
+    ctl wait 6 >/dev/null
+    local out=''
+    # A shared box can briefly answer an empty `ctl messages`; retry the read, never weaken the
+    # assertion (an empty read is not a pass and never becomes one).
+    for _ in 1 2 3; do
+        out=$(ctl messages 8 2>/dev/null | jq -r '.chat[]' 2>/dev/null | grep -m1 -E 'Test (passed|failed)' || true)
+        [ -n "$out" ] && break
+        ctl wait 2 >/dev/null
+    done
+    printf '%s' "$out"
+}
+DIR_SUPPORT=200
+# Place one machine against a face of the support and verify it bound. A shared box can leave a
+# stray item entity at the click point or delay the given stack into the hand, so clear and
+# re-give with a bounded retry; only the *placement* is retried, never the state assertion.
+place_facing() { # <face> <tx> <ty> <tz> <px> <py> <pz>
+    local face=$1 tx=$2 ty=$3 tz=$4 px=$5 py=$6 pz=$7
+    local attempt reply=''
+    for attempt in 1 2 3; do
+        ctl command "execute in minecraft:the_end run kill @e[type=item,x=$tx,y=$ty,z=$tz,dx=2,dy=2,dz=2]" >/dev/null 2>&1 || true
+        ctl give "$BLOCK" 2 >/dev/null 2>&1 || true
+        ctl wait 6 >/dev/null
+        ctl select "$BLOCK" >/dev/null 2>&1 || true
+        ctl wait 6 >/dev/null
+        ctl tp "$px" "$py" "$pz" >/dev/null
+        ctl look-at-block "$DIR_SUPPORT" 66 0 "$face" >/dev/null 2>&1 || true
+        ctl wait 8 >/dev/null
+        reply=$(ctl place "$tx" "$ty" "$tz" 2>&1) || true
+        ctl wait 6 >/dev/null
+        [ "$(ctl block "$tx" "$ty" "$tz" | jq -r '.block // "unknown"')" = "$BLOCK" ] && break
+    done
+    printf '%s' "$reply"
+}
+ctl command "execute in minecraft:the_end run setblock $DIR_SUPPORT 66 0 minecraft:stone" >/dev/null
+for z in -1 1; do
+    ctl command "execute in minecraft:the_end run setblock $DIR_SUPPORT 66 $z minecraft:air" >/dev/null
+done
+ctl command "execute in minecraft:the_end run setblock 202 66 0 minecraft:stone" >/dev/null
+ctl wait 6
+ctl command "clear @s" >/dev/null
+ctl wait 4
+# North: approach from the north and aim at the support's north face; the machine goes north of it.
+PLACE_N=$(place_facing north "$DIR_SUPPORT" 66 -1 "$DIR_SUPPORT.5" 64 -3.5)
+ctl wait 6
+echo "  place on the north face: $PLACE_N"
+[ "$(ctl block "$DIR_SUPPORT" 66 -1 | jq -r '.block // "unknown"')" = "$BLOCK" ] \
+    || fail "the north placement did not bind: $(ctl block "$DIR_SUPPORT" 66 -1)"
+NORTH=$(state_pred "$DIR_SUPPORT" 66 -1 "$BLOCK[direction=north]")
+echo "  north placement, [direction=north]: $NORTH"
+if [ "$SELFTEST" = direction ]; then
+    # Today's defect (notes.md §1): no `direction` state, so the predicate cannot pass. This
+    # package's north placement passes it, so the inverted run must end here, non-zero — at the
+    # headline assertion itself, before the (load-sensitive) second placement.
+    case "$NORTH" in
+        ""|*"Test failed"*) ;;
+        *) fail "SELFTEST=direction: the machine has a direction state and the run must end non-zero: $NORTH" ;;
+    esac
+    fail "SELFTEST=direction: today's defect is not on this package"
+fi
+# South: the same support from the other side; the machine goes south of it.
+PLACE_S=$(place_facing south "$DIR_SUPPORT" 66 1 "$DIR_SUPPORT.5" 64 3.5)
+ctl wait 6
+echo "  place on the south face: $PLACE_S"
+[ "$(ctl block "$DIR_SUPPORT" 66 1 | jq -r '.block // "unknown"')" = "$BLOCK" ] \
+    || fail "the south placement did not bind: $(ctl block "$DIR_SUPPORT" 66 1)"
+SOUTH=$(state_pred "$DIR_SUPPORT" 66 1 "$BLOCK[direction=south]")
+SOUTH_AS_NORTH=$(state_pred "$DIR_SUPPORT" 66 1 "$BLOCK[direction=north]")
+echo "  south placement, [direction=south]: $SOUTH"
+echo "  south placement, [direction=north]: $SOUTH_AS_NORTH"
+# Differential: vanilla stone has no `direction` state, so the same predicate cannot pass.
+STONE_NORTH=$(state_pred 202 66 0 "minecraft:stone[direction=north]")
+echo "  vanilla stone, [direction=north]: $STONE_NORTH"
+case "$NORTH" in
+    *"Test passed"*) ;;
+    *) fail "the north placement did not read direction=north: $NORTH" ;;
+esac
+case "$SOUTH" in
+    *"Test passed"*) ;;
+    *) fail "the south placement did not read direction=south: $SOUTH" ;;
+esac
+case "$SOUTH_AS_NORTH" in
+    *"Test passed"*) fail "the south placement also read direction=north: $SOUTH_AS_NORTH" ;;
+esac
+case "$STONE_NORTH" in
+    *"Test passed"*) fail "vanilla stone answered a direction predicate: $STONE_NORTH" ;;
+esac
+echo "  both placements read only the face they were placed against; vanilla stone has no direction"
+
 echo "== queued asks: one crafter, two requesters, each served its own share =="
 # The 0.2.6 gap (notes.md §6): the ask was one `Int` in the crafter's compound, so a second
 # requester asking the same crafter was never queued - its ask was lost while the first's was
@@ -1936,4 +2051,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x238 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the machine's two target cells made two saved slots that each filled their own band out of the shared stock (torch 8..16, stick 16..32, four coal and sixteen planks consumed) with per-entry targets=2 entries=..., while the same spot with only the first cell pressed kept one slot, the full 9x5 panel pressed cell 44 to make targets=45 with a 45th torch entry at index 44 while the identically planted machine nobody opened kept 44 slots, and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x238 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the machine's two target cells made two saved slots that each filled their own band out of the shared stock (torch 8..16, stick 16..32, four coal and sixteen planks consumed) with per-entry targets=2 entries=..., while the same spot with only the first cell pressed kept one slot, the full 9x5 panel pressed cell 44 to make targets=45 with a 45th torch entry at index 44 while the identically planted machine nobody opened kept 44 slots, a machine placed against a support's north face passed [direction=north] and one placed against the south face passed [direction=south] while failing [direction=north] and vanilla stone had no such state, and the command needs an operator"

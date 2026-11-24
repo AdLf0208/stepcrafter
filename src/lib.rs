@@ -31,10 +31,11 @@ pub mod runtime;
 pub mod screen;
 
 use mod_api::{
-    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, ClientHost,
-    Flow, Hooks, HostSide, MenuButtonEvent, MenuExtraDataEvent, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ScreenClickEvent,
-    ScreenDrawEvent, ScreenEvent, ServerHost,
+    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, BlockState,
+    ClientHost, Flow, Hooks, HostSide, LevelHost, MenuButtonEvent, MenuExtraDataEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, ScreenClickEvent, ScreenDrawEvent, ScreenEvent, ServerHost,
+    StateForPlacementEvent,
 };
 
 /// The mod keeps no state of its own: a machine's pattern, band, phase and stock all live in its
@@ -98,6 +99,24 @@ pub struct StepCrafter;
 
 #[mod_api::horizon_part]
 impl BlockPart for StepCrafter {}
+
+/// The block-scoped Part that sets the `direction` state on placement. A separate type from the
+/// block-entity Part: the same Part type cannot be attached to the block twice, and the block
+/// entity already attaches `StepCrafter`.
+pub struct StepCrafterPlacement;
+
+#[mod_api::horizon_part]
+impl BlockPart for StepCrafterPlacement {
+    /// The machine takes the clicked face as its `direction` state when placed, as upstream's
+    /// `DefaultDirectionType.FACE_CLICKED` does (the six faces in the jar's blockstate).
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        machine::state_for_placement(level, event)
+    }
+}
 
 #[mod_api::horizon_part]
 impl BlockEntityPart for StepCrafter {

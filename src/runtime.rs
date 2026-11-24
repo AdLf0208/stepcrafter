@@ -20,6 +20,16 @@ use std::collections::BTreeMap;
 /// Steps one tick takes: upstream's `speed + 1` with no speed upgrade installed.
 pub const STEPS_PER_TICK: u32 = 1;
 
+/// The six values of the jar's `direction` block-state property, in the blockstate file's order.
+/// Upstream's `StepCrafterBlock` uses RS's `DefaultDirectionType.FACE_CLICKED`, so a machine takes
+/// the face it was placed against — not the placer's yaw and not the opposite of either.
+pub const FACES: [&str; 6] = ["down", "up", "north", "south", "west", "east"];
+
+/// The `direction` state value for a clicked face (one of [`FACES`]), or `None` for anything else.
+pub fn direction_for_face(face: &str) -> Option<&'static str> {
+    FACES.iter().copied().find(|value| *value == face)
+}
+
 /// The maintenance band of one configured pattern: start below `min`, stop at `max`.
 ///
 /// Upstream's `ResourceMinMaxAmount` validates the same way: neither amount may be negative and a
@@ -3868,5 +3878,21 @@ mod tests {
             editor.targets().entry(1).and_then(TargetEntry::band),
             Some(band(16, 32))
         );
+    }
+
+    /// The placement rule is upstream's `FACE_CLICKED`: the clicked face *is* the state value.
+    #[test]
+    fn a_clicked_face_becomes_the_blocks_direction() {
+        for face in FACES {
+            assert_eq!(direction_for_face(face), Some(face), "face {face}");
+        }
+    }
+
+    /// A face the blockstate does not name is not a `direction` value.
+    #[test]
+    fn an_unknown_face_is_not_a_direction() {
+        assert_eq!(direction_for_face("northeast"), None);
+        assert_eq!(direction_for_face(""), None);
+        assert_eq!(direction_for_face("North"), None);
     }
 }

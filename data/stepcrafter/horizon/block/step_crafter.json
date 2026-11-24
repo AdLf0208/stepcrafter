@@ -1,9 +1,13 @@
 {
   "template": "minecraft:stone",
   "state_properties": {
-    "active": { "type": "boolean" }
+    "active": { "type": "boolean" },
+    "direction": {
+      "type": "enum",
+      "values": ["down", "up", "north", "south", "west", "east"]
+    }
   },
-  "default_state": { "active": "false" },
+  "default_state": { "active": "false", "direction": "north" },
   "properties": {
     "hardness": 1.5,
     "explosion_resistance": 6.0,

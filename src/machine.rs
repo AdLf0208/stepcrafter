@@ -14,9 +14,10 @@
 //! configuration is set with `/stepcrafter`.
 
 use mod_api::{
-    BlockClick, BlockEntityTickEvent, Compound, Flow, Hand, Host, HostSide, HostTransaction,
-    Identifier, InteractionResult, ItemKey, ItemStack, LevelRef, MenuButtonEvent, ModContainer,
-    Registrar, RightClickBlockEvent, ServerHost, Tag,
+    BlockClick, BlockEntityTickEvent, BlockState, Compound, Direction, Flow, Hand, Host, HostSide,
+    HostTransaction, Identifier, InteractionResult, ItemKey, ItemStack, LevelHost, LevelRef,
+    MenuButtonEvent, ModContainer, Registrar, RightClickBlockEvent, ServerHost,
+    StateForPlacementEvent, Tag,
 };
 
 use crate::nbt::{amount, drop_key, int, int_of, list, put, string};
@@ -68,6 +69,39 @@ pub fn declare(r: &mut dyn Registrar) {
     // A refusal here is the game's to report at load; the Part is then unattached and the block
     // keeps no state, which the load log states.
     let _ = r.block_entity_part(&kind, crate::StepCrafter);
+    // The placement-facing Part answers `state_for_placement` for this block only: the machine
+    // takes the face it was placed against (upstream's `FACE_CLICKED`), not the placer's yaw.
+    r.block_part(block, crate::StepCrafterPlacement);
+}
+
+/// The face name of the pin's `Direction`, in the jar's blockstate spelling.
+fn face_name(face: Direction) -> &'static str {
+    match face {
+        Direction::Down => "down",
+        Direction::Up => "up",
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::West => "west",
+        Direction::East => "east",
+    }
+}
+
+/// The `state_for_placement` rule: a machine placed against a face takes that face as its
+/// `direction`. Upstream's `StepCrafterBlock.getDirectionType()` is
+/// `DefaultDirectionType.FACE_CLICKED`, so the clicked face — not the placer's yaw — is the value.
+/// Answer only for our block: every placement goes through this hook, and a state of another
+/// block is ignored by the engine, but claiming it here would stop the next mod and vanilla.
+pub fn state_for_placement(
+    level: &dyn LevelHost,
+    event: &mut StateForPlacementEvent<'_>,
+) -> Option<Option<BlockState>> {
+    if level.state_block(event.state) != Some(BLOCK) {
+        return None;
+    }
+    let value = runtime::direction_for_face(face_name(event.context.face))?;
+    level
+        .state_with_property(event.state, "direction", value)
+        .map(Some)
 }
 
 /// Every face reaches every slot and the machine's own menu shows them: the machine's stock is its
