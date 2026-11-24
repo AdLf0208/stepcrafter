@@ -65,7 +65,7 @@
 #    guard refuses `min +` at 0..0), a carried stick repoints the cell while keeping its band, a
 #    command-added entry appears as a cell the remove button drops, and a requester nobody opened
 #    carries no entry — the screen and `/stepcrafter requester` are one saved container;
-#  - the machine's own panel (0.2.8): a right click opens the package's own 176 x 208 menu type with
+#  - the machine's own panel (0.2.8): a right click opens the package's own 176 x 238 menu type with
 #    the 27 stock slots still there at 300..326, a carried torch clicked onto the drawn target cell
 #    makes `/stepcrafter info` read `target=minecraft:torch cells=2 result=minecraft:torch:4`, the
 #    drawn `max +` x16 and `min +` x8 set the band to `min=8 max=16`, a `min +` that would invert
@@ -74,6 +74,10 @@
 #    each with its own band, and both fill out of the shared stock (`targets=2`, torch 8..16 and
 #    stick 16..32, four coal and sixteen planks consumed), while the same spot with only the first
 #    cell pressed reads `targets=1` with one entry — the second cell is the only difference;
+#  - the full 45-cell pattern grid (0.2.10): with 44 slots already saved, a carried torch pressed on
+#    cell 44 of the 9 x 5 panel makes the 45th (`targets=45`, a 45th `entries=` field at index 44),
+#    while a machine planted identically but never opened stays at 44 — the press is the only
+#    difference; `SELFTEST=grid45` asserts today's nine-cell panel (no 45th slot) and ends non-zero;
 #  - two requesters share one crafter: the ask is now a list in the crafter's compound, so the
 #    second is queued behind the first instead of being lost, each reads its own share of the stock
 #    (the first `stored=4 served=4`, the second `stored=0 queued=1`), and a restock serves the second
@@ -96,6 +100,8 @@
 # cell, so the carried torch clicked on it changes nothing and the target stays `none`);
 # SELFTEST=patterns flips the several-patterns assertion (today's defect: one target for the whole
 # machine, `targets=1`, even after both cells were pressed).
+# SELFTEST=grid45 flips the full-grid assertion (today's defect: the panel draws only nine cells, so
+# cell 44 cannot be pressed and the 45th saved slot never appears).
 # CONTROL_GAME is the same Nightly built **without** this package: the block and item ids must then
 # be unknown, so the scenario is not vacuous.
 set -uo pipefail
@@ -1324,8 +1330,8 @@ MACHINE_SCREEN=$(ctl screen)
 [ "$(jq -r '.screen' <<<"$MACHINE_SCREEN")" = container ] \
     || fail "the machine's menu did not open: $(jq -r '.screen' <<<"$MACHINE_SCREEN")"
 MACHINE_SLOTS=$(jq '[.slots[] | select(.slot >= 300)] | length' <<<"$MACHINE_SCREEN")
-PANEL_H=208
-panel_origin 126
+PANEL_H=238
+panel_origin 156
 MACHINE_OY=$OY
 echo "  the machine's stock menu: $(jq -r '.screen' <<<"$MACHINE_SCREEN"), $MACHINE_SLOTS container slots, top $MACHINE_OY"
 [ "$MACHINE_SLOTS" = 27 ] || fail "the machine's menu shows $MACHINE_SLOTS slots, not its 27"
@@ -1340,9 +1346,8 @@ open_requester 223 64 0
 SCREEN_FIRST=$(info 223 64 0)
 if [ "$OPENED" = container ]; then
     echo "  the screen opened: $(ctl screen | jq -r '.screen'), slots $(ctl screen | jq -r '(.slots | length)')"
-    # Both panels are centred in the same GUI, so their tops differ by half their heights:
-    # (238 - 208) / 2 = 15. That is the requester's declared height against the machine's 208.
-    [ "$(( MACHINE_OY - OY ))" = 15 ] || fail "the requester's panel top is $OY against the machine's $MACHINE_OY: not the 238-high panel (15 above a 208-high one)"
+    # Both panels are 176 x 238 now, so they centre at the same top in the same GUI.
+    [ "$(( MACHINE_OY - OY ))" = 0 ] || fail "the requester's panel top is $OY against the machine's $MACHINE_OY: not the same centred 238-high panel"
     # A cell's entry is made from the carried item, as upstream's ghost filter slot is: pick the
     # torch up onto the cursor, click the first cell, put it back.
     TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
@@ -1486,15 +1491,18 @@ open_machine() { # X Y Z -> sets OPENED and, when it opened, OX/OY
     ctl interact "$1" "$2" "$3" south >/dev/null || fail "the machine refused the right click"
     ctl wait 6
     OPENED=$(ctl screen | jq -r '.screen')
-    if [ "$OPENED" = container ]; then PANEL_H=208; panel_origin 126; fi
+    if [ "$OPENED" = container ]; then PANEL_H=238; panel_origin 156; fi
 }
 
-# The cell and the four buttons, at the pixels `src/screen.rs` lays them out at.
-press_target_cell() { press 17 85; }
-press_min_down() { press 36 104; }
-press_min_up() { press 72 104; }
-press_max_down() { press 116 104; }
-press_max_up() { press 152 104; }
+# The pattern grid's cells and the four buttons, at the pixels `src/screen.rs` lays them out at:
+# 15-pixel cells at (8, 51), nine columns, five rows; the band's row at y=127.
+press_target_cell() { press 15 58; }
+press_target_cell_1() { press 30 58; }
+press_target_cell_44() { press 135 118; }
+press_min_down() { press 36 133; }
+press_min_up() { press 72 133; }
+press_max_down() { press 116 133; }
+press_max_up() { press 152 133; }
 
 ctl command "clear" >/dev/null
 ctl wait 4
@@ -1593,7 +1601,6 @@ echo "== the machine's several patterns: two targets, each with its own band =="
 # 0.2.9: the machine carries a saved list of pattern slots (upstream's 45-slot container), each with
 # its own target, band, status and count. Two cells pressed on its panel make two entries; the tick
 # walks them in slot order and each fills its own band out of the shared inventory.
-press_target_cell_1() { press 35 85; } # the second cell's centre: x = 8 + 18 + 9, y = 76 + 9
 # Clear every crafter and requester in reach: a requester left by an earlier phase would otherwise
 # link this fresh machine and ask it for sticks, skewing the per-slot counts this leg asserts.
 for x in 220 221 222 223 224 225 226; do
@@ -1699,6 +1706,117 @@ case "$ONE_TARGET" in
 esac
 ONE_ENTRIES=$(sed -n 's/.* entries=\([^ ]*\).*/\1/p' <<<"$ONE_TARGET")
 [ -z "${ONE_ENTRIES//[^;]/}" ] || fail "the differential machine has more than one entry: $ONE_ENTRIES"
+
+echo "== the full 45-cell pattern grid: cell 44 makes the 45th saved slot =="
+# 0.2.9 carried a 45-slot saved container but drew only its first nine cells; the command reached
+# the rest. The panel now draws all 45, so the last cell is a click away. Both machines here are
+# planted with the same 44 saved slots; only the one that is opened and pressed gains a 45th.
+GRID45_ITEMS=(
+    minecraft:stone minecraft:granite minecraft:diorite minecraft:andesite minecraft:deepslate
+    minecraft:cobblestone minecraft:mossy_cobblestone minecraft:stone_bricks
+    minecraft:mossy_stone_bricks minecraft:cracked_stone_bricks minecraft:chiseled_stone_bricks
+    minecraft:gravel minecraft:dirt minecraft:coarse_dirt minecraft:grass_block minecraft:podzol
+    minecraft:mycelium minecraft:sand minecraft:red_sand minecraft:clay minecraft:terracotta
+    minecraft:white_terracotta minecraft:orange_terracotta minecraft:magenta_terracotta
+    minecraft:light_blue_terracotta minecraft:yellow_terracotta minecraft:lime_terracotta
+    minecraft:pink_terracotta minecraft:gray_terracotta minecraft:light_gray_terracotta
+    minecraft:cyan_terracotta minecraft:purple_terracotta minecraft:blue_terracotta
+    minecraft:brown_terracotta minecraft:green_terracotta minecraft:red_terracotta
+    minecraft:black_terracotta minecraft:oak_planks minecraft:spruce_planks
+    minecraft:birch_planks minecraft:jungle_planks minecraft:acacia_planks
+    minecraft:dark_oak_planks minecraft:crimson_planks
+)
+[ "${#GRID45_ITEMS[@]}" = 44 ] || fail "the grid45 setup must plant 44 slots, not ${#GRID45_ITEMS[@]}"
+grid45_list=''
+for id in "${GRID45_ITEMS[@]}"; do
+    # One saved slot: item|min|max|batch|phase|crafted|result_count|cells|remainders.
+    entry="$id|-|-|1|idle|0|1|$id|"
+    [ -z "$grid45_list" ] || grid45_list="$grid45_list,"
+    grid45_list="$grid45_list\"$entry\""
+done
+for x in 224 225 226; do
+    for z in 0 4; do
+        ctl command "execute in minecraft:the_end run setblock $x 64 $z minecraft:air" >/dev/null
+    done
+done
+ctl wait 6
+ctl command "execute in minecraft:the_end run kill @e[type=item,x=224,y=63,z=-1,dx=4,dy=4,dz=7]" >/dev/null 2>&1 || true
+ctl wait 4
+ctl command "execute in minecraft:the_end run setblock 225 64 0 $BLOCK" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 225 64 4 $BLOCK" >/dev/null
+ctl wait 8
+for z in 0 4; do
+    ctl command "data merge block 225 64 $z {Targets:[$grid45_list]}" >/dev/null
+done
+ctl wait 6
+PLANTED45=$(info 225 64 0)
+echo "  before the press: $PLANTED45"
+case "$PLANTED45" in
+    *"targets=44"*) ;;
+    *) fail "the grid45 machine was not planted with 44 slots: $PLANTED45" ;;
+esac
+
+ctl command "clear" >/dev/null
+ctl wait 4
+ctl give minecraft:torch 1 >/dev/null
+ctl wait 4
+open_machine 225 64 0
+GRID45_PANEL=$(ctl screen)
+[ "$(jq -r '.screen' <<<"$GRID45_PANEL")" = container ] || fail "the grid45 panel did not open"
+# The panel is the centred 238-high one, read from slot-0 in the game, not from the layout source.
+[ "$OY" = "$MACHINE_OY" ] || fail "the grid45 panel top is $OY, not the machine's $MACHINE_OY"
+TORCH_SLOT=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:torch")][0].slot // ""')
+[ -n "$TORCH_SLOT" ] || fail "the torch is not in the grid45 panel's inventory"
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+press_target_cell_44
+ctl click-slot "$TORCH_SLOT" >/dev/null
+ctl wait 3
+ctl close >/dev/null
+ctl wait 6
+GRID45=$(info 225 64 0) # `info` sends `ctl chat "/stepcrafter info 225 64 0"` and parses its reply
+echo "  after cell 44: $GRID45"
+# The parsed reply is the assertion: 45 slots and a 45th entries field at index 44.
+GRID45_ENTRIES=$(sed -n 's/.* entries=\([^ ]*\).*/\1/p' <<<"$GRID45")
+GRID45_COUNT=$(awk -F';' '{print NF}' <<<"$GRID45_ENTRIES")
+echo "  targets and entries: $(grep -o 'targets=[0-9]*' <<<"$GRID45"), $GRID45_COUNT entry/ies"
+[ "$GRID45_COUNT" = 45 ] || fail "the 45th cell made $GRID45_COUNT entries, not 45: $GRID45_ENTRIES"
+case "$(awk -F';' '{print $45}' <<<"$GRID45_ENTRIES")" in
+    "minecraft:torch|"*) ;;
+    *) fail "entry 44 is not the carried torch: $(awk -F';' '{print $45}' <<<"$GRID45_ENTRIES")" ;;
+esac
+
+if [ "$SELFTEST" = grid45 ]; then
+    # Today's defect, deliberately asserted: the panel draws nine cells, so cell 44's pixel is
+    # nothing and the saved container keeps its 44 slots. This package makes the 45th, so the
+    # inverted run has to end here, non-zero.
+    case "$GRID45_ENTRIES" in
+        "") ;;
+        *) [ "$(awk -F';' '{print NF}' <<<"$GRID45_ENTRIES")" = 44 ] ||
+            fail "SELFTEST=grid45: cell 44 made a 45th slot where today's nine-cell panel changes nothing, so the run must end non-zero: $GRID45" ;;
+    esac
+    fail "SELFTEST=grid45: today's defect is not on this package"
+fi
+case "$GRID45" in
+    *"targets=45"*) ;;
+    *) fail "the 45th cell did not make a 45th saved slot: $GRID45" ;;
+esac
+# Evidence only: reopen the panel so the screenshot shows the 45 cells with the new icon.
+open_machine 225 64 0
+ctl screenshot "$PORT/../_shared/evidence/stepcrafter-e2e/screen-grid45.png" >/dev/null 2>&1 || true
+ctl close >/dev/null
+ctl wait 4
+
+# The differential: planted with the same 44 slots, never opened, so it has no 45th entry.
+GRID45_OTHER=$(info 225 64 4)
+echo "  the machine nobody opened: $GRID45_OTHER"
+case "$GRID45_OTHER" in
+    *"targets=44"*) ;;
+    *) fail "a machine nobody opened gained a 45th slot: $GRID45_OTHER" ;;
+esac
+GRID45_OTHER_ENTRIES=$(sed -n 's/.* entries=\([^ ]*\).*/\1/p' <<<"$GRID45_OTHER")
+[ "$(awk -F';' '{print NF}' <<<"$GRID45_OTHER_ENTRIES")" = 44 ] \
+    || fail "the unopened machine does not have exactly 44 entries: $GRID45_OTHER_ENTRIES"
 
 echo "== queued asks: one crafter, two requesters, each served its own share =="
 # The 0.2.6 gap (notes.md §6): the ask was one `Int` in the crafter's compound, so a second
@@ -1818,4 +1936,4 @@ ctl wait 6 >/dev/null
 expect 202 64 0 "stepcrafter 202 64 0"
 echo "  as a non-operator: $REFUSAL"
 
-echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x208 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the machine's two target cells made two saved slots that each filled their own band out of the shared stock (torch 8..16, stick 16..32, four coal and sixteen planks consumed) with per-entry targets=2 entries=..., while the same spot with only the first cell pressed kept one slot, and the command needs an operator"
+echo "PASS: the block and item registered and an unported id was refused, both carried recipes craft and consume their five ingredients, a fresh machine reads unconfigured, target/configure resolve the torch's own recipe and refuse a bedrock target, an unknown id and an inverted band, the container stocked 8 coal and 8 sticks and the tick filled the target 0->16 in steps of 4 consuming 4 and 4, it stopped at the maximum, take moved the target to the inventory, a stick-less step reported not-enough-ingredients and the restock resumed to 32, a manual step crafted and then refused with no ingredients, the 64..128 band filled past the minimum to the maximum with active true then false, a requester beside a quiet machine asked it to 8 torches in batches of 4 (stored=8 crafted=8) while the same world without the requester left a second machine at 0, the refusal reported not-enough-ingredients and the restock resumed it, the requester's active state followed its run, a crafter whose slots left no room for the result (26x64 coal + 60 sticks) refused every ask as network-full with no ingredient consumed and nothing crafted while the requester read stored=0, a named stack of the target was no room for the step's plain result (network-full, crafted=0, stock unchanged) while the same step beside a plain stack merged its four torches into it, a requester with two filter entries read filters=2 and asked its torch crafter to 8 and its stick crafter to 16 while the same world with only one entry left the stick crafter at 0, take handed over the stored stacks with their custom names and damage intact (Alpha, Beta, damage 7), a cake step made the cake and left the three buckets its milk leaves, two requesters shared one crafter with the second queued behind the first and each served its own four after a restock, the requester's screen opened on a right click, its first cell took a carried torch, its drawn buttons set that entry to torch 4 8 4 (the band guard refused min + at 0..0), a carried stick repointed the cell keeping its band, a command-added entry appeared as a cell the remove button dropped, and a requester nobody opened carried no entry, the machine opened its own 176x238 panel on a right click with its 27 stock slots still there, a carried torch on its target cell read target=minecraft:torch cells=2 result=minecraft:torch:4, its drawn max + x16 and min + x8 read min=8 max=16 while a min + at 8..8 was refused, and a machine nobody opened read target=none min=- max=-, its refusals and its own loot held, a broken machine dropped its own item and spilled its stock (and a moved machine is re-targeted, as recorded), and the machine's two target cells made two saved slots that each filled their own band out of the shared stock (torch 8..16, stick 16..32, four coal and sixteen planks consumed) with per-entry targets=2 entries=..., while the same spot with only the first cell pressed kept one slot, the full 9x5 panel pressed cell 44 to make targets=45 with a 45th torch entry at index 44 while the identically planted machine nobody opened kept 44 slots, and the command needs an operator"

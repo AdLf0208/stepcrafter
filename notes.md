@@ -495,7 +495,49 @@ missing** — the list is carryable at this pin. The 8 upgrade slots remain
   `info` appends `targets=N entries=item|min|max|phase|crafted|stored;…` beside its legacy fields.
 - **`screen.rs`**: the 0.2.8 panel's single target cell becomes a row of 9 drawn cells at the same
   first position; a carried item on a cell makes or repoints that slot, an empty hand focuses it and
-  the four band buttons step the focused slot. The panel stays 176 × 208 and cell 0 keeps its pixels.
+  the four band buttons step the focused slot. The panel stays 176 × 208 and cell 0 keeps its pixels
+  (0.2.10 widens it to the full grid).
+
+## 2k. The slice (version 0.2.10): the full 45-cell pattern grid
+
+0.2.9's own gap line (§2j/§6) was *"The panel draws the first nine cells in a row (the command
+reaches the rest)"*. Upstream's `StepCrafterScreen` exposes all 45 pattern slots
+(`StepCrafterBlockEntity.PATTERNS = 45`, `jar-pattern-slots.txt`); this panel exposed 9. This is a
+**screen-layout change only** over the saved `Targets` container 0.2.9 just carried — no new block,
+item, renderer, hook or saved key. The 8 upgrade slots stay `blocked(no-parent-addon-surface)`.
+
+### The layout, computed before any code
+
+Fitting the 27 stock rows, a 9 × 5 pattern grid and the value row into the game's 240-pixel GUI needs
+**15-pixel cells** (8 rows of 18 plus the buttons exceed the 140 pixels above the engine's
+"Inventory" label). The panel becomes the requester's 176 × 238, so both centre alike:
+
+- stock: x=8, y=6, 9 columns × 3 rows, ending at y=51;
+- pattern grid: x=8, y=51, 9 columns × 5 rows, ending at x=143, y=126;
+- value row y=127 with 12-pixel buttons ending at 139, above the "Inventory" label at 140;
+- `inventory_y = 156`, height `156 + 82 = 238`.
+
+Cell 44 = row 4, column 8: bounds [128,143) × [111,126), centre (135.5, 118.5). Every drawn rect
+adds `event.origin`. The single "target" text label is dropped: the grid needs the row.
+
+### The defect fixed with it
+
+`MachinePress::of` decoded buttons `300..=340` only, so cells 41..44 (ids 341..344) were dropped on
+the server even though `MachinePress::Cell(u8)` and `Targets` (cap 45) can hold them. The decoder now
+ends at `LAST_TARGET_BUTTON = TARGET_BUTTON + MAX_TARGET_ENTRIES as i32 - 1 = 344`.
+
+### What changed
+
+- **`screen.rs`**: the machine panel draws all 45 cells (`MACHINE_TARGETS = 45`) and
+  `machine_button_at` hit-tests all of them; the 27 stock slots remain real menu slots, now at
+  15 pixels; the panel is 176 × 238 with `inventory_y = 156`, and a compile-time assertion holds
+  every row inside the declared height. A new unit test presses all 45 cell centres.
+- **`runtime.rs`**: the button decoder's range closes the gap to cell 44; the editor already added a
+  45th slot by resource and the saved list already held 45, so neither changed.
+- **`tools/e2e.sh`**: the machine panel's origin is read back from the game as the centred 238-high
+  one, the cell/button pixels follow the new grid, and a `grid45` leg plants 44 saved slots, presses
+  cell 44 with a carried torch, and asserts `targets=45` plus a 45th `entries=` field from the parsed
+  `/stepcrafter info` reply. `SELFTEST=grid45` asserts today's no-45th-slot reply and ends `EXIT:1`.
 
 ## 2d. The slice (version 0.2.3): crafting remainders
 
@@ -799,6 +841,39 @@ test result: FAILED. 82 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out
 The game half's red is `SELFTEST=patterns` (§4): it asserts today's one-target reply (`targets=1`)
 after both cells were pressed, so the run ends non-zero on the package that keeps two slots.
 
+Green at 0.2.10 (the full-grid slice): **94 tests** (`sdk-test.log`, `Compiling stepcrafter v0.2.10`).
+Its red transcript is `red-unit-grid45.log`: the panel still declared 176 × 208 with a nine-cell row
+and the button decoder stopped at 340, so three tests failed for exactly that defect:
+
+```
+---- runtime::tests::the_forty_fifth_cell_button_reaches_the_editor stdout ----
+assertion `left == right` failed: the 45th cell's button must reach the server
+  left: None
+ right: Some(Cell(44))
+
+---- screen::tests::the_forty_fifth_cell_is_on_the_machine_panel stdout ----
+assertion `left == right` failed: cell 44's centre must press the 45th pattern slot
+  left: None
+ right: Some(344)
+
+---- screen::tests::the_machine_panel_is_the_requesters_height stdout ----
+assertion `left == right` failed
+  left: (176.0, 208.0)
+ right: (176.0, 238.0)
+
+test result: FAILED. 90 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The game half's red is `SELFTEST=grid45` (§4): it asserts today's nine-cell reply — no 45th slot
+after cell 44's pixel is pressed — and ends `EXIT:1` on the package that makes the 45th. The
+differential machine is planted with the same 44 slots but never opened, so it stays at 44.
+
+**Harness flakes (recorded, not port verdicts):** with three game legs sharing the box, two legs
+(`components-room`, `queue`) got an empty `ctl messages` reply (`jq: Cannot iterate over null`) and
+failed at an earlier assertion. Both were re-run alone and ended at their intended `SELFTEST`
+assertion with `EXIT:1`; the final logs are those re-runs. This is the same class as `powah`'s
+memory-contention flake in HANDOVER.
+
 The machine's tests cover They cover the rule (`decide_holds_at_the_minimum_while_idle`,
 `decide_crafts_below_the_minimum`, `decide_keeps_crafting_above_the_minimum_until_the_maximum`,
 `decide_finishes_at_the_maximum`), the step (`a_step_consumes_every_cell_and_makes_the_result`,
@@ -829,8 +904,8 @@ entity, and was removed. Both are recorded under §6.
 
 ## 4. In-game evidence (what the transcript proves)
 
-`ports/_shared/evidence/stepcrafter-e2e/` — fifteen run logs plus the build log, all `--strict` green
-(`logs=15 ok=15 missing-exit=0 bad-exit=0`):
+`ports/_shared/evidence/stepcrafter-e2e/` — sixteen run logs plus the build log, all `--strict` green
+(`logs=16 ok=16 missing-exit=0 bad-exit=0`):
 
 | log | verdict | what it is |
 |---|---|---|
@@ -848,9 +923,11 @@ entity, and was removed. Both are recorded under §6.
 | `e2e-selftest-queue.log` | `FAIL` + `EXIT:1` | `SELFTEST=queue` inverts the **queued-ask** assertion: today's defect is one `Int`, so the second requester's ask is lost and it reads the first's torches; this package serves it its own four (`served=4`), so the run ends non-zero |
 | `e2e-selftest-crafterscreen.log` | `FAIL` + `EXIT:1` | `SELFTEST=crafterscreen` inverts the **machine-panel** assertion: today's defect is a panel with no target cell, so the carried torch clicked on it changes nothing (`target=none`); this package sets the target, so the run ends non-zero |
 | `e2e-selftest-patterns.log` | `FAIL` + `EXIT:1` | `SELFTEST=patterns` inverts the **several-patterns** assertion: today's defect is one target for the whole machine (`targets=1`) after both cells were pressed; this package keeps two slots, so the run ends non-zero |
-| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.8: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
+| `e2e-selftest-grid45.log` | `FAIL` + `EXIT:1` | `SELFTEST=grid45` inverts the **full-grid** assertion: today's nine-cell panel cannot press cell 44, so the saved container stays at 44 slots; this package makes the 45th, so the run ends non-zero |
+| `game-build.log` | `EXIT:0` | the launcher's `native-build` at 0.2.10: `Compiling stepcrafter (1 of 1)` — the bumped manifest forced a real recompile, not a cached package |
 | `screen-requester.png` | screenshot | the filter screen on a requester at `223 64 0`: the title, the 9 × 5 cells with the torch's icon, `min 4`, `max 8`, `batch 4` and the remove button |
 | `screen-crafter.png` | screenshot | the machine's panel on `225 64 0`: the 27 stock slots, the target cell with the torch's icon, `min 8`, `max 8` and the four value buttons |
+| `screen-grid45.png` | screenshot | the 176 × 238 machine panel with all 45 pattern cells; cell 44 (bottom right) carries the torch added by the press (evidence only — the parsed reply is the assertion) |
 
 The scenario, in order (each assertion is parsed from a reply, never "no error"):
 
@@ -986,16 +1063,24 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
     only the first cell pressed reads `targets=1`, exactly one `entries=` field and no stick slot;
     the second cell is the only difference. `SELFTEST=patterns` asserts today's `targets=1` reply and
     ends the run non-zero.
+27. **the full 45-cell pattern grid (0.2.10)**: two machines at `225 64 0` and `225 64 4` are planted
+    with the same 44 saved pattern slots (`targets=44`, 44 `entries=` fields). The panel's origin is
+    read back from the game as the centred **238**-high one. A carried torch pressed on **cell 44**
+    at its computed pixel (local `[135,118]`; grid bounds [128,143) × [111,126)) makes
+    `targets=45` with **45** `entries=` fields, the 45th at index 44 reading `minecraft:torch|-|-|idle|
+    0|0`. The **differential**: the identically planted machine nobody opened keeps `targets=44`
+    with exactly 44 entries — the press is the only difference. `SELFTEST=grid45` asserts the old
+    no-45th-slot reply and ends the run non-zero; the screenshot is evidence only.
 
 ## 5. Packaging
 
 | item | value |
 |---|---|
 | file | `ports/stepcrafter/stepcrafter.hmod` |
-| size | **96,434 B** |
-| sha256 | `08d5c4773800c0b68f9fb29f599691451bb770455ac2b4e6a59db5c0defba411` |
-| entries | 40 (`360,083 B` uncompressed), **no `Cargo.lock`** |
-| version | `0.2.9` (`horizon-mod.toml` + `Cargo.toml`) |
+| size | **97,388 B** |
+| sha256 | `9bb9770bb572b52118df5fd9c80f68096d34b555adb66976c29298e8096c0760` |
+| entries | 40 (`364,768 B` uncompressed), **no `Cargo.lock`** |
+| version | `0.2.10` (`horizon-mod.toml` + `Cargo.toml`) |
 | build | `cargo horizon-mod build`, twice, `rm -f Cargo.lock` before each → `cmp` identical (`sdk-build-twice.log`) |
 | pin | `0a875da  made for` / `0b14f8a  fits` (`sdk-fits-0a875da.log`, `sdk-fits-0b14f8a.log`, each printing the sha) |
 | notice | packed `LICENSE` and `LICENSE-NOTICE.md` are `cmp`-identical to the tree's: upstream's MIT text (Starforcraft, 2025) and the notice naming **Ultramega**, **Starforcraft** and `https://github.com/starforcraft/Step-Crafter`; the packed `README.md` is `cmp`-identical to the tree's |
@@ -1050,9 +1135,10 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   0.2.1–0.2.4 reads as one entry and is migrated to the container on the next write.
 - ~~**The machine's panel edits one band, as its command does.**~~ **Closed in 0.2.9** (§2j): the
   machine now carries up to 45 pattern slots, each with its own target, band, batch, status and
-  counter. The panel draws the first nine cells in a row (the command reaches the rest); a carried
-  item on a cell makes or repoints that slot's target, an empty hand focuses it, and the four buttons
-  step the focused slot's band. A target the carried item cannot express — no `minecraft:crafting`
+  counter. ~~The panel draws the first nine cells in a row (the command reaches the rest).~~ **Closed
+  in 0.2.10** (§2k): the panel draws all 45 in a 9 × 5 grid; a carried item on a cell makes or
+  repoints that slot's target, an empty hand focuses it, and the four buttons step the focused slot's
+  band. A target the carried item cannot express — no `minecraft:crafting`
   recipe — leaves the slot as it was, exactly as `/stepcrafter target` refuses it. The tick walks the
   slots in order and spends one step per tick on the first that needs it (upstream's step budget is
   shared across its slots too), so a slot whose stock stays below its band can hold up a later one;
@@ -1080,10 +1166,10 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
   (§2g, §2i) and `screen.rs` documents them. `machine.rs`/`lib.rs` name the command as the way the
   machine is configured and do not mention the panel. The behaviour is the record here; a later
   slice that rebuilds the glue should rewrite those summaries with it.
-- **A panel taller than the game's 240-pixel GUI is unreachable** (§2g trap 3): the requester's is
-  176 × 238 and the machine's 176 × 208, which fit (a compile-time assertion holds their rows inside
-  the declared height, and the leg reads the machine's panel back from the game). A future row must
-  come out of the layout, not be added below it.
+- **A panel taller than the game's 240-pixel GUI is unreachable** (§2g trap 3): both panels are now
+  176 × 238 — the requester's 18-pixel cells and the machine's 15-pixel ones (three stock rows plus
+  five pattern rows), each with a compile-time row-fit assertion and a game read-back of the panel's
+  top. A future row must come out of the layout, not be added below it.
 - **Both panels open from the mod's own click handler** (§2g trap 1), not from the engine: a click is
   consumed on both sides, so a held item is not used behind the panel. Before 0.2.6 the machine's menu
   did not open at all, though §2 claimed it did; since 0.2.8 the machine opens its **own** menu type
@@ -1140,7 +1226,7 @@ The scenario, in order (each assertion is parsed from a reply, never "no error")
 | one step per tick without speed upgrades | `for j < speed + 1` with `speed = 0` | `runtime::STEPS_PER_TICK = 1` |
 | the click | `getMenuProvider`/`ExtendedMenuProvider` opens the block's menu on use | the mod asks for its own menu on `right_click_block` → `PlayerRef::open_menu` (the engine does not open a mod container's menu at this pin, §2g); the machine opens `stepcrafter:step_crafter_config` (its panel, 0.2.8), the requester `stepcrafter:step_requester_filters` |
 | the requester's filter screen | `StepRequesterScreen`: 45 filter slots with a resource, a min/max editor and a batch each, plus the 8 upgrade slots | a 176 × 238 panel: 45 drawn cells (the entries' icons from the menu's open payload), the focused entry's `min`/`max`/`batch` from the data slots, `-`/`+` buttons per value and a `remove` button; a cell click with a carried item makes or repoints that entry (upstream's ghost slot). The 8 upgrade slots are not ported |
-| the machine's own panel | `StepCrafterScreen`: the machine's pattern resources with a min/max editor, in the block's menu | a 176 × 208 panel: the 27 stock slots as real menu slots, a drawn target cell (a carried item makes the target, resolved into its recipe's pattern as the command does) and `min`/`max` `-`/`+` buttons over the saved band; the numbers are the menu's data slots, the icon the open payload |
+| the machine's own panel | `StepCrafterScreen`: all 45 of the machine's pattern resources with a min/max editor, in the block's menu | a 176 × 238 panel: the 27 stock slots as real menu slots, a 9 × 5 grid of 45 drawn pattern cells (a carried item makes or repoints that slot's target, resolved into its recipe's pattern as the command does) and `min`/`max` `-`/`+` buttons over the focused slot's saved band; the numbers are the menu's data slots, the icons the open payload |
 | a screen press | a slot click or a side button in the mod's screen | `screen_click` (the client's hit test) → the menu's button id → `menu_button` on the server (`runtime::Editor::apply`), which writes the same saved container the command writes |
 | taking the resource out | `network.extract(resource, count)` | `/stepcrafter take` hands over the **stored stacks themselves**, split to the count asked for: names, enchantments and damage stay on them |
 | the requester's rule (start below min, ask to max, `min(needed, batch)` per task) | `StepRequesterNetworkNode.doWork`, five guards | `runtime::ask`, `requester::tick_entry` |
@@ -1168,7 +1254,7 @@ a deviation, not as an upstream defect.
 | `src/pattern.rs` | the target item's crafting recipe resolved into a `Pattern` (one host crossing, at configuration), including what each candidate leaves (`item_crafting_remainder`) |
 | `src/machine.rs` | the crafter's block entity: saved compound (the `Targets` list of 45 pattern slots with their bands/phases/patterns/counters, plus the ask `Queue` with its `Served` credits and `Failed` ask), the 27-slot inventory as a stock, `Shared` (every maintained item, the part a requester reads), the tick that walks the slots and prunes/serves/credits the head ask, the manual step, `apply_craft`, and `right_click` (the mod's own menu open for both blocks) |
 | `src/requester.rs` | the requester's block entity: its filter entries (the container's saved `Filters` list, with the 0.2.4 single-entry keys read as a fallback), each entry's link to a nearby crafter, its ask merged into that crafter's queue, the per-entry tick (`settle` → `ask`) and the readout's views (its own `stored`/`served`/`queued`), the selected cell, the menu's data slots and open payload, and `press` (the server half of a screen press) |
-| `src/screen.rs` | the two panels: the requester's 176 × 238 filter screen and the machine's 176 × 208 configuration panel (`machine_layout`/`machine_button_at`/`machine_draw`), with their hit tests and drawing |
+| `src/screen.rs` | the two panels: the requester's 176 × 238 filter screen and the machine's 176 × 238 configuration panel with its full 9 × 5 pattern grid (`machine_layout`/`machine_button_at`/`machine_draw`), with their hit tests and drawing |
 | `src/nbt.rs` | the saved-compound vocabulary both block entities share (`put`, `string`, `int`, `list`, …) |
 | `src/commands.rs` | `/stepcrafter info|target|configure|requester|step|take` |
 | `src/lib.rs` | the one `impl Hooks` and the two `Part`s the game ticks |
@@ -1212,6 +1298,7 @@ requester's two are upstream's own `cube_all` shape unchanged.
 | the machine's stock slots and its own panel | **tested** in game — a right click opens `container` with the **27** stock slots at 300..326 on the package's own menu type, the panel's top read back as the centred 208 (**tested** — `the_machines_stock_slots_are_its_containers_twenty_seven`, `the_machines_cell_and_buttons_are_the_presses_the_server_applies`, `the_machines_menu_declares_the_slots_the_screen_publishes`) |
 | **the machine's own configuration screen** (target cell, band buttons, inversion guard) | **tested** — `the_target_cell_takes_the_carried_item`, `the_target_cell_with_the_same_item_changes_nothing`, `the_value_buttons_step_the_band_and_refuse_an_inversion`, `a_machine_value_never_goes_below_zero_and_caps_at_the_screens_maximum`, `the_machines_data_slots_are_its_band`, `the_target_cells_payload_is_its_item_id`, `a_machine_press_round_trips_through_its_button_id`; in game a carried torch on the cell reads `target=minecraft:torch cells=2 result=minecraft:torch:4`, `max +` ×16 and `min +` ×8 read `min=8 max=16`, `max -` ×8 then a `min +` stays `min=8 max=8`, and the machine nobody opened reads `target=none min=- max=-`; `SELFTEST=crafterscreen` inverts it and ends non-zero |
 | **the machine's several patterns (45 slots with resource/min/max/batch/status)** | **tested** — `a_second_target_slot_keeps_its_own_band_beside_the_first`, `the_two_targets_round_trip_through_the_saved_list`, `a_46th_distinct_target_is_refused`, `repointing_one_cell_leaves_the_other_target_untouched`, `the_two_targets_round_trip_through_the_saved_compound`, `a_legacy_single_target_compound_still_reads_as_one_slot`, `the_shared_read_is_the_queue_and_the_phase`, `the_target_cells_payload_is_its_item_id`; in game two cells pressed on one panel make `targets=2` with both entries, each fills its own band out of the shared stock (torch `8..16`, stick `16..32`, four coal and sixteen planks consumed), and the same spot with only the first cell pressed reads `targets=1` with one entry; `SELFTEST=patterns` asserts today's one-target reply and ends non-zero. The 45 **upgrade** slots of upstream's container are a separate RS surface and stay `blocked(no-parent-addon-surface)` |
+| **the full 45-cell pattern grid** (0.2.10) | **tested** — `the_forty_fifth_cell_is_on_the_machine_panel`, `every_one_of_the_forty_five_cells_presses_its_own_slot`, `the_machine_panel_is_the_requesters_height`, `the_forty_fifth_cell_button_reaches_the_editor`, `the_forty_fifth_cell_makes_the_forty_fifth_slot`; in game the 176 × 238 panel's origin is read back, cell 44's pixel makes `targets=45` with 45 `entries=` fields and the torch at index 44, while an identically planted machine nobody opened stays at 44; `SELFTEST=grid45` inverts it and ends non-zero. The screenshot `screen-grid45.png` is evidence only |
 | the 8 upgrade slots | `blocked(no-parent-addon-surface)` — the RS `UpgradeContainer`, which the parent port does not ship |
 | the crafter/requester managers, the crafting monitor, the 48 colour variants | **not ported** — `blocked(no-parent-addon-surface)`: mixins into Refined Storage's grid screen |
 | the slot upgrade, the FE buffer, the GUI, `direction`, advancements, JEI/EMI | **not ported** — upgrades/energy/GUI are the RS harness; `direction` is cosmetic here |

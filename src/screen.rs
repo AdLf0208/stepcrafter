@@ -205,36 +205,48 @@ fn item_key(host: &dyn ClientHost, item: &str) -> Option<ItemKey> {
 /// The machine's panel: vanilla's 176 wide, tall enough for its three stock rows, its
 /// configuration row and the player's inventory.
 pub const MACHINE_WIDTH: f32 = 176.0;
-/// The player's inventory rows, under the configuration row.
-pub const MACHINE_INVENTORY_Y: f32 = 126.0;
-/// The machine's panel height: the inventory's first row plus vanilla's 82. It fits the game's
-/// 240-pixel GUI the same way the requester's 238 does (measured in game, §2g trap 3).
+/// The player's inventory rows, under the pattern grid and the value row. It is the requester's
+/// inventory row, so both panels are the same height and centre alike in the game's GUI.
+pub const MACHINE_INVENTORY_Y: f32 = 156.0;
+/// The machine's panel height: the inventory's first row plus vanilla's 82. Like the requester's
+/// 238, it fits the game's 240-pixel GUI (a taller panel is clipped, §2g trap 3).
 pub const MACHINE_HEIGHT: f32 = MACHINE_INVENTORY_Y + 82.0;
 
 /// The stock grid's top left: the machine's own 27 slots, the same three chest rows, and they are
 /// real menu slots (unlike the requester's drawn filter cells).
 const STOCK_X: f32 = 8.0;
-const STOCK_Y: f32 = 18.0;
+const STOCK_Y: f32 = 6.0;
 const STOCK_COLUMNS: usize = 9;
-/// The row of target cells under the stock grid: one drawn cell per pattern slot, the first at the
-/// old single-target cell's place so a click there still sets the machine's first target. Upstream
-/// draws a whole grid of pattern slots; the panel shows the first row and the command sets the rest.
-const TARGET_CELL: [f32; 4] = [8.0, 76.0, 18.0, 18.0];
-/// How many target cells the panel draws.
-const TARGET_CELLS: usize = 9;
+/// One cell is 15 pixels: 27 stock rows (3) and 45 pattern rows (5) and the value row have to fit
+/// above the engine's "Inventory" label at `MACHINE_INVENTORY_Y - 16`; 18-pixel cells do not.
+const MACHINE_CELL: f32 = 15.0;
+/// The pattern grid: upstream's 9 × 5 cells, one per pattern slot, in the same row-major order as
+/// the requester's filter grid. Cell 0 keeps the first cell's place under the stock grid.
+const MACHINE_GRID_X: f32 = 8.0;
+const MACHINE_GRID_Y: f32 = 51.0;
+const MACHINE_TARGET_COLUMNS: usize = 9;
+const MACHINE_TARGET_ROWS: usize = 5;
+/// All 45 of upstream's pattern slots are drawn, not just the first row.
+pub const MACHINE_TARGETS: usize = MACHINE_TARGET_COLUMNS * MACHINE_TARGET_ROWS;
 
-/// The `index`th target cell's bounds, left to right.
+/// The `index`th pattern cell's bounds, left to right, row by row.
 #[must_use]
 fn target_cell(index: usize) -> Option<[f32; 4]> {
-    (index < TARGET_CELLS).then(|| {
-        let [x, y, w, h] = TARGET_CELL;
-        [x + index as f32 * w, y, w, h]
+    (index < MACHINE_TARGETS).then(|| {
+        let column = (index % MACHINE_TARGET_COLUMNS) as f32;
+        let row = (index / MACHINE_TARGET_COLUMNS) as f32;
+        [
+            MACHINE_GRID_X + column * MACHINE_CELL,
+            MACHINE_GRID_Y + row * MACHINE_CELL,
+            MACHINE_CELL,
+            MACHINE_CELL,
+        ]
     })
 }
 
-/// The band's row under the target cells: `min`'s group then `max`'s, each a label, `-`, its number
+/// The band's row under the pattern grid: `min`'s group then `max`'s, each a label, `-`, its number
 /// and `+`.
-const MACHINE_VALUE_Y: f32 = 98.0;
+const MACHINE_VALUE_Y: f32 = 127.0;
 const MACHINE_MIN_GROUP: [f32; 4] = [8.0, 30.0, 44.0, 66.0];
 const MACHINE_MAX_GROUP: [f32; 4] = [88.0, 110.0, 124.0, 146.0];
 
@@ -242,9 +254,11 @@ const MACHINE_MAX_GROUP: [f32; 4] = [88.0, 110.0, 124.0, 146.0];
 /// the target cell, the cell above the band's row, that row above the engine's "Inventory" label,
 /// and the inventory inside the height the panel declares.
 const _: () = {
-    assert!(STOCK_Y + CELL * (crate::machine::SLOTS / STOCK_COLUMNS) as f32 <= TARGET_CELL[1]);
-    assert!(TARGET_CELL[1] + TARGET_CELL[3] <= MACHINE_VALUE_Y);
-    assert!(TARGET_CELL[0] + TARGET_CELLS as f32 * TARGET_CELL[2] <= MACHINE_WIDTH);
+    assert!(
+        STOCK_Y + MACHINE_CELL * (crate::machine::SLOTS / STOCK_COLUMNS) as f32 <= MACHINE_GRID_Y
+    );
+    assert!(MACHINE_GRID_Y + MACHINE_CELL * MACHINE_TARGET_ROWS as f32 <= MACHINE_VALUE_Y);
+    assert!(MACHINE_GRID_X + MACHINE_TARGET_COLUMNS as f32 * MACHINE_CELL <= MACHINE_WIDTH);
     assert!(MACHINE_VALUE_Y + BUTTON <= MACHINE_INVENTORY_Y - 16.0);
     assert!(MACHINE_INVENTORY_Y + 82.0 <= MACHINE_HEIGHT + 0.01);
     assert!(MACHINE_HEIGHT <= 240.0);
@@ -258,7 +272,10 @@ pub fn machine_layout() -> Screen {
         .map(|slot| {
             let column = (slot % STOCK_COLUMNS) as f32;
             let row = (slot / STOCK_COLUMNS) as f32;
-            Some([STOCK_X + column * CELL, STOCK_Y + row * CELL])
+            Some([
+                STOCK_X + column * MACHINE_CELL,
+                STOCK_Y + row * MACHINE_CELL,
+            ])
         })
         .collect();
     Screen {
@@ -277,7 +294,7 @@ pub fn machine_layout() -> Screen {
 /// nothing of the screen's.
 #[must_use]
 pub fn machine_button_at(at: [f32; 2]) -> Option<i32> {
-    for index in 0..TARGET_CELLS {
+    for index in 0..MACHINE_TARGETS {
         if let Some(cell) = target_cell(index)
             && inside(cell, at)
         {
@@ -300,14 +317,11 @@ pub fn machine_button_at(at: [f32; 2]) -> Option<i32> {
     Some(press.button())
 }
 
-/// The "target" label beside the cell.
-const TARGET_LABEL: [f32; 2] = [30.0, 81.0];
-
-/// Draw the machine's panel over the engine's: the target cell (its item from the open payload),
-/// its label, and the band's two rows as the data slots carry them.
+/// Draw the machine's panel over the engine's: the 45 pattern cells (their items from the open
+/// payload) and the focused cell's band, as the data slots carry it.
 ///
 /// The engine draws the plain panel, the stock slots' frames and the player's inventory; the drawn
-/// cell and buttons are this function's, over the panel and under the items and labels, so every
+/// cells and buttons are this function's, over the panel and under the items and labels, so every
 /// coordinate must add `event.origin`.
 pub fn machine_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
     let [ox, oy] = event.origin;
@@ -317,7 +331,7 @@ pub fn machine_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
         .unwrap_or((0, Vec::new()));
     let draw = &mut *event.draw;
 
-    for index in 0..TARGET_CELLS {
+    for index in 0..MACHINE_TARGETS {
         let Some([x, y, w, h]) = target_cell(index) else {
             break;
         };
@@ -332,15 +346,10 @@ pub fn machine_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
         if let Some(item) = targets.get(index).filter(|item| !item.is_empty())
             && let Some(key) = item_key(host, item)
         {
-            draw.item(key, [rect[0] + 1.0, rect[1] + 1.0], 16.0);
+            // A 15-pixel cell cannot show a 16-pixel icon: draw it at 13 inside the frame.
+            draw.item(key, [rect[0] + 1.0, rect[1] + 1.0], 13.0);
         }
     }
-    draw.text(
-        "target",
-        [ox + TARGET_LABEL[0], oy + TARGET_LABEL[1]],
-        TEXT,
-        false,
-    );
 
     let value = |index: usize| event.data.get(index).copied().unwrap_or(0);
     for (label, group, index) in [
@@ -453,18 +462,17 @@ mod tests {
     }
 
     /// The machine's 27 stock slots are menu slots, placed in the chest's three rows, and its
-    /// panel is the 176 × 208 declaration the engine reads — the 238 of the requester's minus its
-    /// own extra row.
+    /// panel is the requester's 176 × 238 declaration, so both panels centre alike in game.
     #[test]
     fn the_machines_stock_slots_are_its_containers_twenty_seven() {
         let screen = machine_layout();
-        assert_eq!((screen.width, screen.height), (176.0, 208.0));
-        assert_eq!(screen.inventory_y, 126.0);
+        assert_eq!((screen.width, screen.height), (176.0, 238.0));
+        assert_eq!(screen.inventory_y, 156.0);
         assert_eq!(screen.slots.len(), 27, "every stock slot is a menu slot");
         assert_eq!(screen.slots[0], Some([STOCK_X, STOCK_Y]));
         assert_eq!(
             screen.slots[26],
-            Some([STOCK_X + 8.0 * CELL, STOCK_Y + 2.0 * CELL])
+            Some([STOCK_X + 8.0 * MACHINE_CELL, STOCK_Y + 2.0 * MACHINE_CELL])
         );
         assert!(
             screen.slots.iter().all(Option::is_some),
@@ -509,5 +517,48 @@ mod tests {
             machine_button_at([MACHINE_WIDTH - 2.0, MACHINE_HEIGHT - 2.0]),
             None
         );
+    }
+
+    /// Every one of the 45 cells has its own pixel and its own button id: the grid is upstream's
+    /// 9 × 5 in row-major order, and none of them lands on a stock slot or a value button.
+    #[test]
+    fn every_one_of_the_forty_five_cells_presses_its_own_slot() {
+        assert_eq!(MACHINE_TARGETS, 45);
+        for index in 0..MACHINE_TARGETS {
+            let [x, y, w, h] = target_cell(index).expect("one of the 45 cells");
+            let centre = [x + w / 2.0, y + h / 2.0];
+            let press = MachinePress::Cell(index as u8);
+            assert_eq!(
+                machine_button_at(centre),
+                Some(press.button()),
+                "cell {index}'s centre must press its own slot"
+            );
+            assert_eq!(MachinePress::of(press.button()), Some(press));
+        }
+        // Cell 0 is the grid's top left; cell 44 is its bottom right.
+        assert_eq!(target_cell(0), Some([8.0, 51.0, 15.0, 15.0]));
+        assert_eq!(target_cell(44), Some([128.0, 111.0, 15.0, 15.0]));
+    }
+
+    /// The panel must draw upstream's whole 9 × 5 pattern grid, not just its first row: the 45th
+    /// cell's pixel is the one a player clicks to configure slot 44 from the panel.
+    #[test]
+    fn the_forty_fifth_cell_is_on_the_machine_panel() {
+        // The computed centre of cell 44: column 8, row 4 of a 15-pixel grid at (8, 51).
+        let centre = [135.0, 118.0];
+        assert_eq!(
+            machine_button_at(centre),
+            Some(MachinePress::Cell(44).button()),
+            "cell 44's centre must press the 45th pattern slot"
+        );
+    }
+
+    /// The machine's panel is the requester's height so the five pattern rows, the value row and
+    /// the inventory all fit inside the game's 240-pixel GUI (a taller panel is clipped).
+    #[test]
+    fn the_machine_panel_is_the_requesters_height() {
+        let layout = machine_layout();
+        assert_eq!((layout.width, layout.height), (176.0, 238.0));
+        assert_eq!(layout.inventory_y, 156.0);
     }
 }

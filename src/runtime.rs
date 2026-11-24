@@ -1797,8 +1797,11 @@ pub enum MachinePress {
     MaxUp,
 }
 
-/// The first target cell's menu button id; the panel draws up to 45 cells from here.
+/// The first target cell's menu button id; the panel draws all 45 cells from here.
 pub const TARGET_BUTTON: i32 = 300;
+/// The last target cell's menu button id: 300 + 44. The old decoder stopped at 340, so cells 41..44
+/// never reached the server even though the saved container had room for them.
+pub const LAST_TARGET_BUTTON: i32 = TARGET_BUTTON + MAX_TARGET_ENTRIES as i32 - 1;
 /// The band buttons follow the cells', after a gap so no cell id collides with a value button.
 pub const MACHINE_MIN_DOWN_BUTTON: i32 = 400;
 
@@ -1807,7 +1810,7 @@ impl MachinePress {
     #[must_use]
     pub fn of(button: i32) -> Option<Self> {
         match button {
-            TARGET_BUTTON..=340 => Some(Self::Cell((button - TARGET_BUTTON) as u8)),
+            TARGET_BUTTON..=LAST_TARGET_BUTTON => Some(Self::Cell((button - TARGET_BUTTON) as u8)),
             MACHINE_MIN_DOWN_BUTTON => Some(Self::MinDown),
             401 => Some(Self::MinUp),
             402 => Some(Self::MaxDown),
@@ -2109,8 +2112,9 @@ impl Targets {
     }
 }
 
-/// The machine's screen over its saved pattern slots: one row of cells, the selected one's band
-/// stepped by the four buttons. The screen and `/stepcrafter target|configure` edit one container.
+/// The machine's screen over its saved pattern slots: the full 9 × 5 grid of cells, the selected
+/// one's band stepped by the four buttons. The screen and `/stepcrafter target|configure` edit one
+/// container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineEditor {
     targets: Targets,
@@ -3543,6 +3547,7 @@ mod tests {
         for (button, press) in [
             (300, MachinePress::Cell(0)),
             (301, MachinePress::Cell(1)),
+            (344, MachinePress::Cell(44)),
             (400, MachinePress::MinDown),
             (401, MachinePress::MinUp),
             (402, MachinePress::MaxDown),
@@ -3551,8 +3556,50 @@ mod tests {
             assert_eq!(MachinePress::of(button), Some(press));
             assert_eq!(press.button(), button);
         }
-        assert_eq!(MachinePress::of(341), None);
+        assert_eq!(MachinePress::of(345), None);
         assert_eq!(MachinePress::of(399), None);
+    }
+
+    /// The server must accept the 45th cell's button id. The old decoder stopped at 340, so cells
+    /// 41..44 never reached the editor even though the saved container had room for them.
+    #[test]
+    fn the_forty_fifth_cell_button_reaches_the_editor() {
+        let button = MachinePress::Cell(44).button();
+        assert_eq!(button, 344);
+        assert_eq!(
+            MachinePress::of(button),
+            Some(MachinePress::Cell(44)),
+            "the 45th cell's button must reach the server"
+        );
+    }
+
+    /// The 45th cell makes the 45th saved slot from the carried item, leaving the 44 slots already
+    /// configured as they were.
+    #[test]
+    fn the_forty_fifth_cell_makes_the_forty_fifth_slot() {
+        let mut targets = Targets::new();
+        for index in 0..44 {
+            let item = format!("minecraft:slot_{index}");
+            let pattern = Pattern::new(vec![vec![item.clone()]], item.clone(), 1)
+                .expect("a one-cell test pattern");
+            assert!(
+                targets
+                    .set(
+                        TargetEntry::new(item, Some(band(0, 0)), 1, pattern)
+                            .expect("a test target")
+                    )
+                    .is_ok()
+            );
+        }
+        let mut editor = MachineEditor::new(targets, 0);
+        assert!(editor.apply(MachinePress::Cell(44), Some("minecraft:torch")));
+        let (targets, selected) = editor.into_parts();
+        assert_eq!(targets.len(), 45, "the 45th cell takes the last free slot");
+        assert_eq!(selected, 44);
+        assert_eq!(
+            targets.entry(44).map(TargetEntry::item),
+            Some("minecraft:torch")
+        );
     }
 
     /// The target cell takes the carried item; an empty hand leaves the target as it was, so a
